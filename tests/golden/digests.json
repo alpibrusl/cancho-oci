@@ -1,0 +1,37 @@
+{
+  "amd64-gzip-epoch-and-config": {
+    "config": "sha256:708edb49fcc0bbd46a6809f1b79ef7a2eadf49229586d6874f4d923cdbaa1355",
+    "diff_id": "sha256:f0b0d123560f52b2f64c4b6012cd814a783e45afca2363b2aeaea137a254d534",
+    "layer": "sha256:bf530c462c1b202db65f38d615250e049cb5521e0256a3277b72263a98cb4a52",
+    "layer_size": 793,
+    "manifest": "sha256:41853b53052fce652df5d1cb92818807276e44915139f3575556c5f5df0e0993"
+  },
+  "amd64-gzip-records-multiblock": {
+    "config": "sha256:0298cbb21e1a65b328a25b539561f03d05450445280a6ec4ae6e4c1c17ac84e6",
+    "diff_id": "sha256:158a4873d05a2dad97b60fd53a72c015e96c0ad51281d84b2cccfbcdfb9714ac",
+    "layer": "sha256:d4cf1393fdb6b52b551540ed27cfc997659cacc6d78431c0ab34bb7595253ed4",
+    "layer_size": 50539,
+    "manifest": "sha256:f1da306274cc4aaa6ca8ab9e655047d5951dd5ed622521083ca13f4469792ae3"
+  },
+  "amd64-gzip-small": {
+    "config": "sha256:a7acc08a24668bc71b64845779fc4488e162215274522ac5aa2b60533e869a2b",
+    "diff_id": "sha256:ad2500da1bc91e02c87475ce6e027a0e2a57ceedd22d96f86fce415d26c285c9",
+    "layer": "sha256:46b5db61a9c0e2f9b6c59667c49fd3e94a52d71f606ecf17d089d720e6af37fc",
+    "layer_size": 202,
+    "manifest": "sha256:86103c6081ce22de6e3657b9eadcdec100f7cd0c85be1848f3e79b8b44b04f69"
+  },
+  "arm64-none": {
+    "config": "sha256:d1b16e0e2cfd6580332d7bda36547a2e4be55d81573c4a5fa69a8c6a9cff0c9d",
+    "diff_id": "sha256:2ad2aa9b998f51f2d16135fec3f59b4b5744d2a62edede5753699199db09efd9",
+    "layer": "sha256:2ad2aa9b998f51f2d16135fec3f59b4b5744d2a62edede5753699199db09efd9",
+    "layer_size": 9728,
+    "manifest": "sha256:dab3a2f30ebd7cbbd4499334e0a4cd98051ab872cf26afe687207c9cc9eaeb57"
+  },
+  "riscv64-gzip-two-bins-multiblock": {
+    "config": "sha256:596d48b697510f4f277cab08fc3a6e79d8993e45669a6bbb62bb7718a1ab553a",
+    "diff_id": "sha256:6e268232d694af4fc32ab865eafecd1f101867ab169821fb6fc683b492e83ba1",
+    "layer": "sha256:fc2d82ec8d583e8e6bf2419e033918534b07e7bbcf1555d107c71570d32c4ffa",
+    "layer_size": 114011,
+    "manifest": "sha256:e0e0abba94b507df805f5c29ef6395c5caed9a66a42843a92c6b391df5383869"
+  }
+}
