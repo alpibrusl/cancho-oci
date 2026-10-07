@@ -1,0 +1,58 @@
+edition 7;
+
+module oci.place;
+
+// `oci.place` -- open a file at a relative path beneath a directory handle
+// (design 5.5, task #7). `dir_open_read` takes one path component, so a nested
+// path is walked a component at a time, each step through `dir_enter`, which opens
+// beneath a descriptor and follows no link and no `..` (docs/directory-handles.md).
+// The walk is cancho-tools' `place.open_file` shape: recurse, hold the child
+// directory, consume the placeholder result before overwriting it, close once.
+
+fn enotdir() -> [] int {
+    return 20;
+}
+
+// Open `<dir>/<rel>` for reading; `rel` is `a/b/c`, no leading or trailing "/".
+pub fn open_file[&d, &p](dir: &d Dir, rel: &p [byte]) -> [dir_read] Opened {
+    let k = index_of_byte(rel, byte_of('/'));
+    if k < 0 {
+        return dir_open_read(dir, rel);
+    }
+    match dir_enter(dir, rel[0..k]) {
+        DirOpened::Ok(sub) => {
+            var held = sub;
+            var out = Opened::Failed(5);
+            borrow held as &h in {
+                match out {
+                    Opened::Ok(unused) => {
+                        file_close(unused);
+                    }
+                    Opened::Failed(unused) => {
+                    }
+                }
+                out = open_file(h, rel[k + 1..len(rel)]);
+            }
+            dir_close(held);
+            return out;
+        }
+        DirOpened::Failed(reason) => {
+            return Opened::Failed(reason);
+        }
+    }
+}
+
+// The size of an open file in bytes, or a negative errno.
+pub fn size_of[&f](file: &!f File) -> [file_read] int {
+    match file_size(file) {
+        Done::Ok(n) => {
+            return n;
+        }
+        Done::Failed(e) => {
+            if e == 0 {
+                return 0 - 5;
+            }
+            return 0 - e;
+        }
+    }
+}

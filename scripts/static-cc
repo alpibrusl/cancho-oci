@@ -1,0 +1,4 @@
+#!/bin/sh
+# The linker wrapper cancho's docs/package-system.md describes: `cancho build` links with $CC, and
+# adding -static gives an executable with no loader and no libc to find, which a `scratch` image needs.
+exec cc "$@" -static

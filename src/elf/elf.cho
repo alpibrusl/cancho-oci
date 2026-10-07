@@ -1,0 +1,204 @@
+edition 5;
+
+module oci.elf;
+
+// `oci.elf` -- just enough of an ELF64 header to decide whether a program can
+// run in a `scratch` image (design 5.4, task #7): is it an executable, for which
+// machine, and does it need a dynamic loader. Pure: it reads the bytes it is
+// given and nothing else; `build` does the reading.
+//
+// A dynamically linked executable always carries a `PT_INTERP` program header
+// naming its loader, and a `scratch` image has no loader and no libc, so it
+// could never start. A static executable has none. (A static-PIE has a
+// `PT_DYNAMIC` and no `PT_INTERP`, and runs, so `PT_DYNAMIC` is not the test.)
+//
+// Only 64-bit little-endian ELF is accepted: it is what cancho builds for
+// amd64, arm64 and riscv64, and the three machines v1 supports (design 4).
+
+pub fn head_len() -> [] int {
+    return 64;
+}
+
+pub fn phdr_len() -> [] int {
+    return 56;
+}
+
+// More program headers than any real executable has; a larger count is a
+// refusal, not an allocation.
+pub fn max_phnum() -> [] int {
+    return 64;
+}
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+pub fn refused_short() -> [] int {
+    return 0 - 301;
+}
+
+pub fn refused_not_elf() -> [] int {
+    return 0 - 302;
+}
+
+pub fn refused_class() -> [] int {
+    return 0 - 303;
+}
+
+pub fn refused_type() -> [] int {
+    return 0 - 304;
+}
+
+pub fn refused_machine() -> [] int {
+    return 0 - 305;
+}
+
+pub fn refused_phdrs() -> [] int {
+    return 0 - 306;
+}
+
+pub fn refused_dynamic() -> [] int {
+    return 0 - 307;
+}
+
+pub fn refused_arch_mismatch() -> [] int {
+    return 0 - 308;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "ok";
+    }
+    if code == refused_short() {
+        return "elf-truncated";
+    }
+    if code == refused_not_elf() {
+        return "elf-not-elf";
+    }
+    if code == refused_class() {
+        return "elf-class";
+    }
+    if code == refused_type() {
+        return "elf-type";
+    }
+    if code == refused_machine() {
+        return "elf-machine";
+    }
+    if code == refused_phdrs() {
+        return "elf-program-headers";
+    }
+    if code == refused_dynamic() {
+        return "elf-dynamic";
+    }
+    if code == refused_arch_mismatch() {
+        return "elf-arch-mismatch";
+    }
+    return "unknown";
+}
+
+// `n` little-endian bytes of `buf` from `at`, as a number (n at most 7: the top
+// byte of a 64-bit field is checked separately, so nothing overflows).
+fn le[&b](buf: &b [byte], at: int, n: int) -> [] int {
+    var value = 0;
+    var i = n - 1;
+    while i >= 0 {
+        value = value * 256 + int_of(buf[at + i]);
+        i = i - 1;
+    }
+    return value;
+}
+
+// A 64-bit field whose value fits in 56 bits, or -1.
+fn le64[&b](buf: &b [byte], at: int) -> [] int {
+    if int_of(buf[at + 7]) != 0 {
+        return 0 - 1;
+    }
+    return le(buf, at, 7);
+}
+
+pub fn machine[&b](head: &b [byte]) -> [] int {
+    return le(head, 18, 2);
+}
+
+// "amd64", "arm64", "riscv64" for the three machines v1 builds for, else "".
+pub fn arch_name[&b](head: &b [byte]) -> [] &static [byte] {
+    let m = machine(head);
+    if m == 62 {
+        return "amd64";
+    }
+    if m == 183 {
+        return "arm64";
+    }
+    if m == 243 {
+        return "riscv64";
+    }
+    return "";
+}
+
+// Is `head` (at least 64 bytes) the header of a 64-bit little-endian executable
+// for a machine v1 knows? 0, or a refusal.
+pub fn check_head[&b](head: &b [byte]) -> [] int {
+    // The magic first: a short file that is not ELF at all (a script) is "not ELF",
+    // not "truncated"; only something that starts like ELF can be cut short.
+    if len(head) < 4 {
+        return refused_short();
+    }
+    if int_of(head[0]) != 127 || int_of(head[1]) != 'E' || int_of(head[2]) != 'L' || int_of(head[3]) != 'F' {
+        return refused_not_elf();
+    }
+    if len(head) < 64 {
+        return refused_short();
+    }
+    // EI_CLASS 2 (64-bit), EI_DATA 1 (little-endian), EI_VERSION 1.
+    if int_of(head[4]) != 2 || int_of(head[5]) != 1 || int_of(head[6]) != 1 {
+        return refused_class();
+    }
+    // ET_EXEC 2, ET_DYN 3 (a PIE or a static-PIE).
+    let kind = le(head, 16, 2);
+    if kind != 2 && kind != 3 {
+        return refused_type();
+    }
+    if len(arch_name(head)) == 0 {
+        return refused_machine();
+    }
+    return 0;
+}
+
+pub fn phnum[&b](head: &b [byte]) -> [] int {
+    return le(head, 56, 2);
+}
+
+// Where the program header table starts, or -1 when the header describes none
+// we will read: an entry size other than 56, no entries, too many, or an
+// offset that does not fit.
+pub fn phoff[&b](head: &b [byte]) -> [] int {
+    if le(head, 54, 2) != 56 {
+        return 0 - 1;
+    }
+    let n = phnum(head);
+    if n < 1 || n > max_phnum() {
+        return 0 - 1;
+    }
+    return le64(head, 32);
+}
+
+// The index of the first `PT_INTERP` (type 3) in `table` (`count` entries of 56
+// bytes), or -1 when there is none.
+pub fn interp_index[&t](table: &t [byte], count: int) -> [] int {
+    var i = 0;
+    while i < count {
+        if le(table, i * 56, 4) == 3 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+pub fn phdr_offset[&t](table: &t [byte], i: int) -> [] int {
+    return le64(table, i * 56 + 8);
+}
+
+pub fn phdr_filesz[&t](table: &t [byte], i: int) -> [] int {
+    return le64(table, i * 56 + 32);
+}

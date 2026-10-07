@@ -1,33 +1,416 @@
-edition 5;
+edition 7;
 
+import std.buffer;
 import std.io;
+import oci.digest;
+import oci.elf;
+import oci.image;
+import oci.layer;
+import oci.store;
+import oci.tar;
 
-// oci-build: the scaffold (#2). It builds nothing yet; it exists so that the
-// compiler pin, CI, the formatter and the authority ceiling (G5) are judged
-// on a real binary before any behaviour is added to it.
+// oci-build: a `FROM scratch` OCI image from static executables and a few files
+// (design 4, task #7). No daemon, no shell, no `RUN`, and no network: this
+// program's authority report has no `net`, `exec`, `clock` or `signals`, and its
+// only file authority is directory handles (`--root` to read, `--out` to write).
 //
-// Its authority row is what the ceiling pins: the console and nothing else.
-// `main` owns the capabilities it releases, so releasing `net` unused is the
-// proof that `build` reaches no network (design 5.5), and `fs`, `ffi`, `heap`
-// and `clock` the same for files, foreign code, memory and time.
+//     oci-build --root <dir> --out <image-dir> --platform linux/<arch>
+//               --bin <src>:<dest> [--bin ...] [--file <src>:<dest> ...]
+//               [--entrypoint <word> ...] [--cmd <word> ...] [--env NAME=value ...]
+//               [--label name=value ...] [--port 8080/tcp ...]
+//               [--user <u>] [--workdir <dir>] [--ref <tag>] [--source-date-epoch <n>]
+//
+// `<src>` is a path beneath `--root`; `<dest>` is the path inside the image, with
+// no leading "/". A `--bin` is checked to be a static ELF executable for the
+// platform and gets mode 0755; a `--file` gets 0644. With no `--entrypoint` the
+// first `--bin` is the entrypoint. `<image-dir>` must already hold `blobs/sha256/`
+// (cancho has no `mkdir` yet, design 5.3). Prints the manifest digest.
+//
+// A refusal is `refused: <rule tag>` on stderr, naming the path it is about, and
+// exit status 1.
 
-fn say[&i](io: &!i Io, text: &static [byte]) -> [io_write] int {
-    return io.write_all(io, text);
+fn build_flag() -> [] int {
+    return 0 - 501;
+}
+
+fn build_missing() -> [] int {
+    return 0 - 502;
+}
+
+fn build_platform() -> [] int {
+    return 0 - 503;
+}
+
+fn build_epoch() -> [] int {
+    return 0 - 504;
+}
+
+fn build_dir() -> [] int {
+    return 0 - 505;
+}
+
+fn build_skeleton() -> [] int {
+    return 0 - 506;
+}
+
+fn rule_of(code: int) -> [] &static [byte] {
+    if code == build_flag() {
+        return "build-flag";
+    }
+    if code == build_missing() {
+        return "build-missing";
+    }
+    if code == build_platform() {
+        return "build-platform";
+    }
+    if code == build_epoch() {
+        return "build-source-date-epoch";
+    }
+    if code == build_dir() {
+        return "build-dir-open";
+    }
+    if code == build_skeleton() {
+        return "build-layout-skeleton";
+    }
+    if code <= 0 - 200 && code > 0 - 300 {
+        return image.rule_name(code);
+    }
+    return layer.rule_name(code);
+}
+
+fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, rule_of(code));
+    if len(culprit) > 0 {
+        io.error_all(io, " (");
+        io.error_all(io, culprit);
+        io.error_all(io, ")");
+    }
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// A decimal number, or -1 when `text` is empty or holds anything else.
+fn number[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 12 {
+        return 0 - 1;
+    }
+    var value = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < '0' || c > '9' {
+            return 0 - 1;
+        }
+        value = value * 10 + (c - '0');
+        i = i + 1;
+    }
+    return value;
+}
+
+// Put `bytes` in the store; its "sha256:<hex>" text goes to `text` (71 bytes).
+fn keep[&h, &d, &b, &t](heap: &!h Heap, blobs: &d Dir, bytes: &b [byte], text: &!t [byte]) -> [heap, dir_write, file_write] int {
+    var code = 0;
+    region a {
+        let raw = alloc_slice[a](32, byte_of(0));
+        code = store.put(heap, blobs, ".incoming-0", bytes, raw);
+        if code > 0 {
+            digest.text_into(raw, text);
+            code = 0;
+        }
+    }
+    return code;
+}
+
+// The layer is in the store with digest text `layer_text` and `layer_size` bytes;
+// write the config, the manifest and the index around it.
+fn finish_image[&h, &d, &b, &m, &l, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir, manifest_text: &!m [byte], layer_text: &l [byte], layer_size: int, arch: &p [byte], os: &q [byte], ref: &x [byte], entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, dir_write, file_write] (int, int) {
+    let config_text = box_slice(heap, 71, byte_of(0));
+    var code = 0;
+    var config_size = 0;
+    var manifest_size = 0;
+
+    let (config, c1) = image.config_json(heap, arch, os, entrypoint, cmd, env, user, workdir, labels, ports, layer_text);
+    code = c1;
+    if code == 0 {
+        borrow config as &cb in {
+            config_size = buffer.size(cb);
+            borrow mut config_text as &!cw in {
+                code = keep(heap, blobs, buffer.bytes(cb), contents(cw));
+            }
+        }
+    }
+    buffer.drop(heap, config);
+
+    if code == 0 {
+        borrow config_text as &cr in {
+            let (manifest, c2) = image.manifest_json(heap, contents(cr), config_size, layer_text, layer_size);
+            code = c2;
+            if code == 0 {
+                borrow manifest as &mb in {
+                    manifest_size = buffer.size(mb);
+                    code = keep(heap, blobs, buffer.bytes(mb), manifest_text);
+                }
+            }
+            buffer.drop(heap, manifest);
+        }
+    }
+
+    if code == 0 {
+        let (index, c3) = image.index_json(heap, manifest_text, manifest_size, arch, os, ref);
+        code = c3;
+        if code == 0 {
+            borrow index as &xb in {
+                if image.write_file(image_dir, "index.json", buffer.bytes(xb)) != 0 {
+                    code = store.refused_io();
+                }
+            }
+            if code == 0 && image.write_file(image_dir, "oci-layout", image.layout_text()) != 0 {
+                code = store.refused_io();
+            }
+        }
+        buffer.drop(heap, index);
+    }
+    unbox_slice(heap, config_text);
+    return (code, manifest_size);
+}
+
+// Table, sort, measure, write the layer, then the image around it.
+fn assemble[&h, &d, &b, &r, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z, &i](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir, root: &r Dir, args: &g Args, io: &!i Io, arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var status = 1;
+    region a {
+        let names = alloc_slice[a](8192, byte_of(0));
+        let meta = alloc_slice[a](384, 0);
+        let state = alloc_slice[a](4, 0);
+        let manifest_text = alloc_slice[a](71, byte_of(0));
+        let layer_text = alloc_slice[a](71, byte_of(0));
+        let raw = alloc_slice[a](32, byte_of(0));
+        var code = 0;
+        let count = layer.collect(args, names, meta, state);
+        if count < 0 {
+            code = count;
+        }
+        if code == 0 {
+            layer.sort(names, meta, count);
+            code = layer.measure(args, root, names, meta, count, state, arch, mtime);
+        }
+        var layer_size = 0;
+        if code == 0 {
+            let (outcome, size) = layer.write(heap, blobs, root, args, names, meta, count, mtime, ".incoming-1", raw);
+            if outcome > 0 {
+                digest.text_into(raw, layer_text);
+                layer_size = size;
+            } else {
+                code = outcome;
+            }
+        }
+        if code == 0 {
+            let (c, manifest_size) = finish_image(heap, image_dir, blobs, manifest_text, layer_text, layer_size, arch, os, ref, entrypoint, cmd, env, user, workdir, labels, ports);
+            code = c;
+        }
+        if code == 0 {
+            io.write_all(io, manifest_text);
+            io.write_all(io, "\n");
+            status = 0;
+        } else if state[2] >= 0 && code != image.refused_arch() {
+            status = refuse(io, code, layer.name_at(names, meta, state[2]));
+        } else {
+            status = refuse(io, code, "");
+        }
+    }
+    return status;
+}
+
+fn with_root[&h, &f, &i, &g, &d, &b, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args, root_path: &static [byte], image_dir: &d Dir, blobs: &b Dir, arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var status = 1;
+    match open_dir(fs, root_path) {
+        DirOpened::Failed(errno) => {
+            status = refuse(io, build_dir(), root_path);
+        }
+        DirOpened::Ok(top) => {
+            var root = top;
+            borrow root as &rd in {
+                status = assemble(heap, image_dir, blobs, rd, args, io, arch, os, ref, mtime, entrypoint, cmd, env, user, workdir, labels, ports);
+            }
+            dir_close(root);
+        }
+    }
+    return status;
+}
+
+fn with_out[&h, &f, &i, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args, root_path: &static [byte], out_path: &static [byte], arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var status = 1;
+    match open_dir(fs, out_path) {
+        DirOpened::Failed(errno) => {
+            status = refuse(io, build_dir(), out_path);
+        }
+        DirOpened::Ok(top) => {
+            var image_dir = top;
+            borrow image_dir as &id in {
+                match dir_enter(id, "blobs") {
+                    DirOpened::Failed(errno) => {
+                        status = refuse(io, build_skeleton(), out_path);
+                    }
+                    DirOpened::Ok(blobs_dir) => {
+                        var blobs = blobs_dir;
+                        borrow blobs as &bd in {
+                            match dir_enter(bd, "sha256") {
+                                DirOpened::Failed(errno) => {
+                                    status = refuse(io, build_skeleton(), out_path);
+                                }
+                                DirOpened::Ok(sha_dir) => {
+                                    var sha = sha_dir;
+                                    borrow sha as &sd in {
+                                        status = with_root(heap, fs, io, args, root_path, id, sd, arch, os, ref, mtime, entrypoint, cmd, env, user, workdir, labels, ports);
+                                    }
+                                    dir_close(sha);
+                                }
+                            }
+                        }
+                        dir_close(blobs);
+                    }
+                }
+            }
+            dir_close(image_dir);
+        }
+    }
+    return status;
+}
+
+// The destination of the first `--bin`, for the default entrypoint, or "".
+fn first_bin[&g](args: &g Args) -> [args] &static [byte] {
+    var i = 1;
+    while i + 1 < arg_count(args) {
+        if digest.equal(arg(args, i), "--bin") {
+            return layer.dest_of(arg(args, i + 1));
+        }
+        i = i + 2;
+    }
+    return "";
+}
+
+fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var root = "";
+    var out = "";
+    var platform = "";
+    var ref = "";
+    var user = "";
+    var workdir = "";
+    var epoch = "";
+    var entry = buffer.empty(heap, 32);
+    var cmd = buffer.empty(heap, 32);
+    var env = buffer.empty(heap, 32);
+    var labels = buffer.empty(heap, 32);
+    var ports = buffer.empty(heap, 32);
+    var bad = "";
+    var at = 1;
+    while at < arg_count(args) && len(bad) == 0 {
+        let flag = arg(args, at);
+        if at + 1 >= arg_count(args) {
+            bad = flag;
+        } else {
+            let value = arg(args, at + 1);
+            if digest.equal(flag, "--root") {
+                root = value;
+            } else if digest.equal(flag, "--out") {
+                out = value;
+            } else if digest.equal(flag, "--platform") {
+                platform = value;
+            } else if digest.equal(flag, "--ref") {
+                ref = value;
+            } else if digest.equal(flag, "--user") {
+                user = value;
+            } else if digest.equal(flag, "--workdir") {
+                workdir = value;
+            } else if digest.equal(flag, "--source-date-epoch") {
+                epoch = value;
+            } else if digest.equal(flag, "--entrypoint") {
+                entry = buffer.push(heap, buffer.append(heap, entry, value), byte_of('\n'));
+            } else if digest.equal(flag, "--cmd") {
+                cmd = buffer.push(heap, buffer.append(heap, cmd, value), byte_of('\n'));
+            } else if digest.equal(flag, "--env") {
+                env = buffer.push(heap, buffer.append(heap, env, value), byte_of('\n'));
+            } else if digest.equal(flag, "--label") {
+                labels = buffer.push(heap, buffer.append(heap, labels, value), byte_of('\n'));
+            } else if digest.equal(flag, "--port") {
+                ports = buffer.push(heap, buffer.append(heap, ports, value), byte_of('\n'));
+            } else if !digest.equal(flag, "--bin") && !digest.equal(flag, "--file") {
+                bad = flag;
+            }
+        }
+        at = at + 2;
+    }
+
+    var status = 1;
+    let slash = index_of_byte(platform, byte_of('/'));
+    var mtime = 0;
+    if len(epoch) > 0 {
+        mtime = number(epoch);
+    }
+    if len(bad) > 0 {
+        status = refuse(io, build_flag(), bad);
+    } else if len(root) == 0 || len(out) == 0 || len(platform) == 0 {
+        status = refuse(io, build_missing(), "--root, --out and --platform are required");
+    } else if slash < 1 || slash >= len(platform) - 1 {
+        status = refuse(io, build_platform(), platform);
+    } else if mtime < 0 {
+        status = refuse(io, build_epoch(), epoch);
+    } else if !image.os_ok(platform[0..slash]) {
+        status = refuse(io, image.refused_os(), platform);
+    } else if !image.arch_ok(platform[slash + 1..len(platform)]) {
+        status = refuse(io, image.refused_arch(), platform);
+    } else {
+        // With no `--entrypoint`, the first `--bin` is it.
+        var no_entrypoint = false;
+        borrow entry as &probe in {
+            no_entrypoint = buffer.size(probe) == 0;
+        }
+        if no_entrypoint {
+            let first = first_bin(args);
+            if len(first) > 0 {
+                entry = buffer.push(heap, buffer.append(heap, buffer.push(heap, entry, byte_of('/')), first), byte_of('\n'));
+            }
+        }
+        borrow entry as &eb in {
+            borrow cmd as &cb in {
+                borrow env as &vb in {
+                    borrow labels as &lb in {
+                        borrow ports as &pb in {
+                            status = with_out(heap, fs, io, args, root, out, platform[slash + 1..len(platform)], platform[0..slash], ref, mtime, buffer.bytes(eb), buffer.bytes(cb), buffer.bytes(vb), user, workdir, buffer.bytes(lb), buffer.bytes(pb));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, entry);
+    buffer.drop(heap, cmd);
+    buffer.drop(heap, env);
+    buffer.drop(heap, labels);
+    buffer.drop(heap, ports);
+    return status;
 }
 
 fn main(world: World) -> [] int {
-    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
     release(ffi);
-    release(fs);
-    release(heap);
-    release(args);
     release(net);
     release(clock);
-
-    var status = 0;
-    borrow mut io as &!i in {
-        say(i, "oci-build: design stage, nothing is built yet (cancho-oci#19)\n");
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow fs as &f in {
+                borrow mut io as &!i in {
+                    status = run(h, f, i, g);
+                }
+            }
+        }
     }
+    release(heap);
+    release(args);
+    release(fs);
     release(io);
     return status;
 }

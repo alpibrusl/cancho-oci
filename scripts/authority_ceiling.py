@@ -116,10 +116,29 @@ fn main(world: World) -> [] int {
 '''
 
 
+# No ceiling may ever grant these, whatever the JSON says: the tools build and inspect images, they do not
+# reach a network, run other programs, read the clock, handle signals, call foreign code or open files by path
+# for writing (writes go through directory handles). Granting one means editing this list in the same PR.
+FORBIDDEN = ("net", "conn_", "listen", "accept", "exec", "clock", "signals", "ffi", "fs_write", "udp", "poller")
+
+
+def forbidden_in(ceil):
+    return [e for e in ceil["effects"] if any(e.startswith(f) for f in FORBIDDEN)]
+
+
 def selftest():
-    """The gate must be able to fail: a program that reads a file is wider than oci-build's ceiling."""
-    b = bins()[0]
-    ceil = json.loads((ROOT / "ceilings" / f"{b['name']}.json").read_text())
+    """The gate must be able to fail: a program that reads a file is wider than tar-probe's console-only ceiling,
+    and no committed ceiling grants a forbidden effect."""
+    bad = 0
+    for b in bins():
+        ceil_b = json.loads((ROOT / "ceilings" / f"{b['name']}.json").read_text())
+        forbidden = forbidden_in(ceil_b)
+        if forbidden:
+            print(f"SELFTEST FAIL: the ceiling of {b['name']} grants forbidden effects {forbidden}")
+            bad = 1
+    if bad:
+        return 1
+    ceil = json.loads((ROOT / "ceilings" / "tar-probe.json").read_text())
     with tempfile.TemporaryDirectory() as d:
         f = Path(d) / "mutant.cho"
         f.write_text(MUTANT)

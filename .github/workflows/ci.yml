@@ -85,7 +85,7 @@ jobs:
           # the runner ships jsonschema 4.10, which has no `registry=`; pin versions that do
           pip install --user --upgrade 'jsonschema==4.23.0' 'referencing==0.35.1'
           python3 -c 'import jsonschema, importlib.metadata as m; print("jsonschema", m.version("jsonschema"))'
-          sudo apt-get install -y -q skopeo
+          sudo apt-get install -y -q skopeo podman
           go install github.com/google/go-containerregistry/cmd/crane@v0.20.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
@@ -99,6 +99,22 @@ jobs:
       - name: The image module's mutants are all killed
         working-directory: oci
         run: python3 scripts/image_mutants.py
+
+      - name: oci-build -- layers equal the tarfile oracle, images validate and reproduce, ELF and path refusals, an image runs in podman
+        working-directory: oci
+        run: |
+          python3 scripts/build_check.py --cases 30 --seed 1 --run
+          python3 scripts/build_check.py --cases 30 --seed 2
+
+      - name: oci-build packages itself -- a static build runs in a scratch container
+        working-directory: oci
+        run: |
+          sh scripts/static_build.sh
+          python3 scripts/build_check.py --cases 3 --dogfood build/oci-build-static
+
+      - name: oci-build's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/build_mutants.py
 
       - name: G5 -- every binary's authority is within its committed ceiling
         working-directory: oci
