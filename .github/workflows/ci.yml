@@ -114,6 +114,16 @@ jobs:
           python3 scripts/build_check.py --cases 30 --seed 1 --run --crane
           python3 scripts/build_check.py --cases 30 --seed 2
 
+      - name: oci-index -- a multi-platform image: schemas, an independent byte-level model, skopeo picks each architecture, crane validates every image under the index
+        working-directory: oci
+        run: |
+          python3 scripts/index_check.py --cases 16 --seed 1
+          python3 scripts/index_check.py --cases 16 --seed 2
+
+      - name: oci-index's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/index_mutants.py
+
       - name: G1 across machines -- every digest equals the committed golden file (also checked on macOS/arm64 in the other job)
         working-directory: oci
         run: python3 scripts/golden_check.py

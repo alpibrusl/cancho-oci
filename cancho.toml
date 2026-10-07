@@ -42,6 +42,13 @@ sources = ["src/gzip", "tests/probe/gzip"]
 std = true
 out = "build/gzip-probe"
 
+# Combine per-platform images into one multi-platform image (#8).
+[[bin]]
+name = "oci-index"
+sources = ["src/digest", "src/store", "src/image", "src/layout", "src/indexcli"]
+std = true
+out = "build/oci-index"
+
 [[test]]
 name = "scaffold"
 sources = ["tests/scaffold_test.cho"]
@@ -65,4 +72,9 @@ std = true
 [[test]]
 name = "elf"
 sources = ["src/elf", "tests/elf_test.cho"]
+std = true
+
+[[test]]
+name = "layout"
+sources = ["src/digest", "src/store", "src/layout", "tests/layout_test.cho"]
 std = true

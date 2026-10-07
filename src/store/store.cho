@@ -368,3 +368,38 @@ pub fn verify[&h, &d, &n](heap: &!h Heap, root: &d Dir, hex: &n [byte]) -> [heap
     }
     return want;
 }
+
+// Like `verify`, and also answers how many bytes the blob holds (for a descriptor's
+// `size`): (0 or a refusal, bytes).
+pub fn verify_sized[&h, &d, &n](heap: &!h Heap, root: &d Dir, hex: &n [byte]) -> [heap, dir_read, file_read] (int, int) {
+    var want = 0;
+    var size = 0;
+    region a {
+        let expected = alloc_slice[a](32, byte_of(0));
+        want = digest.parse_hex_into(hex, expected);
+        if want == 0 {
+            match dir_open_read(root, hex) {
+                Opened::Failed(errno) => {
+                    want = refused_missing();
+                }
+                Opened::Ok(file) => {
+                    var handle = file;
+                    let raw = alloc_slice[a](32, byte_of(0));
+                    var got = 0;
+                    borrow mut handle as &!f in {
+                        got = hash_file(heap, f, raw);
+                    }
+                    file_close(handle);
+                    if got < 0 {
+                        want = refused_io();
+                    } else if !digest.equal(raw, expected) {
+                        want = refused_mismatch();
+                    } else {
+                        size = got;
+                    }
+                }
+            }
+        }
+    }
+    return (want, size);
+}

@@ -1,0 +1,145 @@
+edition 7;
+
+module oci.layout;
+
+import oci.digest;
+import oci.store;
+import std.buffer;
+import std.json;
+
+// `oci.layout` -- reading an OCI image layout back (design 5.2, task #8; push, task #9,
+// reads layouts the same way). Everything is read through a directory handle on
+// `<image>/blobs/sha256`, so a digest named in a document cannot become a path
+// outside it, and every blob is re-hashed as it is read: a document is trusted only
+// if its bytes are what its name says.
+//
+// Documents are small (a manifest, a config, an index), so a blob is read whole, up to
+// a cap, and parsed with `std.json` into a tape the caller provides. The accessors
+// answer views into the document, so the caller keeps the document alive.
+
+pub fn max_document() -> [] int {
+    return 1048576;
+}
+
+pub fn refused_too_large() -> [] int {
+    return 0 - 601;
+}
+
+pub fn refused_json() -> [] int {
+    return 0 - 602;
+}
+
+pub fn refused_shape() -> [] int {
+    return 0 - 603;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == refused_too_large() {
+        return "layout-document-too-large";
+    }
+    if code == refused_json() {
+        return "layout-json";
+    }
+    if code == refused_shape() {
+        return "layout-shape";
+    }
+    return "unknown";
+}
+
+// The blob named `hex` (64 lowercase hex digits), whole, if it is no longer than
+// `cap` and hashes to its own name. Answers the bytes and 0, or an empty buffer and
+// `store.refused_missing()`, `store.refused_mismatch()`, `store.refused_io()`,
+// a digest refusal, or `refused_too_large()`.
+pub fn read_blob[&h, &d, &n](heap: &!h Heap, blobs: &d Dir, hex: &n [byte], cap: int) -> [heap, dir_read, file_read] (buffer.Buffer, int) {
+    var body = buffer.empty(heap, 1024);
+    var code = 0;
+    region a {
+        let expected = alloc_slice[a](32, byte_of(0));
+        code = digest.parse_hex_into(hex, expected);
+        if code == 0 {
+            match dir_open_read(blobs, hex) {
+                Opened::Failed(errno) => {
+                    code = store.refused_missing();
+                }
+                Opened::Ok(file) => {
+                    var handle = file;
+                    let chunk = box_slice(heap, 16384, byte_of(0));
+                    var going = true;
+                    while going {
+                        borrow mut chunk as &!cw in {
+                            let room = contents(cw);
+                            borrow mut handle as &!f in {
+                                match file_read(f, room) {
+                                    Read::Got(got) => {
+                                        body = buffer.append(heap, body, room[0..got]);
+                                        var held = 0;
+                                        borrow body as &sb in {
+                                            held = buffer.size(sb);
+                                        }
+                                        if held > cap {
+                                            code = refused_too_large();
+                                            going = false;
+                                        }
+                                    }
+                                    Read::End => {
+                                        going = false;
+                                    }
+                                    Read::Failed(errno) => {
+                                        code = store.refused_io();
+                                        going = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    unbox_slice(heap, chunk);
+                    file_close(handle);
+                    if code == 0 {
+                        let raw = alloc_slice[a](32, byte_of(0));
+                        borrow body as &bb in {
+                            digest.of_bytes(buffer.bytes(bb), raw);
+                        }
+                        if !digest.equal(raw, expected) {
+                            code = store.refused_mismatch();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return (body, code);
+}
+
+// The string at `key` of the object at node `obj`: a view into the document, or an
+// empty slice when the key is absent or its value is not a string (`string_view`
+// itself answers an empty slice for any other kind of node).
+pub fn text_of[&s, &t, &k](src: &s [byte], tape: &t [int], obj: int, key: &k [byte]) -> [] &s [byte] {
+    let n = json.get(src, tape, obj, key);
+    if n < 0 {
+        return src[0..0];
+    }
+    return json.string_view(src, tape, n);
+}
+
+// The integer at `key`, or -1 when absent, not an integer, or not exactly representable.
+pub fn number_of[&s, &t, &k](src: &s [byte], tape: &t [int], obj: int, key: &k [byte]) -> [] int {
+    let n = json.get(src, tape, obj, key);
+    if n < 0 || !json.is_int(tape, n) || !json.fits_int(src, tape, n) {
+        return 0 - 1;
+    }
+    return json.to_int(src, tape, n);
+}
+
+// The digest in "sha256:<hex>" form without its prefix, or an empty slice when
+// the text is not exactly that.
+pub fn hex_of[&t](text: &t [byte]) -> [] &t [byte] {
+    var ok = false;
+    region a {
+        let scratch = alloc_slice[a](32, byte_of(0));
+        ok = digest.parse_into(text, scratch) == 0;
+    }
+    if !ok {
+        return text[0..0];
+    }
+    return text[7..len(text)];
+}

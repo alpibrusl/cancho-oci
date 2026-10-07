@@ -1,0 +1,402 @@
+edition 7;
+
+import std.buffer;
+import std.io;
+import std.json;
+import oci.digest;
+import oci.image;
+import oci.layout;
+import oci.store;
+
+// oci-index: combine images built for different platforms into one multi-platform
+// image (design 4, task #8). Build each platform's image into the same layout
+// directory with `oci-build` (their blobs live side by side and identical blobs are
+// shared), then name the manifests:
+//
+//     oci-index --out <image-dir> --manifest sha256:<hex> [--manifest ...] [--ref <tag>]
+//
+// Nothing is trusted from the command line. Each manifest, its config and every layer
+// is read back from `<image-dir>/blobs/sha256` and re-hashed; the platform comes from
+// the config's own `architecture` and `os`; two manifests for one platform are refused.
+// The image index is written as a blob, in the order the manifests were named, and
+// `index.json` is replaced by one entry pointing at it. Prints the index digest.
+// A refusal is `refused: <rule tag>` on stderr and exit status 1.
+
+fn idx_flag() -> [] int {
+    return 0 - 701;
+}
+
+fn idx_missing() -> [] int {
+    return 0 - 702;
+}
+
+fn idx_none() -> [] int {
+    return 0 - 703;
+}
+
+fn idx_manifest() -> [] int {
+    return 0 - 705;
+}
+
+fn idx_platform_twice() -> [] int {
+    return 0 - 706;
+}
+
+fn idx_dir() -> [] int {
+    return 0 - 707;
+}
+
+fn idx_skeleton() -> [] int {
+    return 0 - 708;
+}
+
+fn idx_digest() -> [] int {
+    return 0 - 709;
+}
+
+fn rule_of(code: int) -> [] &static [byte] {
+    if code == idx_flag() {
+        return "index-flag";
+    }
+    if code == idx_missing() {
+        return "index-missing";
+    }
+    if code == idx_none() {
+        return "index-no-manifests";
+    }
+    if code == idx_manifest() {
+        return "index-manifest";
+    }
+    if code == idx_platform_twice() {
+        return "index-platform-twice";
+    }
+    if code == idx_dir() {
+        return "index-dir-open";
+    }
+    if code == idx_skeleton() {
+        return "index-layout-skeleton";
+    }
+    if code == idx_digest() {
+        return "index-digest";
+    }
+    if code <= 0 - 600 && code > 0 - 700 {
+        return layout.rule_name(code);
+    }
+    if code <= 0 - 200 && code > 0 - 300 {
+        return image.rule_name(code);
+    }
+    return store.rule_name(code);
+}
+
+fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, rule_of(code));
+    if len(culprit) > 0 {
+        io.error_all(io, " (");
+        io.error_all(io, culprit);
+        io.error_all(io, ")");
+    }
+    io.error_all(io, "\n");
+    return 1;
+}
+
+fn arch_name(id: int) -> [] &static [byte] {
+    if id == 0 {
+        return "amd64";
+    }
+    if id == 1 {
+        return "arm64";
+    }
+    return "riscv64";
+}
+
+fn arch_id[&a](arch: &a [byte]) -> [] int {
+    if digest.equal(arch, "amd64") {
+        return 0;
+    }
+    if digest.equal(arch, "arm64") {
+        return 1;
+    }
+    if digest.equal(arch, "riscv64") {
+        return 2;
+    }
+    return 0 - 1;
+}
+
+// One manifest, checked all the way down: the manifest is what it says, its config
+// names a platform v1 builds for, every layer is present, intact and the size it
+// claims. Answers (0 or a refusal, the platform id, the manifest's own size).
+fn examine[&h, &d, &n](heap: &!h Heap, blobs: &d Dir, hex: &n [byte]) -> [heap, dir_read, file_read] (int, int, int) {
+    let (body, c1) = layout.read_blob(heap, blobs, hex, layout.max_document());
+    var code = c1;
+    var platform = 0 - 1;
+    var size = 0;
+    if code == 0 {
+        borrow body as &mb in {
+            let src = buffer.bytes(mb);
+            size = len(src);
+            region a {
+                let tape = alloc_slice[a](json.tape_len(src), 0);
+                let nodes = json.parse(src, tape);
+                if nodes < 0 {
+                    code = layout.refused_json();
+                } else if !digest.equal(layout.text_of(src, tape, 0, "mediaType"), image.media_manifest()) || layout.number_of(src, tape, 0, "schemaVersion") != 2 {
+                    code = idx_manifest();
+                } else {
+                    let cfg = json.get(src, tape, 0, "config");
+                    let layers = json.get(src, tape, 0, "layers");
+                    if cfg < 0 || layers < 0 || !json.is_array(tape, layers) || json.count(tape, layers) < 1 {
+                        code = idx_manifest();
+                    } else {
+                        let chex = layout.hex_of(layout.text_of(src, tape, cfg, "digest"));
+                        let csize = layout.number_of(src, tape, cfg, "size");
+                        if len(chex) == 0 || csize < 0 {
+                            code = idx_manifest();
+                        } else {
+                            let (cbody, c2) = layout.read_blob(heap, blobs, chex, layout.max_document());
+                            code = c2;
+                            if code == 0 {
+                                borrow cbody as &cb in {
+                                    let csrc = buffer.bytes(cb);
+                                    if len(csrc) != csize {
+                                        code = idx_manifest();
+                                    } else {
+                                        region b {
+                                            let ctape = alloc_slice[b](json.tape_len(csrc), 0);
+                                            if json.parse(csrc, ctape) < 0 {
+                                                code = layout.refused_json();
+                                            } else {
+                                                let arch = layout.text_of(csrc, ctape, 0, "architecture");
+                                                let os = layout.text_of(csrc, ctape, 0, "os");
+                                                if !image.arch_ok(arch) {
+                                                    code = image.refused_arch();
+                                                } else if !image.os_ok(os) {
+                                                    code = image.refused_os();
+                                                } else {
+                                                    platform = arch_id(arch);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            buffer.drop(heap, cbody);
+                            var l = 0;
+                            while code == 0 && l < json.count(tape, layers) {
+                                let node = json.at(tape, layers, l);
+                                let lhex = layout.hex_of(layout.text_of(src, tape, node, "digest"));
+                                let lsize = layout.number_of(src, tape, node, "size");
+                                if len(lhex) == 0 || lsize < 0 {
+                                    code = idx_manifest();
+                                } else {
+                                    let (vc, actual) = store.verify_sized(heap, blobs, lhex);
+                                    if vc != 0 {
+                                        code = vc;
+                                    } else if actual != lsize {
+                                        code = idx_manifest();
+                                    }
+                                }
+                                l = l + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, body);
+    return (code, platform, size);
+}
+
+fn assemble[&h, &d, &b, &g, &r, &i](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir, args: &g Args, ref: &r [byte], io: &!i Io) -> [heap, args, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var status = 1;
+    region a {
+        // At most three manifests can get here: one per supported platform, and a fourth would repeat one.
+        let texts = alloc_slice[a](3 * 71, byte_of(0));
+        let platforms = alloc_slice[a](3, 0);
+        let sizes = alloc_slice[a](3, 0);
+        let scratch = alloc_slice[a](32, byte_of(0));
+        var count = 0;
+        var code = 0;
+        var culprit = "";
+        var at = 1;
+        while at + 1 < arg_count(args) && code == 0 {
+            if digest.equal(arg(args, at), "--manifest") {
+                let text = arg(args, at + 1);
+                let hex = layout.hex_of(text);
+                if len(hex) == 0 {
+                    code = idx_digest();
+                    culprit = text;
+                } else {
+                    let (c, platform, size) = examine(heap, blobs, hex);
+                    if c != 0 {
+                        code = c;
+                        culprit = text;
+                    } else {
+                        var k = 0;
+                        while k < count {
+                            if platforms[k] == platform {
+                                code = idx_platform_twice();
+                                culprit = text;
+                            }
+                            k = k + 1;
+                        }
+                        if code == 0 {
+                            var j = 0;
+                            while j < 71 {
+                                texts[count * 71 + j] = text[j];
+                                j = j + 1;
+                            }
+                            platforms[count] = platform;
+                            sizes[count] = size;
+                            count = count + 1;
+                        }
+                    }
+                }
+            }
+            at = at + 2;
+        }
+        if code == 0 && count == 0 {
+            code = idx_none();
+        }
+        var index_text = alloc_slice[a](71, byte_of(0));
+        if code == 0 {
+            var w = image.begin_index(heap);
+            var k = 0;
+            while k < count {
+                w = image.add_manifest(heap, w, texts[k * 71..k * 71 + 71], sizes[k], arch_name(platforms[k]), "linux");
+                k = k + 1;
+            }
+            let body = image.end_index(heap, w);
+            var index_size = 0;
+            // Nothing is written until everything has been validated: the digest of the index is
+            // computed first, the entry that will point at it is built (which checks `--ref`), and only
+            // then are the blob and the two files written. A refusal leaves the layout as it was.
+            borrow body as &xb in {
+                index_size = buffer.size(xb);
+                digest.of_bytes(buffer.bytes(xb), scratch);
+                digest.text_into(scratch, index_text);
+            }
+            let (top, c3) = image.layout_index_json(heap, index_text, index_size, ref);
+            code = c3;
+            if code == 0 {
+                borrow body as &xb in {
+                    let outcome = store.put(heap, blobs, ".incoming-0", buffer.bytes(xb), scratch);
+                    if outcome <= 0 {
+                        code = outcome;
+                    }
+                }
+            }
+            if code == 0 {
+                borrow top as &tb in {
+                    if image.write_file(image_dir, "index.json", buffer.bytes(tb)) != 0 {
+                        code = store.refused_io();
+                    }
+                }
+                if code == 0 && image.write_file(image_dir, "oci-layout", image.layout_text()) != 0 {
+                    code = store.refused_io();
+                }
+            }
+            buffer.drop(heap, top);
+            buffer.drop(heap, body);
+        }
+        if code == 0 {
+            io.write_all(io, index_text);
+            io.write_all(io, "\n");
+            status = 0;
+        } else {
+            status = refuse(io, code, culprit);
+        }
+    }
+    return status;
+}
+
+fn with_out[&h, &f, &i, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args, out_path: &static [byte], ref: &r [byte]) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var status = 1;
+    match open_dir(fs, out_path) {
+        DirOpened::Failed(errno) => {
+            status = refuse(io, idx_dir(), out_path);
+        }
+        DirOpened::Ok(top) => {
+            var image_dir = top;
+            borrow image_dir as &id in {
+                match dir_enter(id, "blobs") {
+                    DirOpened::Failed(errno) => {
+                        status = refuse(io, idx_skeleton(), out_path);
+                    }
+                    DirOpened::Ok(blobs_dir) => {
+                        var blobs = blobs_dir;
+                        borrow blobs as &bd in {
+                            match dir_enter(bd, "sha256") {
+                                DirOpened::Failed(errno) => {
+                                    status = refuse(io, idx_skeleton(), out_path);
+                                }
+                                DirOpened::Ok(sha_dir) => {
+                                    var sha = sha_dir;
+                                    borrow sha as &sd in {
+                                        status = assemble(heap, id, sd, args, ref, io);
+                                    }
+                                    dir_close(sha);
+                                }
+                            }
+                        }
+                        dir_close(blobs);
+                    }
+                }
+            }
+            dir_close(image_dir);
+        }
+    }
+    return status;
+}
+
+fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var out = "";
+    var ref = "";
+    var bad = "";
+    var at = 1;
+    while at < arg_count(args) && len(bad) == 0 {
+        let flag = arg(args, at);
+        if at + 1 >= arg_count(args) {
+            bad = flag;
+        } else if digest.equal(flag, "--out") {
+            out = arg(args, at + 1);
+        } else if digest.equal(flag, "--ref") {
+            ref = arg(args, at + 1);
+        } else if !digest.equal(flag, "--manifest") {
+            bad = flag;
+        }
+        at = at + 2;
+    }
+    if len(bad) > 0 {
+        return refuse(io, idx_flag(), bad);
+    }
+    if len(out) == 0 {
+        return refuse(io, idx_missing(), "--out is required");
+    }
+    return with_out(heap, fs, io, args, out, ref);
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow fs as &f in {
+                borrow mut io as &!i in {
+                    status = run(h, f, i, g);
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(fs);
+    release(io);
+    return status;
+}

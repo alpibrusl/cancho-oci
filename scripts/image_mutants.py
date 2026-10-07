@@ -28,11 +28,12 @@ MUTANTS = [
     ("duplicate keys accepted", "if digest.equal(key, key_of(text[other..other_end], kind)) {", "if false {"),
     ("the user is dropped", 'w1 = json.put_key(heap, w1, "User");', 'w1 = json.put_key(heap, w1, "WorkingDir");'),
     ("the layer and config sizes swapped", "w1 = put_descriptor(heap, w1, layer_media, layer_digest, layer_size);", "w1 = put_descriptor(heap, w1, layer_media, layer_digest, config_size);"),
-    ("the ref annotation always written", "    if len(ref) > 0 {\n        w1 = json.put_key(heap, w1, \"annotations\");", "    if len(ref) >= 0 {\n        w1 = json.put_key(heap, w1, \"annotations\");"),
+    ("the ref annotation always written", "    w1 = json.end_object(heap, w1);\n    if len(ref) > 0 {\n        w1 = json.put_key(heap, w1, \"annotations\");", "    w1 = json.end_object(heap, w1);\n    if len(ref) >= 0 {\n        w1 = json.put_key(heap, w1, \"annotations\");"),
     ("the layout marker changed", '{\\"imageLayoutVersion\\":\\"1.0.0\\"}', '{\\"imageLayoutVersion\\":\\"1.0.1\\"}'),
     ("index.json written without replacing", "match dir_rename(dir, tmp, name) {", "match dir_rename_new(dir, tmp, name) {"),
     ("history text changed", 'w1 = json.put_string(heap, w1, "cancho-oci");', 'w1 = json.put_string(heap, w1, "cancho-oci 1");'),
-    ("a control character in the ref accepted", "} else if !plain(ref) {", "} else if false {"),
+    ("a control character in the ref accepted", "} else if !os_ok(os) {\n        code = refused_os();\n    } else if !plain(ref) {", "} else if !os_ok(os) {\n        code = refused_os();\n    } else if false {"),
+    ("a control character in a layout index ref accepted", "    if !digest_ok(index_digest) || index_size < 0 {\n        code = refused_text();\n    } else if !plain(ref) {", "    if !digest_ok(index_digest) || index_size < 0 {\n        code = refused_text();\n    } else if false {"),
     ("a control character in the user accepted", "} else if !plain(user) || !plain(workdir) {", "} else if !plain(workdir) {"),
     ("a control character in the working directory accepted", "} else if !plain(user) || !plain(workdir) {", "} else if !plain(user) {"),
 ]
@@ -60,6 +61,16 @@ def main():
                 continue
             r = subprocess.run([sys.executable, str(ROOT / "scripts/image_check.py"), "--cases", str(a.cases), "--probe", str(probe)], capture_output=True, text=True)
             killed = r.returncode != 0
+            if not killed:
+                # `layout_index_json` and the index builders are used only by oci-index, whose gate is the one that sees them
+                idx = m / "oci-index"
+                bx = subprocess.run(["cancho", "build", str(ROOT / "src/digest/digest.cho"), str(ROOT / "src/store/store.cho"), str(m / "image.cho"),
+                                     str(ROOT / "src/layout/layout.cho"), str(ROOT / "src/indexcli/main.cho"), "--std", "-o", str(idx)],
+                                    capture_output=True, text=True)
+                if bx.returncode == 0:
+                    rx = subprocess.run([sys.executable, str(ROOT / "scripts/index_check.py"), "--cases", "5", "--index", str(idx)],
+                                        capture_output=True, text=True)
+                    killed = rx.returncode != 0
             print(f"{'killed  ' if killed else 'SURVIVED'} {label}", flush=True)
             if not killed:
                 survived.append(label)

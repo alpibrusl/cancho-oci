@@ -445,6 +445,84 @@ pub fn index_json[&h, &m, &a, &o, &r](heap: &!h Heap, manifest_digest: &m [byte]
     return (json.finish(w1), 0);
 }
 
+// An image index over several manifests: `begin_index`, one `add_manifest` per
+// platform in the order given, then `end_index`. The order is the caller's, and it is
+// kept: a digest is over these exact bytes.
+pub fn begin_index[&h](heap: &!h Heap) -> [heap] json.Writer {
+    var w1 = json.writer(heap, 512);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "schemaVersion");
+    w1 = json.put_int(heap, w1, 2);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_index());
+    w1 = json.put_key(heap, w1, "manifests");
+    return json.begin_array(heap, w1);
+}
+
+pub fn add_manifest[&h, &m, &a, &o](heap: &!h Heap, w: json.Writer, manifest_digest: &m [byte], size: int, arch: &a [byte], os: &o [byte]) -> [heap] json.Writer {
+    var w1 = json.begin_object(heap, w);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_manifest());
+    w1 = json.put_key(heap, w1, "digest");
+    w1 = json.put_string(heap, w1, manifest_digest);
+    w1 = json.put_key(heap, w1, "size");
+    w1 = json.put_int(heap, w1, size);
+    w1 = json.put_key(heap, w1, "platform");
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "architecture");
+    w1 = json.put_string(heap, w1, arch);
+    w1 = json.put_key(heap, w1, "os");
+    w1 = json.put_string(heap, w1, os);
+    w1 = json.end_object(heap, w1);
+    return json.end_object(heap, w1);
+}
+
+pub fn end_index[&h](heap: &!h Heap, w: json.Writer) -> [heap] buffer.Buffer {
+    var w1 = json.end_array(heap, w);
+    w1 = json.end_object(heap, w1);
+    return json.finish(w1);
+}
+
+// `index.json` of a layout whose one entry is an image index blob (a multi-platform
+// image), with the tag as the `ref.name` annotation.
+pub fn layout_index_json[&h, &m, &r](heap: &!h Heap, index_digest: &m [byte], index_size: int, ref: &r [byte]) -> [heap] (buffer.Buffer, int) {
+    var code = 0;
+    if !digest_ok(index_digest) || index_size < 0 {
+        code = refused_text();
+    } else if !plain(ref) {
+        code = refused_ref();
+    }
+    if code != 0 {
+        return (buffer.empty(heap, 1), code);
+    }
+    var w1 = json.writer(heap, 512);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "schemaVersion");
+    w1 = json.put_int(heap, w1, 2);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_index());
+    w1 = json.put_key(heap, w1, "manifests");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_index());
+    w1 = json.put_key(heap, w1, "digest");
+    w1 = json.put_string(heap, w1, index_digest);
+    w1 = json.put_key(heap, w1, "size");
+    w1 = json.put_int(heap, w1, index_size);
+    if len(ref) > 0 {
+        w1 = json.put_key(heap, w1, "annotations");
+        w1 = json.begin_object(heap, w1);
+        w1 = json.put_key(heap, w1, "org.opencontainers.image.ref.name");
+        w1 = json.put_string(heap, w1, ref);
+        w1 = json.end_object(heap, w1);
+    }
+    w1 = json.end_object(heap, w1);
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    return (json.finish(w1), 0);
+}
+
 // Replace `<dir>/<name>` with `bytes`, atomically: write a temporary, sync it, and
 // rename it over the name. For the two files of a layout that are not blobs
 // (`oci-layout`, `index.json`), which are meant to be replaced by a rebuild.
