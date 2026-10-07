@@ -1,0 +1,33 @@
+edition 5;
+
+import std.io;
+
+// oci-build: the scaffold (#2). It builds nothing yet; it exists so that the
+// compiler pin, CI, the formatter and the authority ceiling (G5) are judged
+// on a real binary before any behaviour is added to it.
+//
+// Its authority row is what the ceiling pins: the console and nothing else.
+// `main` owns the capabilities it releases, so releasing `net` unused is the
+// proof that `build` reaches no network (design 5.5), and `fs`, `ffi`, `heap`
+// and `clock` the same for files, foreign code, memory and time.
+
+fn say[&i](io: &!i Io, text: &static [byte]) -> [io_write] int {
+    return io.write_all(io, text);
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(fs);
+    release(heap);
+    release(args);
+    release(net);
+    release(clock);
+
+    var status = 0;
+    borrow mut io as &!i in {
+        say(i, "oci-build: design stage, nothing is built yet (cancho-oci#19)\n");
+    }
+    release(io);
+    return status;
+}
