@@ -13,7 +13,20 @@ sources = ["src/build"]
 std = true
 out = "build/oci-build"
 
+# The test harness for oci.tar (#3): not shipped, but built and held to its own
+# authority ceiling like every other program (G5).
+[[bin]]
+name = "tar-probe"
+sources = ["src/tar", "tests/probe"]
+std = true
+out = "build/tar-probe"
+
 [[test]]
 name = "scaffold"
 sources = ["tests/scaffold_test.cho"]
+std = true
+
+[[test]]
+name = "tar"
+sources = ["src/tar", "tests/tar_test.cho"]
 std = true

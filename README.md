@@ -2,7 +2,7 @@
 
 **Container images without a container daemon.** A tool written in [cancho](https://github.com/alpibrusl/cancho) that assembles an [OCI image](https://github.com/opencontainers/image-spec) from a static binary: a deterministic layer, a config, a manifest and an image layout, byte-for-byte the same every time it is built from the same inputs, and optionally pushed to a registry. No Docker, no shell, no `RUN` steps, and an authority report that says what the tool can reach.
 
-**Status: design stage. Nothing is built.** There is no code, no benchmark and no claim beyond what is written here. The plan and its tasks are in the epic (see the issues). The first deliverable is `docs/design.md`: scope, the authority row, the reproducibility and security policy, the gates and the benchmark cells, written before any code.
+**Status: design stage; the first piece is built.** The deterministic tar writer (`src/tar/tar.cho`) exists and is held to a differential test against Python's `tarfile` and a mutation gate. There is no `build` command yet, no benchmark and no claim beyond what is written here. The plan and its tasks are in the epic (see the issues). The first deliverable is `docs/design.md`: scope, the authority row, the reproducibility and security policy, the gates and the benchmark cells, written before any code.
 
 ## Why
 
