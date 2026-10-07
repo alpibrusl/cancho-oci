@@ -4,9 +4,11 @@ module oci.layer;
 
 import oci.digest;
 import oci.elf;
+import oci.gzip;
 import oci.place;
 import oci.store;
 import oci.tar;
+import std.crypto;
 
 // `oci.layer` -- the one layer of a `FROM scratch` image, from `--bin src:dest`
 // and `--file src:dest` arguments (design 4 and 5.3, task #7).
@@ -344,10 +346,137 @@ pub fn measure[&g, &r, &n, &m, &s, &a](args: &g Args, root: &r Dir, names: &n [b
     return 0;
 }
 
-// Write `size` bytes of the file at `rel` into the blob, then the padding. Answers
-// the blob back and 0, or a refusal (the blob is then to be abandoned).
-fn put_file[&r, &c, &z, &p](blob: store.Blob, root: &r Dir, rel: &p [byte], size: int, chunk: &!c [byte], zeros: &z [byte]) -> [dir_read, file_read, file_write] (store.Blob, int) {
+// Where the layer's bytes go. Every byte of the tar passes through here once: it
+// is hashed (the `diff_id`, the digest of the uncompressed layer), and then either
+// written as it is (`mode` 0) or fed to the gzip encoder, whose output is what the
+// blob holds (`mode` 1). So a compressed layer has two digests, and both are made
+// in the one pass.
+pub res struct Sink {
+    blob: store.Blob,
+    gz: gzip.Gz,
+    diff: Box[[int]],
+    mode: int,
+}
+
+pub enum SinkBegan {
+    Ok(Sink),
+    Failed(int),
+}
+
+pub fn mode_none() -> [] int {
+    return 0;
+}
+
+pub fn mode_gzip() -> [] int {
+    return 1;
+}
+
+fn sink_begin[&h, &d, &t](heap: &!h Heap, blobs: &d Dir, tmp: &t [byte], mode: int) -> [heap, dir_write] SinkBegan {
+    match store.begin(heap, blobs, tmp) {
+        store.Began::Failed(errno) => {
+            return SinkBegan::Failed(refused_io());
+        }
+        store.Began::Ok(blob) => {
+            let diff = box_slice(heap, 138, 0);
+            borrow mut diff as &!dw in {
+                crypto.sha256_init(contents(dw));
+            }
+            return SinkBegan::Ok(Sink { blob: blob, gz: gzip.begin(heap), diff: diff, mode: mode });
+        }
+    }
+}
+
+// Take what the encoder has produced and write it to the blob.
+fn flush_gz[&g](blob: store.Blob, gz: &g gzip.Gz) -> [file_write] (store.Blob, int) {
+    let produced = gzip.output(gz);
+    if len(produced) == 0 {
+        return (blob, 0);
+    }
+    return store.write(blob, produced);
+}
+
+// Hash `bytes` and send them on. Answers the sink and 0, or a refusal.
+fn put_bytes[&b](sink: Sink, bytes: &b [byte]) -> [file_write] (Sink, int) {
+    let Sink { blob, gz, diff, mode } = sink;
+    borrow mut diff as &!dw in {
+        crypto.sha256_update(contents(dw), bytes);
+    }
     var current = blob;
+    var encoder = gz;
+    var code = 0;
+    if mode == 0 {
+        let (next, errno) = store.write(current, bytes);
+        current = next;
+        if errno != 0 {
+            code = refused_io();
+        }
+    } else {
+        var at = 0;
+        while at < len(bytes) && code == 0 {
+            let (next, taken) = gzip.feed(encoder, bytes[at..len(bytes)]);
+            encoder = next;
+            at = at + taken;
+            borrow encoder as &er in {
+                let (written, errno) = flush_gz(current, er);
+                current = written;
+                if errno != 0 {
+                    code = refused_io();
+                }
+            }
+            encoder = gzip.drained(encoder);
+        }
+    }
+    return (Sink { blob: current, gz: encoder, diff: diff, mode: mode }, code);
+}
+
+fn sink_abandon[&h, &d, &t](heap: &!h Heap, blobs: &d Dir, sink: Sink, tmp: &t [byte]) -> [heap, dir_write] int {
+    let Sink { blob, gz, diff, mode } = sink;
+    gzip.drop(heap, gz);
+    unbox_slice(heap, diff);
+    store.abandon(heap, blobs, blob, tmp);
+    return 0;
+}
+
+// Close the encoder if there is one, publish the blob, and answer (outcome, bytes
+// in the blob). `raw` receives the digest of the blob as stored, `diff_raw` that of
+// the uncompressed tar: the same when `mode` is 0.
+fn sink_finish[&h, &d, &t, &o, &q](heap: &!h Heap, blobs: &d Dir, sink: Sink, tmp: &t [byte], raw: &!o [byte], diff_raw: &!q [byte]) -> [heap, dir_write, file_write] (int, int) {
+    let Sink { blob, gz, diff, mode } = sink;
+    borrow mut diff as &!dw in {
+        crypto.sha256_final(contents(dw), diff_raw);
+    }
+    unbox_slice(heap, diff);
+    var current = blob;
+    var encoder = gz;
+    var code = 0;
+    if mode == 1 {
+        encoder = gzip.finish(encoder);
+        borrow encoder as &er in {
+            let (written, errno) = flush_gz(current, er);
+            current = written;
+            if errno != 0 {
+                code = refused_io();
+            }
+        }
+        encoder = gzip.drained(encoder);
+    }
+    gzip.drop(heap, encoder);
+    if code != 0 {
+        store.abandon(heap, blobs, current, tmp);
+        return (code, 0);
+    }
+    var size = 0;
+    borrow current as &cr in {
+        size = store.written(cr);
+    }
+    let outcome = store.finish(heap, blobs, current, tmp, raw);
+    return (outcome, size);
+}
+
+// Write `size` bytes of the file at `rel` into the sink, then the padding. Answers
+// the sink back and 0, or a refusal (the sink is then to be abandoned).
+fn put_file[&r, &c, &z, &p](sink: Sink, root: &r Dir, rel: &p [byte], size: int, chunk: &!c [byte], zeros: &z [byte]) -> [dir_read, file_read, file_write] (Sink, int) {
+    var current = sink;
     var code = 0;
     match place.open_file(root, rel) {
         Opened::Failed(errno) => {
@@ -361,7 +490,7 @@ fn put_file[&r, &c, &z, &p](blob: store.Blob, root: &r Dir, rel: &p [byte], size
                 borrow mut handle as &!f in {
                     match file_read(f, chunk) {
                         Read::Got(n) => {
-                            let (next, errno) = store.write(current, chunk[0..n]);
+                            let (next, errno) = put_bytes(current, chunk[0..n]);
                             current = next;
                             total = total + n;
                             if errno != 0 {
@@ -389,7 +518,7 @@ fn put_file[&r, &c, &z, &p](blob: store.Blob, root: &r Dir, rel: &p [byte], size
             if code == 0 {
                 let pad = tar.padding(size);
                 if pad > 0 {
-                    let (next, errno) = store.write(current, zeros[0..pad]);
+                    let (next, errno) = put_bytes(current, zeros[0..pad]);
                     current = next;
                     if errno != 0 {
                         code = refused_io();
@@ -402,30 +531,29 @@ fn put_file[&r, &c, &z, &p](blob: store.Blob, root: &r Dir, rel: &p [byte], size
 }
 
 // Stream the whole layer into the store under `tmp`: each header, each file's
-// bytes, the padding, and the two zero blocks that end an archive. `raw`
-// receives the layer's digest. Answers (outcome, size): `store.created()` or
-// `store.existed()` and the tar's length, or a refusal and 0.
-pub fn write[&h, &b, &r, &g, &n, &m, &t, &o](heap: &!h Heap, blobs: &b Dir, root: &r Dir, args: &g Args, names: &n [byte], meta: &m [int], count: int, mtime: int, tmp: &t [byte], raw: &!o [byte]) -> [heap, args, dir_read, dir_write, file_read, file_write] (int, int) {
-    match store.begin(heap, blobs, tmp) {
-        store.Began::Failed(errno) => {
-            return (refused_io(), 0);
+// bytes, the padding, and the two zero blocks that end an archive, compressed
+// when `mode` is `mode_gzip()`. `raw` receives the digest of the blob, `diff_raw`
+// the digest of the uncompressed tar. Answers (outcome, bytes in the blob):
+// `store.created()` or `store.existed()`, or a refusal and 0.
+pub fn write[&h, &b, &r, &g, &n, &m, &t, &o, &q](heap: &!h Heap, blobs: &b Dir, root: &r Dir, args: &g Args, names: &n [byte], meta: &m [int], count: int, mtime: int, mode: int, tmp: &t [byte], raw: &!o [byte], diff_raw: &!q [byte]) -> [heap, args, dir_read, dir_write, file_read, file_write] (int, int) {
+    match sink_begin(heap, blobs, tmp, mode) {
+        SinkBegan::Failed(code) => {
+            return (code, 0);
         }
-        store.Began::Ok(first) => {
-            var blob = first;
+        SinkBegan::Ok(first) => {
+            var sink = first;
             let chunk = box_slice(heap, 65536, byte_of(0));
             let zeros = box_slice(heap, 512, byte_of(0));
             let header = box_slice(heap, 512, byte_of(0));
             var code = 0;
-            var written = 0;
             var e = 0;
             while e < count && code == 0 {
                 borrow mut header as &!hw in {
                     let kind = meta[e * 6 + 2];
                     code = tar.header(contents(hw), name_of(names, meta, e), kind, meta[e * 6 + 5], meta[e * 6 + 3] == 1, mtime);
                     if code == 0 {
-                        let (next, errno) = store.write(blob, contents(hw));
-                        blob = next;
-                        written = written + 512;
+                        let (next, errno) = put_bytes(sink, contents(hw));
+                        sink = next;
                         if errno != 0 {
                             code = refused_io();
                         }
@@ -435,21 +563,19 @@ pub fn write[&h, &b, &r, &g, &n, &m, &t, &o](heap: &!h Heap, blobs: &b Dir, root
                     let spec = arg(args, meta[e * 6 + 4]);
                     borrow mut chunk as &!cw in {
                         borrow zeros as &zr in {
-                            let (next, c2) = put_file(blob, root, source_of(spec), meta[e * 6 + 5], contents(cw), contents(zr));
-                            blob = next;
+                            let (next, c2) = put_file(sink, root, source_of(spec), meta[e * 6 + 5], contents(cw), contents(zr));
+                            sink = next;
                             code = c2;
                         }
                     }
-                    written = written + meta[e * 6 + 5] + tar.padding(meta[e * 6 + 5]);
                 }
                 e = e + 1;
             }
             if code == 0 {
                 borrow zeros as &zr in {
-                    let (next, errno) = store.write(blob, contents(zr));
-                    let (last, errno2) = store.write(next, contents(zr));
-                    blob = last;
-                    written = written + 1024;
+                    let (next, errno) = put_bytes(sink, contents(zr));
+                    let (last, errno2) = put_bytes(next, contents(zr));
+                    sink = last;
                     if errno != 0 || errno2 != 0 {
                         code = refused_io();
                     }
@@ -459,11 +585,10 @@ pub fn write[&h, &b, &r, &g, &n, &m, &t, &o](heap: &!h Heap, blobs: &b Dir, root
             unbox_slice(heap, zeros);
             unbox_slice(heap, header);
             if code != 0 {
-                store.abandon(heap, blobs, blob, tmp);
+                sink_abandon(heap, blobs, sink, tmp);
                 return (code, 0);
             }
-            let outcome = store.finish(heap, blobs, blob, tmp, raw);
-            return (outcome, written);
+            return sink_finish(heap, blobs, sink, tmp, raw, diff_raw);
         }
     }
 }

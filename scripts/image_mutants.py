@@ -27,7 +27,7 @@ MUTANTS = [
     ("a port without digits accepted", "if int_of(item[k]) < '0' || int_of(item[k]) > '9' {", "if int_of(item[k]) < '0' || int_of(item[k]) > 'z' {"),
     ("duplicate keys accepted", "if digest.equal(key, key_of(text[other..other_end], kind)) {", "if false {"),
     ("the user is dropped", 'w1 = json.put_key(heap, w1, "User");', 'w1 = json.put_key(heap, w1, "WorkingDir");'),
-    ("the layer and config sizes swapped", "w1 = put_descriptor(heap, w1, media_layer(), layer_digest, layer_size);", "w1 = put_descriptor(heap, w1, media_layer(), layer_digest, config_size);"),
+    ("the layer and config sizes swapped", "w1 = put_descriptor(heap, w1, layer_media, layer_digest, layer_size);", "w1 = put_descriptor(heap, w1, layer_media, layer_digest, config_size);"),
     ("the ref annotation always written", "    if len(ref) > 0 {\n        w1 = json.put_key(heap, w1, \"annotations\");", "    if len(ref) >= 0 {\n        w1 = json.put_key(heap, w1, \"annotations\");"),
     ("the layout marker changed", '{\\"imageLayoutVersion\\":\\"1.0.0\\"}', '{\\"imageLayoutVersion\\":\\"1.0.1\\"}'),
     ("index.json written without replacing", "match dir_rename(dir, tmp, name) {", "match dir_rename_new(dir, tmp, name) {"),

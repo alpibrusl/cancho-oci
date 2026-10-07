@@ -1,0 +1,28 @@
+{
+  "bounded": true,
+  "effects": [
+    "args",
+    "heap",
+    "io_read",
+    "io_write"
+  ],
+  "labels": [
+    {
+      "name": "args",
+      "argument": null
+    },
+    {
+      "name": "heap",
+      "argument": null
+    },
+    {
+      "name": "io_read",
+      "argument": null
+    },
+    {
+      "name": "io_write",
+      "argument": null
+    }
+  ],
+  "foreign_symbols": []
+}

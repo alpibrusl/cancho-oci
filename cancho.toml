@@ -9,7 +9,7 @@ cancho = "25448b8f0d1e899dbfa7663aa0e5a521acd2a3dd"   # the compiler these sourc
 
 [[bin]]
 name = "oci-build"
-sources = ["src/digest", "src/tar", "src/elf", "src/place", "src/store", "src/image", "src/layer", "src/build"]
+sources = ["src/digest", "src/tar", "src/elf", "src/place", "src/store", "src/image", "src/gzip", "src/layer", "src/build"]
 std = true
 out = "build/oci-build"
 
@@ -34,6 +34,13 @@ name = "image-probe"
 sources = ["src/digest", "src/store", "src/image", "tests/probe/image"]
 std = true
 out = "build/image-probe"
+
+# The test harness for oci.gzip (#6), held to its own ceiling.
+[[bin]]
+name = "gzip-probe"
+sources = ["src/gzip", "tests/probe/gzip"]
+std = true
+out = "build/gzip-probe"
 
 [[test]]
 name = "scaffold"

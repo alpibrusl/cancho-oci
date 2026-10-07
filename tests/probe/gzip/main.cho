@@ -1,0 +1,112 @@
+edition 5;
+
+import std.io;
+import oci.gzip;
+
+// gzip-probe: the test harness for `oci.gzip` (#6). It reads stdin to the end,
+// feeds it to the encoder in pieces of at most 64 KiB, and writes the gzip stream
+// to stdout, draining the encoder after every call exactly as `oci.layer` does.
+// An optional first argument is the size of the pieces offered to `feed` (default
+// 65536): the output must not depend on it, and the gate checks that it does not.
+
+fn emit[&i, &g](io: &!i Io, gz: &g gzip.Gz) -> [io_write] int {
+    let bytes = gzip.output(gz);
+    var k = 0;
+    while k < len(bytes) {
+        putchar(io, int_of(bytes[k]));
+        k = k + 1;
+    }
+    return len(bytes);
+}
+
+fn run[&h, &i](heap: &!h Heap, io: &!i Io, step: int) -> [heap, io_read, io_write] int {
+    var gz = gzip.begin(heap);
+    let chunk = box_slice(heap, 65536, byte_of(0));
+    var going = true;
+    while going {
+        var got = 0;
+        borrow mut chunk as &!cw in {
+            let room = contents(cw);
+            var c = getchar(io);
+            while c >= 0 && got < len(room) {
+                room[got] = byte_of(c);
+                got = got + 1;
+                if got < len(room) {
+                    c = getchar(io);
+                } else {
+                    c = 0 - 2;
+                }
+            }
+            if c == 0 - 1 {
+                going = false;
+            }
+        }
+        var at = 0;
+        borrow chunk as &cr in {
+            while at < got {
+                var end = at + step;
+                if end > got {
+                    end = got;
+                }
+                let (next, taken) = gzip.feed(gz, contents(cr)[at..end]);
+                gz = next;
+                at = at + taken;
+                borrow gz as &gr in {
+                    emit(io, gr);
+                }
+                gz = gzip.drained(gz);
+            }
+        }
+    }
+    gz = gzip.finish(gz);
+    borrow gz as &gr in {
+        emit(io, gr);
+    }
+    gz = gzip.drained(gz);
+    gzip.drop(heap, gz);
+    unbox_slice(heap, chunk);
+    return 0;
+}
+
+fn number[&t](text: &t [byte]) -> [] int {
+    var value = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < '0' || c > '9' {
+            return 0 - 1;
+        }
+        value = value * 10 + (c - '0');
+        i = i + 1;
+    }
+    if len(text) == 0 {
+        return 0 - 1;
+    }
+    return value;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(fs);
+    release(net);
+    release(clock);
+    var step = 65536;
+    borrow args as &g in {
+        if arg_count(g) > 1 {
+            step = number(arg(g, 1));
+        }
+    }
+    release(args);
+    var status = 1;
+    if step >= 1 {
+        borrow mut heap as &!h in {
+            borrow mut io as &!i in {
+                status = run(h, i, step);
+            }
+        }
+    }
+    release(heap);
+    release(io);
+    return status;
+}

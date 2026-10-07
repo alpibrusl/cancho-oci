@@ -4,6 +4,7 @@ import std.buffer;
 import std.io;
 import oci.digest;
 import oci.elf;
+import oci.gzip;
 import oci.image;
 import oci.layer;
 import oci.store;
@@ -19,11 +20,13 @@ import oci.tar;
 //               [--entrypoint <word> ...] [--cmd <word> ...] [--env NAME=value ...]
 //               [--label name=value ...] [--port 8080/tcp ...]
 //               [--user <u>] [--workdir <dir>] [--ref <tag>] [--source-date-epoch <n>]
+//               [--compress gzip|none]
 //
 // `<src>` is a path beneath `--root`; `<dest>` is the path inside the image, with
 // no leading "/". A `--bin` is checked to be a static ELF executable for the
 // platform and gets mode 0755; a `--file` gets 0644. With no `--entrypoint` the
-// first `--bin` is the entrypoint. `<image-dir>` must already hold `blobs/sha256/`
+// first `--bin` is the entrypoint. The layer is gzip-compressed unless `--compress none`
+// (most tools, `crane` among them, expect gzip). `<image-dir>` must already hold `blobs/sha256/`
 // (cancho has no `mkdir` yet, design 5.3). Prints the manifest digest.
 //
 // A refusal is `refused: <rule tag>` on stderr, naming the path it is about, and
@@ -53,6 +56,10 @@ fn build_skeleton() -> [] int {
     return 0 - 506;
 }
 
+fn build_compress() -> [] int {
+    return 0 - 507;
+}
+
 fn rule_of(code: int) -> [] &static [byte] {
     if code == build_flag() {
         return "build-flag";
@@ -71,6 +78,9 @@ fn rule_of(code: int) -> [] &static [byte] {
     }
     if code == build_skeleton() {
         return "build-layout-skeleton";
+    }
+    if code == build_compress() {
+        return "build-compress";
     }
     if code <= 0 - 200 && code > 0 - 300 {
         return image.rule_name(code);
@@ -124,13 +134,13 @@ fn keep[&h, &d, &b, &t](heap: &!h Heap, blobs: &d Dir, bytes: &b [byte], text: &
 
 // The layer is in the store with digest text `layer_text` and `layer_size` bytes;
 // write the config, the manifest and the index around it.
-fn finish_image[&h, &d, &b, &m, &l, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir, manifest_text: &!m [byte], layer_text: &l [byte], layer_size: int, arch: &p [byte], os: &q [byte], ref: &x [byte], entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, dir_write, file_write] (int, int) {
+fn finish_image[&h, &d, &b, &m, &l, &k, &j, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir, manifest_text: &!m [byte], layer_text: &l [byte], diff_text: &k [byte], layer_media: &j [byte], layer_size: int, arch: &p [byte], os: &q [byte], ref: &x [byte], entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, dir_write, file_write] (int, int) {
     let config_text = box_slice(heap, 71, byte_of(0));
     var code = 0;
     var config_size = 0;
     var manifest_size = 0;
 
-    let (config, c1) = image.config_json(heap, arch, os, entrypoint, cmd, env, user, workdir, labels, ports, layer_text);
+    let (config, c1) = image.config_json(heap, arch, os, entrypoint, cmd, env, user, workdir, labels, ports, diff_text);
     code = c1;
     if code == 0 {
         borrow config as &cb in {
@@ -144,7 +154,7 @@ fn finish_image[&h, &d, &b, &m, &l, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap
 
     if code == 0 {
         borrow config_text as &cr in {
-            let (manifest, c2) = image.manifest_json(heap, contents(cr), config_size, layer_text, layer_size);
+            let (manifest, c2) = image.manifest_json(heap, contents(cr), config_size, layer_text, layer_size, layer_media);
             code = c2;
             if code == 0 {
                 borrow manifest as &mb in {
@@ -175,8 +185,15 @@ fn finish_image[&h, &d, &b, &m, &l, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap
     return (code, manifest_size);
 }
 
+fn layer_media(mode: int) -> [] &static [byte] {
+    if mode == layer.mode_gzip() {
+        return image.media_layer_gzip();
+    }
+    return image.media_layer();
+}
+
 // Table, sort, measure, write the layer, then the image around it.
-fn assemble[&h, &d, &b, &r, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z, &i](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir, root: &r Dir, args: &g Args, io: &!i Io, arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+fn assemble[&h, &d, &b, &r, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z, &i](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir, root: &r Dir, args: &g Args, io: &!i Io, arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, mode: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
     var status = 1;
     region a {
         let names = alloc_slice[a](8192, byte_of(0));
@@ -184,7 +201,9 @@ fn assemble[&h, &d, &b, &r, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z, &i](heap
         let state = alloc_slice[a](4, 0);
         let manifest_text = alloc_slice[a](71, byte_of(0));
         let layer_text = alloc_slice[a](71, byte_of(0));
+        let diff_text = alloc_slice[a](71, byte_of(0));
         let raw = alloc_slice[a](32, byte_of(0));
+        let diff_raw = alloc_slice[a](32, byte_of(0));
         var code = 0;
         let count = layer.collect(args, names, meta, state);
         if count < 0 {
@@ -196,16 +215,17 @@ fn assemble[&h, &d, &b, &r, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z, &i](heap
         }
         var layer_size = 0;
         if code == 0 {
-            let (outcome, size) = layer.write(heap, blobs, root, args, names, meta, count, mtime, ".incoming-1", raw);
+            let (outcome, size) = layer.write(heap, blobs, root, args, names, meta, count, mtime, mode, ".incoming-1", raw, diff_raw);
             if outcome > 0 {
                 digest.text_into(raw, layer_text);
+                digest.text_into(diff_raw, diff_text);
                 layer_size = size;
             } else {
                 code = outcome;
             }
         }
         if code == 0 {
-            let (c, manifest_size) = finish_image(heap, image_dir, blobs, manifest_text, layer_text, layer_size, arch, os, ref, entrypoint, cmd, env, user, workdir, labels, ports);
+            let (c, manifest_size) = finish_image(heap, image_dir, blobs, manifest_text, layer_text, diff_text, layer_media(mode), layer_size, arch, os, ref, entrypoint, cmd, env, user, workdir, labels, ports);
             code = c;
         }
         if code == 0 {
@@ -221,7 +241,7 @@ fn assemble[&h, &d, &b, &r, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z, &i](heap
     return status;
 }
 
-fn with_root[&h, &f, &i, &g, &d, &b, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args, root_path: &static [byte], image_dir: &d Dir, blobs: &b Dir, arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+fn with_root[&h, &f, &i, &g, &d, &b, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args, root_path: &static [byte], image_dir: &d Dir, blobs: &b Dir, arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, mode: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
     var status = 1;
     match open_dir(fs, root_path) {
         DirOpened::Failed(errno) => {
@@ -230,7 +250,7 @@ fn with_root[&h, &f, &i, &g, &d, &b, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](hea
         DirOpened::Ok(top) => {
             var root = top;
             borrow root as &rd in {
-                status = assemble(heap, image_dir, blobs, rd, args, io, arch, os, ref, mtime, entrypoint, cmd, env, user, workdir, labels, ports);
+                status = assemble(heap, image_dir, blobs, rd, args, io, arch, os, ref, mtime, mode, entrypoint, cmd, env, user, workdir, labels, ports);
             }
             dir_close(root);
         }
@@ -238,7 +258,7 @@ fn with_root[&h, &f, &i, &g, &d, &b, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](hea
     return status;
 }
 
-fn with_out[&h, &f, &i, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args, root_path: &static [byte], out_path: &static [byte], arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+fn with_out[&h, &f, &i, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args, root_path: &static [byte], out_path: &static [byte], arch: &p [byte], os: &q [byte], ref: &x [byte], mtime: int, mode: int, entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &y [byte], ports: &z [byte]) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
     var status = 1;
     match open_dir(fs, out_path) {
         DirOpened::Failed(errno) => {
@@ -261,7 +281,7 @@ fn with_out[&h, &f, &i, &g, &p, &q, &x, &e, &c, &v, &u, &w, &y, &z](heap: &!h He
                                 DirOpened::Ok(sha_dir) => {
                                     var sha = sha_dir;
                                     borrow sha as &sd in {
-                                        status = with_root(heap, fs, io, args, root_path, id, sd, arch, os, ref, mtime, entrypoint, cmd, env, user, workdir, labels, ports);
+                                        status = with_root(heap, fs, io, args, root_path, id, sd, arch, os, ref, mtime, mode, entrypoint, cmd, env, user, workdir, labels, ports);
                                     }
                                     dir_close(sha);
                                 }
@@ -297,6 +317,8 @@ fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args)
     var user = "";
     var workdir = "";
     var epoch = "";
+    var compress = "";
+    var compress_given = false;
     var entry = buffer.empty(heap, 32);
     var cmd = buffer.empty(heap, 32);
     var env = buffer.empty(heap, 32);
@@ -324,6 +346,9 @@ fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args)
                 workdir = value;
             } else if digest.equal(flag, "--source-date-epoch") {
                 epoch = value;
+            } else if digest.equal(flag, "--compress") {
+                compress = value;
+                compress_given = true;
             } else if digest.equal(flag, "--entrypoint") {
                 entry = buffer.push(heap, buffer.append(heap, entry, value), byte_of('\n'));
             } else if digest.equal(flag, "--cmd") {
@@ -347,6 +372,15 @@ fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args)
     if len(epoch) > 0 {
         mtime = number(epoch);
     }
+    var mode = layer.mode_gzip();
+    var bad_compress = false;
+    if compress_given {
+        if digest.equal(compress, "none") {
+            mode = layer.mode_none();
+        } else if !digest.equal(compress, "gzip") {
+            bad_compress = true;
+        }
+    }
     if len(bad) > 0 {
         status = refuse(io, build_flag(), bad);
     } else if len(root) == 0 || len(out) == 0 || len(platform) == 0 {
@@ -355,6 +389,8 @@ fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args)
         status = refuse(io, build_platform(), platform);
     } else if mtime < 0 {
         status = refuse(io, build_epoch(), epoch);
+    } else if bad_compress {
+        status = refuse(io, build_compress(), compress);
     } else if !image.os_ok(platform[0..slash]) {
         status = refuse(io, image.refused_os(), platform);
     } else if !image.arch_ok(platform[slash + 1..len(platform)]) {
@@ -376,7 +412,7 @@ fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args)
                 borrow env as &vb in {
                     borrow labels as &lb in {
                         borrow ports as &pb in {
-                            status = with_out(heap, fs, io, args, root, out, platform[slash + 1..len(platform)], platform[0..slash], ref, mtime, buffer.bytes(eb), buffer.bytes(cb), buffer.bytes(vb), user, workdir, buffer.bytes(lb), buffer.bytes(pb));
+                            status = with_out(heap, fs, io, args, root, out, platform[slash + 1..len(platform)], platform[0..slash], ref, mtime, mode, buffer.bytes(eb), buffer.bytes(cb), buffer.bytes(vb), user, workdir, buffer.bytes(lb), buffer.bytes(pb));
                         }
                     }
                 }

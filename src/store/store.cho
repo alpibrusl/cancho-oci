@@ -122,6 +122,11 @@ pub fn begin[&h, &d, &n](heap: &!h Heap, root: &d Dir, tmp: &n [byte]) -> [heap,
     return Began::Failed(refused_stale());
 }
 
+// How many bytes have been written to the blob so far.
+pub fn written[&b](blob: &b Blob) -> [] int {
+    return blob.size;
+}
+
 // Append `bytes` and hash them. Answers the blob back and 0, or a nonzero errno
 // (the blob is then to be dropped with `abandon`).
 pub fn write[&b](blob: Blob, bytes: &b [byte]) -> [file_write] (Blob, int) {

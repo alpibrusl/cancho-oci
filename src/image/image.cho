@@ -96,6 +96,10 @@ pub fn media_layer() -> [] &static [byte] {
     return "application/vnd.oci.image.layer.v1.tar";
 }
 
+pub fn media_layer_gzip() -> [] &static [byte] {
+    return "application/vnd.oci.image.layer.v1.tar+gzip";
+}
+
 // The marker file `oci-layout`.
 pub fn layout_text() -> [] &static [byte] {
     return "{\"imageLayoutVersion\":\"1.0.0\"}";
@@ -370,8 +374,8 @@ pub fn config_json[&h, &a, &o, &e, &c, &v, &u, &w, &l, &p, &d](heap: &!h Heap, a
 }
 
 // The manifest of an image with one layer.
-pub fn manifest_json[&h, &c, &l](heap: &!h Heap, config_digest: &c [byte], config_size: int, layer_digest: &l [byte], layer_size: int) -> [heap] (buffer.Buffer, int) {
-    if !digest_ok(config_digest) || !digest_ok(layer_digest) || config_size < 0 || layer_size < 0 {
+pub fn manifest_json[&h, &c, &l, &m](heap: &!h Heap, config_digest: &c [byte], config_size: int, layer_digest: &l [byte], layer_size: int, layer_media: &m [byte]) -> [heap] (buffer.Buffer, int) {
+    if !digest_ok(config_digest) || !digest_ok(layer_digest) || config_size < 0 || layer_size < 0 || !(digest.equal(layer_media, media_layer()) || digest.equal(layer_media, media_layer_gzip())) {
         return (buffer.empty(heap, 1), refused_text());
     }
     var w1 = json.writer(heap, 512);
@@ -384,7 +388,7 @@ pub fn manifest_json[&h, &c, &l](heap: &!h Heap, config_digest: &c [byte], confi
     w1 = put_descriptor(heap, w1, media_config(), config_digest, config_size);
     w1 = json.put_key(heap, w1, "layers");
     w1 = json.begin_array(heap, w1);
-    w1 = put_descriptor(heap, w1, media_layer(), layer_digest, layer_size);
+    w1 = put_descriptor(heap, w1, layer_media, layer_digest, layer_size);
     w1 = json.end_array(heap, w1);
     w1 = json.end_object(heap, w1);
     return (json.finish(w1), 0);
