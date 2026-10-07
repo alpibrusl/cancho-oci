@@ -114,6 +114,10 @@ jobs:
           python3 scripts/build_check.py --cases 30 --seed 1 --run --crane
           python3 scripts/build_check.py --cases 30 --seed 2
 
+      - name: G1 across machines -- every digest equals the committed golden file (also checked on macOS/arm64 in the other job)
+        working-directory: oci
+        run: python3 scripts/golden_check.py
+
       - name: oci-build packages itself -- a static build runs in a scratch container (docker)
         working-directory: oci
         run: |
@@ -131,3 +135,48 @@ jobs:
       - name: G5 -- and the gate can fail (a program that reads a file is refused)
         working-directory: oci
         run: python3 scripts/authority_ceiling.py --selftest
+
+  # The same golden digests on a second operating system and CPU architecture: a build on macOS/arm64 and a build on
+  # Linux/x86-64 must give identical manifests, configs, layers and diff_ids (design 2, G1; task #11).
+  golden-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: oci
+
+      - name: Read the compiler pin from cancho.toml
+        id: pin
+        run: echo "rev=$(sed -n 's/^cancho *= *"\([0-9a-f]*\)".*/\1/p' oci/cancho.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho
+          ref: ${{ steps.pin.outputs.rev }}
+          path: cancho
+
+      - name: Cache the compiler
+        id: compiler
+        uses: actions/cache@v4
+        with:
+          path: cancho/target/release/cancho
+          key: cancho-macos-${{ steps.pin.outputs.rev }}
+
+      - name: Build cancho
+        if: steps.compiler.outputs.cache-hit != 'true'
+        working-directory: cancho
+        run: cargo build --release -p cancho
+
+      - name: Put the compiler on PATH
+        run: echo "$GITHUB_WORKSPACE/cancho/target/release" >> "$GITHUB_PATH"
+
+      - name: Build oci-build
+        working-directory: oci
+        run: |
+          cancho --version
+          cancho build --bin oci-build
+
+      - name: Every digest equals the golden file, on macOS
+        working-directory: oci
+        run: python3 scripts/golden_check.py
+
