@@ -14,9 +14,9 @@ import argparse, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ORDER = ["digest", "tar", "elf", "place", "store", "image", "layer", "build"]
+ORDER = ["digest", "tar", "elf", "place", "store", "image", "gzip", "layer", "build"]
 FILES = {"digest": "src/digest/digest.cho", "tar": "src/tar/tar.cho", "elf": "src/elf/elf.cho", "place": "src/place/place.cho",
-         "store": "src/store/store.cho", "image": "src/image/image.cho", "layer": "src/layer/layer.cho", "build": "src/build/main.cho"}
+         "store": "src/store/store.cho", "image": "src/image/image.cho", "gzip": "src/gzip/gzip.cho", "layer": "src/layer/layer.cho", "build": "src/build/main.cho"}
 
 MUTANTS = [
     ("elf", "a dynamic executable accepted", "if le(table, i * 56, 4) == 3 {", "if le(table, i * 56, 4) == 99 {"),
@@ -37,8 +37,8 @@ MUTANTS = [
     ("layer", "binaries not inspected", "} else if meta[e * 6 + 3] == 1 {\n                            code = inspect(f, arch);", "} else if false {\n                            code = inspect(f, arch);"),
     ("layer", "duplicates accepted", "state[2] = e;\n            return refused_duplicate();", "return 0;"),
     ("layer", "file padding dropped", "let pad = tar.padding(size);", "let pad = 0;"),
-    ("layer", "the end-of-archive blocks short by one", "let (last, errno2) = store.write(next, contents(zr));\n                    blob = last;\n                    written = written + 1024;\n                    if errno != 0 || errno2 != 0 {", "blob = next;\n                    written = written + 1024;\n                    if errno != 0 {"),
-    ("layer", "the time ignored in headers", "kind, meta[e * 6 + 5], meta[e * 6 + 3] == 1, mtime);\n                    if code == 0 {\n                        let (next, errno) = store.write(blob, contents(hw));", "kind, meta[e * 6 + 5], meta[e * 6 + 3] == 1, 0);\n                    if code == 0 {\n                        let (next, errno) = store.write(blob, contents(hw));"),
+    ("layer", "the end-of-archive blocks short by one", "let (last, errno2) = put_bytes(next, contents(zr));\n                    sink = last;\n                    if errno != 0 || errno2 != 0 {", "sink = next;\n                    if errno != 0 {"),
+    ("layer", "the time ignored in headers", "kind, meta[e * 6 + 5], meta[e * 6 + 3] == 1, mtime);\n                    if code == 0 {\n                        let (next, errno) = put_bytes(sink, contents(hw));", "kind, meta[e * 6 + 5], meta[e * 6 + 3] == 1, 0);\n                    if code == 0 {\n                        let (next, errno) = put_bytes(sink, contents(hw));"),
     ("layer", "source and destination swapped", "return spec[0..split_at(spec)];", "return spec[split_at(spec) + 1..len(spec)];"),
     ("layer", "an empty destination accepted", "if k < 1 || k >= len(spec) - 1 {", "if k < 1 {"),
     ("layer", "no limit on entries", "if count >= max_entries() {", "if count >= 100000 {"),
@@ -50,6 +50,14 @@ MUTANTS = [
     ("build", "the platform OS not checked first", "} else if !image.os_ok(platform[0..slash]) {\n        status = refuse(io, image.refused_os(), platform);", "} else if false {\n        status = refuse(io, image.refused_os(), platform);"),
     ("build", "unknown flags accepted", '} else if !digest.equal(flag, "--bin") && !digest.equal(flag, "--file") {\n                bad = flag;', '} else if false {\n                bad = flag;'),
     ("build", "a bad epoch accepted", "} else if mtime < 0 {\n        status = refuse(io, build_epoch(), epoch);", "} else if false {\n        status = refuse(io, build_epoch(), epoch);"),
+    ("layer", "the uncompressed digest not computed", "crypto.sha256_update(contents(dw), bytes);", "crypto.sha256_update(contents(dw), bytes[0..0]);"),
+    ("layer", "gzip mode ignored: the bytes are stored plain", "    if mode == 0 {\n        let (next, errno) = store.write(current, bytes);", "    if true {\n        let (next, errno) = store.write(current, bytes);"),
+    ("layer", "the gzip stream never finished", "        encoder = gzip.finish(encoder);", "        encoder = encoder;"),
+    ("layer", "the layer size is not the blob's", "        size = store.written(cr);", "        size = 0;"),
+    ("build", "the media type always uncompressed", "    if mode == layer.mode_gzip() {\n        return image.media_layer_gzip();", "    if false {\n        return image.media_layer_gzip();"),
+    ("build", "--compress none ignored", "mode = layer.mode_none();", "mode = layer.mode_gzip();"),
+    ("build", "a bad --compress accepted", "bad_compress = true;", "bad_compress = false;"),
+    ("build", "an empty --compress accepted", "    if compress_given {\n        if digest.equal(compress, \"none\") {", "    if len(compress) > 0 {\n        if digest.equal(compress, \"none\") {"),
 ]
 
 

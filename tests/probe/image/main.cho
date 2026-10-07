@@ -89,7 +89,7 @@ fn assemble[&h, &d, &b, &l, &g](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir
     if code == 0 {
         borrow layer_text as &lr in {
             borrow config_text as &cr in {
-                let (manifest, c2) = image.manifest_json(heap, contents(cr), config_size, contents(lr), layer_size);
+                let (manifest, c2) = image.manifest_json(heap, contents(cr), config_size, contents(lr), layer_size, image.media_layer());
                 code = c2;
                 if code == 0 {
                     borrow manifest as &mb in {

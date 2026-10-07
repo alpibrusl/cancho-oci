@@ -18,7 +18,7 @@ For random inputs on all three architectures it checks:
 
     build_check.py [--cases N] [--seed S] [--run] [--build build/oci-build]
 """
-import argparse, importlib.util, json, os, platform, random, shutil, subprocess, sys, tarfile, tempfile
+import argparse, gzip, importlib.util, json, os, platform, random, shutil, socket, subprocess, sys, tarfile, tempfile, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -127,9 +127,24 @@ def check_image(image, rec, case_name, arch):
     layer = expected_layer(rec["files"], rec["mtime"])
     if layer is None:
         return
-    ok(blobs[lhex] == layer, f"{case_name}: the layer differs from the tarfile oracle ({len(blobs[lhex])} bytes vs {len(layer)})"
-       + ("" if blobs[lhex] == layer else f"\n   first difference: {TD.first_diff(blobs[lhex], layer)}"))
-    mc = IC.model_config(arch, "linux", rec["entry"], rec["cmd"], rec["env"], rec["user"], rec["workdir"], rec["labels"], rec["ports"], f"sha256:{lhex}")
+    gz = rec.get("compress", "gzip") == "gzip"
+    ok(manifest["layers"][0]["mediaType"] == ("application/vnd.oci.image.layer.v1.tar+gzip" if gz else "application/vnd.oci.image.layer.v1.tar"),
+       f"{case_name}: the layer media type is {manifest['layers'][0]['mediaType']}")
+    if gz:
+        # the blob is gzip: decoding it must give exactly the tar the oracle writes, and the config's diff_id is the
+        # digest of that tar, not of the blob (a compressed layer has two digests)
+        try:
+            plain = gzip.decompress(blobs[lhex])
+        except Exception as e:
+            ok(False, f"{case_name}: the layer is not valid gzip: {e}")
+            return
+        ok(plain == layer, f"{case_name}: the decompressed layer differs from the tarfile oracle ({len(plain)} bytes vs {len(layer)})"
+           + ("" if plain == layer else f"\n   first difference: {TD.first_diff(plain, layer)}"))
+        ok(blobs[lhex][:10] == bytes([0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF]), f"{case_name}: the gzip header is not the fixed one")
+    else:
+        ok(blobs[lhex] == layer, f"{case_name}: the layer differs from the tarfile oracle ({len(blobs[lhex])} bytes vs {len(layer)})"
+           + ("" if blobs[lhex] == layer else f"\n   first difference: {TD.first_diff(blobs[lhex], layer)}"))
+    mc = IC.model_config(arch, "linux", rec["entry"], rec["cmd"], rec["env"], rec["user"], rec["workdir"], rec["labels"], rec["ports"], f"sha256:{IC.sha(layer)}")
     ok(blobs[chex] == IC.compact(mc), f"{case_name}: config bytes differ from the model:\n  ours  {blobs[chex][:240]!r}\n  model {IC.compact(mc)[:240]!r}")
     mi = IC.model_index(f"sha256:{mhex}", len(blobs[mhex]), arch, "linux", rec["ref"])
     ok((image / "index.json").read_bytes() == IC.compact(mi), f"{case_name}: index bytes differ from the model")
@@ -177,6 +192,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--build", default=str(ROOT / "build" / "oci-build"))
     ap.add_argument("--run", action="store_true", help="run the host-architecture image in podman")
+    ap.add_argument("--crane", action="store_true", help="push to an in-memory registry and validate with crane (full layer check)")
     ap.add_argument("--dogfood", help="a static oci-build for the host architecture: package it with oci-build and run it in podman")
     a = ap.parse_args()
     rng = random.Random(a.seed)
@@ -185,6 +201,22 @@ def main():
     have_skopeo, have_crane = shutil.which("skopeo"), shutil.which("crane")
     rt = runtime() if (a.run or a.dogfood) else None
     ran_run = False
+    crane_full = 0
+    server, registry = None, None
+    if shutil.which("crane") and a.crane:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        server = subprocess.Popen(["crane", "registry", "serve", "--address", f"127.0.0.1:{port}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                registry = f"127.0.0.1:{port}"
+                break
+            except OSError:
+                time.sleep(0.1)
+        if not registry:
+            fail("the in-memory registry (crane registry serve) did not start")
 
     with tempfile.TemporaryDirectory() as t:
         t = Path(t)
@@ -228,7 +260,10 @@ def main():
                 extra += ["--port", v]
             for v in entry_flag.split("\n") if entry_flag else []:
                 extra += ["--entrypoint", v]
-            rec = dict(files=rec_files, mtime=mtime, user=user, workdir=workdir, env=env, ports=ports, ref=ref, cmd="", labels="",
+            compress = ["gzip", "gzip", "none"][n % 3 if n < 3 else rng.randrange(3)]
+            if compress == "none" or rng.random() < 0.3:
+                extra += ["--compress", compress]
+            rec = dict(files=rec_files, mtime=mtime, user=user, workdir=workdir, env=env, ports=ports, ref=ref, cmd="", labels="", compress=compress,
                        entry=entry_flag if entry_flag else "/" + bins[0][1])
             code, stdout, err = build(exe, root, out, f"linux/{arch}", extra)
             if not ok(code == 0 and stdout.startswith("sha256:"), f"case {n} ({arch}): build refused: {err!r}"):
@@ -251,6 +286,16 @@ def main():
                     ok(rc == 0, f"case {n}: skopeo refused the image: {text[:200]}")
                     rc, text = tool(["skopeo", "copy", target, f"dir:{w / 'copy'}"])
                     ok(rc == 0, f"case {n}: skopeo copy failed: {text[:200]}")
+            if registry and n < 9 and rec.get("compress") == "gzip":
+                ref_ = f"{registry}/build{n}:t"
+                rc, text = tool(["crane", "push", str(out), ref_, "--insecure"])
+                if ok(rc == 0, f"case {n}: crane push failed: {text[:200]}"):
+                    # a gzip layer: crane's FULL validation (it decompresses every layer and checks diff_ids) must pass.
+                    rc, text = tool(["crane", "validate", "--remote", ref_, "--insecure"])
+                    ok(rc == 0, f"case {n}: crane validate (full, with the layers) refused a gzip image: {text[:300]}")
+                    rc, text = tool(["crane", "digest", ref_, "--insecure"])
+                    ok(rc == 0 and text.strip() == stdout, f"case {n}: the registry's manifest digest {text.strip()!r} is not the one oci-build printed {stdout!r}")
+                    crane_full += 1
             if a.run and rt and arch == host_arch and not ran_run:
                 ran_run = True
                 src = f"oci:{out}" + (f":{rec['ref']}" if rec["ref"] else "")
@@ -339,6 +384,8 @@ def main():
             (["--bin", "bin/amd64:app"], "linuxamd64", "build-platform", None),
             (["--bin", "bin/amd64:app"], "linux/", "build-platform", None),
             (["--bin", "bin/amd64:app", "--source-date-epoch", "soon"], "linux/amd64", "build-source-date-epoch", None),
+            (["--bin", "bin/amd64:app", "--compress", "zstd"], "linux/amd64", "build-compress", "zstd"),
+            (["--bin", "bin/amd64:app", "--compress", ""], "linux/amd64", "build-compress", None),
             (["--bin", "bin/amd64:app", "--env", "NOEQ"], "linux/amd64", "image-env", None),
             (["--bin", "bin/amd64:app", "--port", "80"], "linux/amd64", "image-port", None),
             (["--bin", "bin/amd64:app", "--label", "a=1", "--label", "a=2"], "linux/amd64", "image-label", None),
@@ -402,7 +449,14 @@ def main():
                            f"dogfood: the packaged oci-build did not run as expected in the container: exit {rc} {se!r}")
                         print(f"dogfood: oci-build ran inside a scratch container built by oci-build ({rt}): {se.strip()[:90]}")
 
+    if server:
+        server.terminate()
+        server.wait(timeout=10)
     notes = []
+    if a.crane and not shutil.which("crane"):
+        notes.append("crane NOT installed: not run")
+    elif crane_full:
+        notes.append(f"crane's full validation passed on {crane_full} gzip images")
     if not have_skopeo:
         notes.append("skopeo NOT installed: not run")
     print(f"{'FAIL' if bad else 'ok'}: {checks} checks, {bad} failure(s)" + (f"  [{'; '.join(notes)}]" if notes else ""))

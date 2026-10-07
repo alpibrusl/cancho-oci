@@ -96,6 +96,14 @@ jobs:
           python3 scripts/image_check.py --cases 80 --seed 1
           python3 scripts/image_check.py --cases 80 --seed 2
 
+      - name: gzip -- four independent decoders, every edge, the same bytes however the data is offered, stored blocks for the incompressible
+        working-directory: oci
+        run: python3 scripts/gzip_check.py --big-mib 8
+
+      - name: The gzip encoder's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/gzip_mutants.py
+
       - name: The image module's mutants are all killed
         working-directory: oci
         run: python3 scripts/image_mutants.py
@@ -103,7 +111,7 @@ jobs:
       - name: oci-build -- layers equal the tarfile oracle, images validate and reproduce, ELF and path refusals, an image runs in a container
         working-directory: oci
         run: |
-          python3 scripts/build_check.py --cases 30 --seed 1 --run
+          python3 scripts/build_check.py --cases 30 --seed 1 --run --crane
           python3 scripts/build_check.py --cases 30 --seed 2
 
       - name: oci-build packages itself -- a static build runs in a scratch container (docker)
