@@ -1,0 +1,171 @@
+edition 5;
+
+module oci.digest;
+
+import std.crypto;
+
+// `oci.digest` -- the `sha256:<hex>` form every blob, layer and manifest is
+// named by (design 5.2, task #4). Pure: it hashes nothing itself (the streaming
+// state is `std.crypto`'s), it only spells and checks digests.
+//
+// The text form is strict: the algorithm `sha256`, a colon, and exactly 64
+// LOWERCASE hex digits. Upper case, a different length or another algorithm is
+// a refusal, never a "close enough": a digest is a name, and two spellings of
+// one name are two names.
+
+pub fn raw_len() -> [] int {
+    return 32;
+}
+
+pub fn hex_len() -> [] int {
+    return 64;
+}
+
+// "sha256:" and the 64 digits.
+pub fn text_len() -> [] int {
+    return 71;
+}
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+pub fn refused_algorithm() -> [] int {
+    return 0 - 1;
+}
+
+pub fn refused_length() -> [] int {
+    return 0 - 2;
+}
+
+pub fn refused_hex() -> [] int {
+    return 0 - 3;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "ok";
+    }
+    if code == refused_algorithm() {
+        return "digest-algorithm";
+    }
+    if code == refused_length() {
+        return "digest-length";
+    }
+    if code == refused_hex() {
+        return "digest-hex";
+    }
+    return "unknown";
+}
+
+fn digit(n: int) -> [] int {
+    if n < 10 {
+        return '0' + n;
+    }
+    return 'a' + n - 10;
+}
+
+// The 32 raw bytes of `raw` as 64 lowercase hex digits in `out[0..64]`.
+pub fn hex_into[&r, &o](raw: &r [byte], out: &!o [byte]) -> [] int {
+    var i = 0;
+    while i < 32 {
+        let b = int_of(raw[i]);
+        out[i * 2] = byte_of(digit(b >> 4));
+        out[i * 2 + 1] = byte_of(digit(b & 15));
+        i = i + 1;
+    }
+    return 64;
+}
+
+// "sha256:" followed by the hex, 71 bytes, into `out[0..71]`.
+pub fn text_into[&r, &o](raw: &r [byte], out: &!o [byte]) -> [] int {
+    let prefix = "sha256:";
+    var i = 0;
+    while i < 7 {
+        out[i] = prefix[i];
+        i = i + 1;
+    }
+    var k = 0;
+    while k < 32 {
+        let b = int_of(raw[k]);
+        out[7 + k * 2] = byte_of(digit(b >> 4));
+        out[7 + k * 2 + 1] = byte_of(digit(b & 15));
+        k = k + 1;
+    }
+    return 71;
+}
+
+// The value of one lowercase hex digit, or -1.
+fn nibble(c: int) -> [] int {
+    if c >= '0' && c <= '9' {
+        return c - '0';
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10;
+    }
+    return 0 - 1;
+}
+
+// 64 lowercase hex digits (no prefix) into 32 raw bytes: 0, or `refused_length`
+// or `refused_hex`. `raw` is untouched on a refusal.
+pub fn parse_hex_into[&t, &o](hex: &t [byte], raw: &!o [byte]) -> [] int {
+    if len(hex) != 64 {
+        return refused_length();
+    }
+    var i = 0;
+    while i < 64 {
+        if nibble(int_of(hex[i])) < 0 {
+            return refused_hex();
+        }
+        i = i + 1;
+    }
+    var k = 0;
+    while k < 32 {
+        raw[k] = byte_of(nibble(int_of(hex[k * 2])) * 16 + nibble(int_of(hex[k * 2 + 1])));
+        k = k + 1;
+    }
+    return 0;
+}
+
+// "sha256:<64 lowercase hex>" into 32 raw bytes: 0 or a refusal.
+pub fn parse_into[&t, &o](text: &t [byte], raw: &!o [byte]) -> [] int {
+    let prefix = "sha256:";
+    if len(text) < 7 {
+        return refused_algorithm();
+    }
+    var i = 0;
+    while i < 7 {
+        if text[i] != prefix[i] {
+            return refused_algorithm();
+        }
+        i = i + 1;
+    }
+    return parse_hex_into(text[7..len(text)], raw);
+}
+
+pub fn equal[&a, &b](x: &a [byte], y: &b [byte]) -> [] bool {
+    if len(x) != len(y) {
+        return false;
+    }
+    var i = 0;
+    while i < len(x) {
+        if x[i] != y[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The digest of `message` into `raw[0..32]`, for a message that fits in memory.
+// (A file or a stream goes through `std.crypto`'s init/update/final, as
+// `oci.store` does.)
+pub fn of_bytes[&m, &o](message: &m [byte], raw: &!o [byte]) -> [] int {
+    region a {
+        let state = alloc_slice[a](138, 0);
+        crypto.sha256_init(state);
+        crypto.sha256_update(state, message);
+        crypto.sha256_final(state, raw);
+    }
+    return 0;
+}

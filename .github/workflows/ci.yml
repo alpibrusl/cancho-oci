@@ -65,6 +65,21 @@ jobs:
         working-directory: oci
         run: python3 scripts/tar_mutants.py --cases 100
 
+      - name: Tools the store gate compares against
+        run: sudo apt-get install -y -q strace coreutils
+
+      - name: Digests agree with sha256sum (incl. a 4.5 GiB file past the 32-bit counter); the store is write-once, tamper-evident and confined
+        working-directory: oci
+        run: python3 scripts/store_diff.py --big-gib 4.5
+
+      - name: The store's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/store_mutants.py
+
+      - name: Durability, observed -- fsync, a rename that cannot replace, fsync (Linux)
+        working-directory: oci
+        run: python3 scripts/store_syscalls.py
+
       - name: G5 -- every binary's authority is within its committed ceiling
         working-directory: oci
         run: python3 scripts/authority_ceiling.py
