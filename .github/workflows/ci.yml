@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: oci
+
+      # The compiler is whichever commit cancho.toml says these sources were
+      # written for: one place, which the compiler itself checks.
+      - name: Read the compiler pin from cancho.toml
+        id: pin
+        run: echo "rev=$(sed -n 's/^cancho *= *"\([0-9a-f]*\)".*/\1/p' oci/cancho.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho
+          ref: ${{ steps.pin.outputs.rev }}
+          path: cancho
+
+      - name: Cache the compiler
+        id: compiler
+        uses: actions/cache@v4
+        with:
+          path: cancho/target/release/cancho
+          key: cancho-${{ steps.pin.outputs.rev }}
+
+      - name: Build cancho
+        if: steps.compiler.outputs.cache-hit != 'true'
+        working-directory: cancho
+        run: cargo build --release -p cancho
+
+      - name: Put the compiler on PATH
+        run: echo "$GITHUB_WORKSPACE/cancho/target/release" >> "$GITHUB_PATH"
+
+      - name: The compiler is the one cancho.toml pins
+        working-directory: oci
+        run: cancho --version | grep -F "rev ${{ steps.pin.outputs.rev }}"
+
+      - name: Formatting
+        working-directory: oci
+        run: cancho fmt --check src tests
+
+      - name: Build every program
+        working-directory: oci
+        run: cancho build
+
+      - name: Tests
+        working-directory: oci
+        run: cancho test
+
+      - name: G5 -- every binary's authority is within its committed ceiling
+        working-directory: oci
+        run: python3 scripts/authority_ceiling.py
+
+      - name: G5 -- and the gate can fail (a program that reads a file is refused)
+        working-directory: oci
+        run: python3 scripts/authority_ceiling.py --selftest
