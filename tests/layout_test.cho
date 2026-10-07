@@ -1,0 +1,51 @@
+edition 7;
+
+import oci.digest;
+import oci.layout;
+import std.json;
+import std.test;
+
+// The pure accessors of `oci.layout`, on documents parsed into a tape in a region.
+// `read_blob` needs a directory and a heap and is judged by scripts/index_check.py.
+
+fn test_text_and_numbers() -> [] int {
+    region a {
+        let doc = "{\"name\":\"amd64\",\"size\":123,\"nested\":{\"k\":\"v\"},\"flag\":true,\"neg\":-5,\"big\":99999999999999999999,\"frac\":1.5}";
+        let tape = alloc_slice[a](json.tape_len(doc), 0);
+        test.assert(json.parse(doc, tape) > 0);
+        test.assert(digest.equal(layout.text_of(doc, tape, 0, "name"), "amd64"));
+        test.assert_eq(len(layout.text_of(doc, tape, 0, "absent")), 0);
+        // a value that is not a string is "no text", not its own spelling
+        test.assert_eq(len(layout.text_of(doc, tape, 0, "size")), 0);
+        test.assert_eq(len(layout.text_of(doc, tape, 0, "flag")), 0);
+        test.assert_eq(len(layout.text_of(doc, tape, 0, "nested")), 0);
+        test.assert_eq(layout.number_of(doc, tape, 0, "size"), 123);
+        test.assert_eq(layout.number_of(doc, tape, 0, "neg"), 0 - 5);
+        // absent, not a number, or not exactly an integer: -1
+        test.assert_eq(layout.number_of(doc, tape, 0, "absent"), 0 - 1);
+        test.assert_eq(layout.number_of(doc, tape, 0, "name"), 0 - 1);
+        test.assert_eq(layout.number_of(doc, tape, 0, "frac"), 0 - 1);
+        test.assert_eq(layout.number_of(doc, tape, 0, "big"), 0 - 1);
+        test.assert_eq(layout.number_of(doc, tape, 0, "flag"), 0 - 1);
+    }
+    return 0;
+}
+
+fn test_hex_of_a_digest() -> [] int {
+    let good = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    test.assert(digest.equal(layout.hex_of(good), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    test.assert_eq(len(layout.hex_of("sha256:abc")), 0);
+    test.assert_eq(len(layout.hex_of("sha512:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")), 0);
+    test.assert_eq(len(layout.hex_of("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")), 0);
+    test.assert_eq(len(layout.hex_of("sha256:BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD")), 0);
+    test.assert_eq(len(layout.hex_of("")), 0);
+    return 0;
+}
+
+fn test_every_rule_has_a_tag() -> [] int {
+    test.assert(digest.equal(layout.rule_name(layout.refused_too_large()), "layout-document-too-large"));
+    test.assert(digest.equal(layout.rule_name(layout.refused_json()), "layout-json"));
+    test.assert(digest.equal(layout.rule_name(layout.refused_shape()), "layout-shape"));
+    test.assert(digest.equal(layout.rule_name(0), "unknown"));
+    return 0;
+}

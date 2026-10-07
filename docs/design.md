@@ -187,6 +187,32 @@ Not run on the Mac this was written on, so CI is their first run: `skopeo` and `
 
 What this does not show: reproducibility of the *binary* (that is cancho's, not ours), builds on Windows, or builds with a different compiler revision (the pin is part of the contract; a new pin should change nothing here, and if it does the golden file says so).
 
+**Built and measured (task #8: `src/layout`, `src/indexcli`, the index builders in `src/image`).** `oci-index` combines per-platform images into one multi-platform image:
+
+```
+oci-build --out img --platform linux/amd64 ...   # prints sha256:A     (one image per platform, the same --out)
+oci-build --out img --platform linux/arm64 ...   # prints sha256:B     (blobs live side by side; identical ones are shared)
+oci-index --out img --manifest sha256:A --manifest sha256:B --ref v1   # prints the index digest
+```
+
+Nothing is trusted from the command line. Each manifest, its config and every layer are read back from `blobs/sha256` through the directory handle and **re-hashed**; the platform is the config's own `architecture` and `os`, not a flag; a manifest of the same platform twice is refused; the image index is written in the order named; and `index.json` is replaced by one entry pointing at it with the tag. No blobs are copied. The gate (`scripts/index_check.py`, 250 checks at 16 cases, two seeds in CI):
+
+- both documents validate against the **official OCI schemas** and equal, byte for byte, an independent model (manifests in order, each with its blob's real size);
+- the layout holds exactly the images' blobs plus the index blob; running it again changes nothing; building in another directory gives identical bytes;
+- **32 refusals**: a platform twice, a missing blob, a tampered manifest, config or layer (re-hash mismatch), a layer or a config given as a manifest, a manifest of another media type or `schemaVersion`, with no layers, with no config, that is not JSON, one over the 1 MiB document cap, hand-made manifests with a wrong layer size, a wrong config size, an unsupported architecture or OS, a layer that is missing, a malformed or wrong-algorithm digest, an unknown flag, a missing `--out`, directory or skeleton, a bad `--ref`. **A refusal leaves `index.json` and the blob set exactly as they were.**
+- in CI: `skopeo inspect` picks the right image for each architecture, `skopeo copy --all` re-verifies every digest, `crane push` and `crane validate --remote` check the index and every image under it (the full layer check), and the registry's digest is the index digest;
+- 22 of 22 `oci-index` mutants killed, and the other 113 mutants of the earlier tools re-run and killed.
+
+What building it found:
+
+1. **A real defect, found by a test written for something else.** With a bad `--ref`, `oci-index` refused with the right tag but only *after* it had written the new index blob, so a refused run left an orphan blob behind. Nothing is written now until everything is validated: the index digest is computed first, the layout entry (which checks the ref) is built, then the blob and the files are written.
+2. **A limit that could never fire.** I had written "at most 16 manifests per index", but with three supported platforms and "each platform once", a fourth manifest is always a repeated platform. The rule was dead code and was deleted; the gate says there is no separate "too many".
+3. **Two redundant guards, found as equivalent mutants** (`is_string` before `string_view`, which already answers an empty slice for a non-string; and `fits_int`, whose effect the later size comparison hides). One was deleted; the other became a unit test of the helper's own contract (`tests/layout_test.cho`), because a helper should keep its contract even where a later check would mask it.
+4. **A mutation script's anchors are part of the code they test.** Adding `verify_sized` (a copy of `verify`) and `layout_index_json` (a copy of part of `index_json`) made four anchors ambiguous; the local full re-run caught it before CI did. New code gets its own mutants, and a store or image mutant is now also judged by the index gate, because `oci-index` is the only user of `verify_sized` and of the layout index.
+5. **The platform comes from the config, which is what the manifest does not contain.** An image manifest has no platform; the index needs one, and the config's `architecture` and `os` are the only authority for it.
+
+Not done, and said so: platform variants (32-bit ARM `v6`/`v7`), `os.version` and features, an index of indexes, attaching artifacts (task #12), and building every platform in one invocation (the shared `--out` was chosen over copying blobs between layouts).
+
 ### 5.4 The static-binary check, and architecture
 
 `build` reads the input binary's **ELF header** and program headers (plain byte parsing, no foreign code) and refuses a dynamic binary: a `PT_INTERP` means it needs a loader a `scratch` image does not have. (Built in task #7: the refusal `elf-dynamic` names the *entry*; naming the loader path and the `DT_NEEDED` libraries is not built.) `e_machine` gives the architecture (`x86-64` is `amd64`, `AArch64` is `arm64`, `RISC-V` is `riscv64`), so a binary that does not match `--platform` is refused. The builder is **architecture-independent**: it can package any ELF it can read, not only what cancho compiles to. cancho's compiler reaches `aarch64`, `riscv64` and `x64` (`docs/backend-limits.md` §1.3); a 32-bit ARM binary from another toolchain needs a variant (`v6`/`v7`) that is not in `e_machine`, so v1 refuses it unless `--variant` is given. Edge and IoT gateways are mostly `arm64` or `riscv64`, so multi-architecture (#8) is first-class, not an afterthought.
