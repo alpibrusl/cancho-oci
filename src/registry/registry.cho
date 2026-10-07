@@ -1,0 +1,936 @@
+edition 7;
+
+module oci.registry;
+
+import oci.digest;
+import oci.http;
+import oci.layout;
+import oci.store;
+import std.buffer;
+
+// `oci.registry` -- the client half of the OCI Distribution protocol (design 5.7, task #9):
+// is a blob there, upload it, put a manifest. Every response is checked rather than
+// believed: an upload's `Location` may only point back at the same host, the digest a
+// registry reports for what it stored must be the digest we computed, and an error is a
+// refusal that names the status and the first error code the registry gave.
+//
+// Authentication is HTTP Basic, sent on every request when credentials are given. A
+// bearer-token challenge is refused by name (`registry-auth-bearer`), not guessed at.
+//
+// Each call is one or two exchanges on fresh connections (`oci.http` does not keep a
+// connection alive), so there is no connection state to get wrong.
+
+pub fn refused_unauthorized() -> [] int {
+    return 0 - 901;
+}
+
+pub fn refused_denied() -> [] int {
+    return 0 - 902;
+}
+
+pub fn refused_not_found() -> [] int {
+    return 0 - 903;
+}
+
+pub fn refused_rejected() -> [] int {
+    return 0 - 904;
+}
+
+pub fn refused_server() -> [] int {
+    return 0 - 905;
+}
+
+pub fn refused_unexpected() -> [] int {
+    return 0 - 906;
+}
+
+pub fn refused_location() -> [] int {
+    return 0 - 907;
+}
+
+pub fn refused_redirect() -> [] int {
+    return 0 - 908;
+}
+
+pub fn refused_digest() -> [] int {
+    return 0 - 909;
+}
+
+pub fn refused_bearer() -> [] int {
+    return 0 - 910;
+}
+
+pub fn refused_name() -> [] int {
+    return 0 - 911;
+}
+
+pub fn refused_size() -> [] int {
+    return 0 - 912;
+}
+
+pub fn refused_media() -> [] int {
+    return 0 - 913;
+}
+
+pub fn refused_creds() -> [] int {
+    return 0 - 914;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == refused_unauthorized() {
+        return "registry-unauthorized";
+    }
+    if code == refused_denied() {
+        return "registry-denied";
+    }
+    if code == refused_not_found() {
+        return "registry-not-found";
+    }
+    if code == refused_rejected() {
+        return "registry-rejected";
+    }
+    if code == refused_server() {
+        return "registry-server-error";
+    }
+    if code == refused_unexpected() {
+        return "registry-unexpected-status";
+    }
+    if code == refused_location() {
+        return "registry-location";
+    }
+    if code == refused_redirect() {
+        return "registry-redirect-foreign-host";
+    }
+    if code == refused_digest() {
+        return "registry-digest-mismatch";
+    }
+    if code == refused_bearer() {
+        return "registry-auth-bearer";
+    }
+    if code == refused_name() {
+        return "registry-name";
+    }
+    if code == refused_size() {
+        return "registry-size-mismatch";
+    }
+    if code == refused_media() {
+        return "registry-media-type";
+    }
+    if code == refused_creds() {
+        return "registry-credentials-file";
+    }
+    return http.rule_name(code);
+}
+
+// ---- Basic authentication --------------------------------------------------------------
+
+fn b64_digit(n: int) -> [] int {
+    if n < 26 {
+        return 'A' + n;
+    }
+    if n < 52 {
+        return 'a' + n - 26;
+    }
+    if n < 62 {
+        return '0' + n - 52;
+    }
+    if n == 62 {
+        return '+';
+    }
+    return '/';
+}
+
+// RFC 4648 section 4, with padding.
+fn base64[&h, &t](heap: &!h Heap, out: buffer.Buffer, data: &t [byte]) -> [heap] buffer.Buffer {
+    var b = out;
+    var i = 0;
+    while i < len(data) {
+        let x = int_of(data[i]);
+        var y = 0;
+        var z = 0;
+        if i + 1 < len(data) {
+            y = int_of(data[i + 1]);
+        }
+        if i + 2 < len(data) {
+            z = int_of(data[i + 2]);
+        }
+        let n = x * 65536 + y * 256 + z;
+        b = buffer.push(heap, b, byte_of(b64_digit(n >> 18 & 63)));
+        b = buffer.push(heap, b, byte_of(b64_digit(n >> 12 & 63)));
+        if i + 1 < len(data) {
+            b = buffer.push(heap, b, byte_of(b64_digit(n >> 6 & 63)));
+        } else {
+            b = buffer.push(heap, b, byte_of('='));
+        }
+        if i + 2 < len(data) {
+            b = buffer.push(heap, b, byte_of(b64_digit(n & 63)));
+        } else {
+            b = buffer.push(heap, b, byte_of('='));
+        }
+        i = i + 3;
+    }
+    return b;
+}
+
+// "Authorization: Basic <base64 of user:password>\r\n" for `credentials` ("user:password"), or
+// an empty buffer for none.
+pub fn auth_line[&h, &c](heap: &!h Heap, credentials: &c [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, 64);
+    if len(credentials) == 0 {
+        return b;
+    }
+    b = buffer.append(heap, b, "Authorization: Basic ");
+    b = base64(heap, b, credentials);
+    return buffer.append(heap, b, "\r\n");
+}
+
+// ---- one request, one reply -------------------------------------------------------------
+
+// What came back: the status, the three headers that matter, and the start of the body
+// (up to 64 KiB; an error body is only ever read for its message).
+pub res struct Reply {
+    status: int,
+    location: buffer.Buffer,
+    content_digest: buffer.Buffer,
+    challenge: buffer.Buffer,
+    body: buffer.Buffer,
+}
+
+fn empty_reply[&h](heap: &!h Heap) -> [heap] Reply {
+    return Reply { status: 0, location: buffer.empty(heap, 1), content_digest: buffer.empty(heap, 1), challenge: buffer.empty(heap, 1), body: buffer.empty(heap, 1) };
+}
+
+pub fn drop_reply[&h](heap: &!h Heap, reply: Reply) -> [heap] int {
+    let Reply { status, location, content_digest, challenge, body } = reply;
+    buffer.drop(heap, location);
+    buffer.drop(heap, content_digest);
+    buffer.drop(heap, challenge);
+    buffer.drop(heap, body);
+    return status;
+}
+
+pub fn reply_status[&r](reply: &r Reply) -> [] int {
+    return reply.status;
+}
+
+pub fn reply_location[&r](reply: &r Reply) -> [] &r [byte] {
+    return buffer.bytes(reply.location);
+}
+
+pub fn reply_digest[&r](reply: &r Reply) -> [] &r [byte] {
+    return buffer.bytes(reply.content_digest);
+}
+
+pub fn reply_challenge[&r](reply: &r Reply) -> [] &r [byte] {
+    return buffer.bytes(reply.challenge);
+}
+
+pub fn reply_body[&r](reply: &r Reply) -> [] &r [byte] {
+    return buffer.bytes(reply.body);
+}
+
+fn body_cap() -> [] int {
+    return 65536;
+}
+
+// "METHOD path HTTP/1.1", Host, User-Agent, the auth line, Content-Type and Content-Length
+// when there is a body, Connection: close, and the blank line.
+fn request_head[&h, &m, &p, &t, &a, &c](heap: &!h Heap, method: &m [byte], path: &p [byte], host: &t [byte], port: int, auth: &a [byte], content_type: &c [byte], length: int) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, 512);
+    b = buffer.append(heap, b, method);
+    b = buffer.append(heap, b, " ");
+    b = buffer.append(heap, b, path);
+    b = buffer.append(heap, b, " HTTP/1.1\r\nHost: ");
+    b = buffer.append(heap, b, host);
+    b = buffer.append(heap, b, ":");
+    b = buffer.push_nat(heap, b, port);
+    b = buffer.append(heap, b, "\r\nUser-Agent: cancho-oci\r\nAccept: */*\r\n");
+    b = buffer.append(heap, b, auth);
+    if len(content_type) > 0 {
+        b = buffer.append(heap, b, "Content-Type: ");
+        b = buffer.append(heap, b, content_type);
+        b = buffer.append(heap, b, "\r\n");
+    }
+    if length >= 0 {
+        b = buffer.append(heap, b, "Content-Length: ");
+        b = buffer.push_nat(heap, b, length);
+        b = buffer.append(heap, b, "\r\n");
+    }
+    return buffer.append(heap, b, "Connection: close\r\n\r\n");
+}
+
+// Read the response: head, the headers worth keeping, and the start of the body. Ends the
+// exchange. (Reply, 0) or (an empty reply, a refusal).
+fn read_reply[&h](heap: &!h Heap, ex: http.Exchange, has_body: bool, cap: int) -> [heap, conn_read] (Reply, int) {
+    var e = ex;
+    let (next, code) = http.read_head(e);
+    e = next;
+    if code != 0 {
+        http.end(heap, e);
+        return (empty_reply(heap), code);
+    }
+    var reply = empty_reply(heap);
+    var seen = 0;
+    borrow e as &er in {
+        seen = http.status(er);
+        let Reply { status, location, content_digest, challenge, body } = reply;
+        reply = Reply { status: seen, location: buffer.append(heap, location, http.header(er, "location")), content_digest: buffer.append(heap, content_digest, http.header(er, "docker-content-digest")), challenge: buffer.append(heap, challenge, http.header(er, "www-authenticate")), body: body };
+    }
+    let piece = box_slice(heap, 4096, byte_of(0));
+    var failed = 0;
+    // A reply to HEAD has no body, whatever Content-Length says (RFC 9110 9.3.2).
+    var going = has_body;
+    while going {
+        borrow mut piece as &!pw in {
+            let (more, n) = http.read_body(e, contents(pw));
+            e = more;
+            if n > 0 {
+                let Reply { status, location, content_digest, challenge, body } = reply;
+                var held = 0;
+                borrow body as &bb in {
+                    held = buffer.size(bb);
+                }
+                var kept = body;
+                if held < cap {
+                    kept = buffer.append(heap, kept, contents(pw)[0..n]);
+                }
+                reply = Reply { status: status, location: location, content_digest: content_digest, challenge: challenge, body: kept };
+            } else {
+                going = false;
+                if n < 0 {
+                    failed = n;
+                }
+            }
+        }
+    }
+    unbox_slice(heap, piece);
+    http.end(heap, e);
+    if failed != 0 && seen != 0 {
+        // A truncated *error* body is still an error: keep the status, drop the detail.
+        if seen >= 400 {
+            return (reply, 0);
+        }
+        drop_reply(heap, reply);
+        return (empty_reply(heap), failed);
+    }
+    return (reply, 0);
+}
+
+// A request with an in-memory body (possibly empty). Answers the reply and 0, or an empty
+// reply and an `oci.http` refusal.
+pub fn round_trip[&h, &n, &t, &a, &m, &p, &c, &b](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], method: &m [byte], path: &p [byte], content_type: &c [byte], body: &b [byte]) -> [heap, net_out(""), conn_read, conn_write] (Reply, int) {
+    let head = request_head(heap, method, path, host, port, auth, content_type, len(body));
+    var result = empty_reply(heap);
+    var code = 0;
+    match http.begin(heap, net, host, port) {
+        http.Started::Failed(c) => {
+            code = c;
+        }
+        http.Started::Ok(first) => {
+            var ex = first;
+            borrow head as &hb in {
+                let (next, c1) = http.send(ex, buffer.bytes(hb));
+                ex = next;
+                code = c1;
+            }
+            if code == 0 && len(body) > 0 {
+                let (next, c2) = http.send(ex, body);
+                ex = next;
+                code = c2;
+            }
+            if code == 0 {
+                drop_reply(heap, result);
+                let (reply, c3) = read_reply(heap, ex, !digest.equal(method, "HEAD"), body_cap());
+                result = reply;
+                code = c3;
+            } else {
+                http.end(heap, ex);
+            }
+        }
+    }
+    buffer.drop(heap, head);
+    return (result, code);
+}
+
+// GET with a body cap of `cap` bytes (a manifest or an index, which is read whole): the reply, or an
+// empty reply and a refusal. A body larger than the cap is not an error here: the caller sees only the
+// start and its digest will not match, which is the right refusal.
+pub fn round_trip_get[&h, &n, &t, &a, &p, &c](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, extra: &a [byte], path: &p [byte], cap: int) -> [heap, net_out(""), conn_read, conn_write] (Reply, int) {
+    let head = request_head(heap, "GET", path, host, port, extra, "", 0 - 1);
+    var result = empty_reply(heap);
+    var code = 0;
+    match http.begin(heap, net, host, port) {
+        http.Started::Failed(c) => {
+            code = c;
+        }
+        http.Started::Ok(first) => {
+            var ex = first;
+            borrow head as &hb in {
+                let (next, c1) = http.send(ex, buffer.bytes(hb));
+                ex = next;
+                code = c1;
+            }
+            if code == 0 {
+                drop_reply(heap, result);
+                let (reply, c3) = read_reply(heap, ex, true, cap);
+                result = reply;
+                code = c3;
+            } else {
+                http.end(heap, ex);
+            }
+        }
+    }
+    buffer.drop(heap, head);
+    return (result, code);
+}
+
+// A request whose body is `size` bytes read from `file` (a blob being uploaded), streamed in
+// 64 KiB pieces: never held whole. The file must hold exactly `size` bytes.
+pub fn round_trip_file[&h, &n, &t, &a, &m, &p, &c, &f](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], method: &m [byte], path: &p [byte], content_type: &c [byte], file: &!f File, size: int) -> [heap, net_out(""), conn_read, conn_write, file_read] (Reply, int) {
+    let head = request_head(heap, method, path, host, port, auth, content_type, size);
+    var result = empty_reply(heap);
+    var code = 0;
+    match http.begin(heap, net, host, port) {
+        http.Started::Failed(c) => {
+            code = c;
+        }
+        http.Started::Ok(first) => {
+            var ex = first;
+            borrow head as &hb in {
+                let (next, c1) = http.send(ex, buffer.bytes(hb));
+                ex = next;
+                code = c1;
+            }
+            let chunk = box_slice(heap, 65536, byte_of(0));
+            var sent = 0;
+            var going = code == 0;
+            while going {
+                borrow mut chunk as &!cw in {
+                    let room = contents(cw);
+                    match file_read(file, room) {
+                        Read::Got(got) => {
+                            sent = sent + got;
+                            if sent > size {
+                                code = http.refused_send();
+                                going = false;
+                            } else {
+                                let (next, c2) = http.send(ex, room[0..got]);
+                                ex = next;
+                                if c2 != 0 {
+                                    code = c2;
+                                    going = false;
+                                }
+                            }
+                        }
+                        Read::End => {
+                            going = false;
+                        }
+                        Read::Failed(errno) => {
+                            code = http.refused_send();
+                            going = false;
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, chunk);
+            if code == 0 && sent != size {
+                code = http.refused_send();
+            }
+            if code == 0 {
+                drop_reply(heap, result);
+                let (reply, c3) = read_reply(heap, ex, true, body_cap());
+                result = reply;
+                code = c3;
+            } else {
+                http.end(heap, ex);
+            }
+        }
+    }
+    buffer.drop(heap, head);
+    return (result, code);
+}
+
+// ---- mapping a status to a refusal ------------------------------------------------------
+
+// Success statuses are the caller's to list; everything else becomes a refusal here.
+pub fn refusal_of[&r](reply: &r Reply) -> [] int {
+    let s = reply.status;
+    if s == 401 {
+        if len(buffer.bytes(reply.challenge)) >= 6 && digest.equal(buffer.bytes(reply.challenge)[0..6], "Bearer") {
+            return refused_bearer();
+        }
+        return refused_unauthorized();
+    }
+    if s == 403 {
+        return refused_denied();
+    }
+    if s == 404 {
+        return refused_not_found();
+    }
+    if s >= 400 && s < 500 {
+        return refused_rejected();
+    }
+    if s >= 500 {
+        return refused_server();
+    }
+    return refused_unexpected();
+}
+
+// Does a repository name satisfy the spec's grammar (lower case components of letters,
+// digits and . _ - separated by /)? A name that does not is refused before it reaches a URL.
+pub fn name_ok[&t](name: &t [byte]) -> [] bool {
+    if len(name) == 0 || len(name) > 255 {
+        return false;
+    }
+    var prev_sep = true;
+    var i = 0;
+    while i < len(name) {
+        let c = int_of(name[i]);
+        let alnum = c >= 'a' && c <= 'z' || c >= '0' && c <= '9';
+        let sep = c == '.' || c == '_' || c == '-' || c == '/';
+        if !alnum && !sep {
+            return false;
+        }
+        if sep && prev_sep {
+            return false;
+        }
+        prev_sep = sep;
+        i = i + 1;
+    }
+    return !prev_sep;
+}
+
+// "/v2/<repo>/<kind>/<tail>"
+fn api_path[&h, &r, &k, &t](heap: &!h Heap, repo: &r [byte], kind: &k [byte], tail: &t [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, 128);
+    b = buffer.append(heap, b, "/v2/");
+    b = buffer.append(heap, b, repo);
+    b = buffer.append(heap, b, "/");
+    b = buffer.append(heap, b, kind);
+    b = buffer.append(heap, b, "/");
+    return buffer.append(heap, b, tail);
+}
+
+// Is the blob there? 0 when it is, 1 when it is not (404, or a registry that does not answer
+// HEAD: the upload will say), or a refusal for anything that is an error in itself
+// (authentication, a server fault).
+pub fn blob_status[&h, &n, &t, &a, &r, &d](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte]) -> [heap, net_out(""), conn_read, conn_write] int {
+    let path = api_path(heap, repo, "blobs", digest_text);
+    var answer = 1;
+    borrow path as &pb in {
+        let (reply, code) = round_trip(heap, net, host, port, auth, "HEAD", buffer.bytes(pb), "", "");
+        if code != 0 {
+            answer = code;
+        } else {
+            borrow reply as &rr in {
+                let s = reply_status(rr);
+                if s == 200 {
+                    answer = 0;
+                } else if s == 404 || s == 405 {
+                    answer = 1;
+                } else {
+                    answer = refusal_of(rr);
+                }
+            }
+        }
+        drop_reply(heap, reply);
+    }
+    buffer.drop(heap, path);
+    return answer;
+}
+
+// The path (and query) an upload's `Location` names, made only from what the registry gave
+// and only if it stays on this host. A path starting with "/" is used as it is; an absolute
+// URL must name this host and port; anything else is a refusal. `digest=<digest>` is
+// appended as the spec requires. Answers the path and 0, or an empty buffer and a refusal.
+pub fn upload_target[&h, &l, &t, &d](heap: &!h Heap, location: &l [byte], host: &t [byte], port: int, digest_text: &d [byte]) -> [heap] (buffer.Buffer, int) {
+    var path = buffer.empty(heap, 128);
+    var start = 0;
+    var code = 0;
+    if len(location) == 0 {
+        code = refused_location();
+    } else if int_of(location[0]) == '/' {
+        start = 0;
+    } else {
+        // an absolute URL: scheme://host[:port]/...
+        let colon = index_of_byte(location, byte_of(':'));
+        if colon < 1 || colon + 3 > len(location) || int_of(location[colon + 1]) != '/' || int_of(location[colon + 2]) != '/' {
+            code = refused_location();
+        } else {
+            var end = colon + 3;
+            while end < len(location) && int_of(location[end]) != '/' {
+                end = end + 1;
+            }
+            // the authority must be exactly host:port (this tool always writes the port in `Host`)
+            var want = buffer.empty(heap, 64);
+            want = buffer.append(heap, want, host);
+            want = buffer.append(heap, want, ":");
+            want = buffer.push_nat(heap, want, port);
+            var same = false;
+            borrow want as &wb in {
+                same = digest.equal(location[colon + 3..end], buffer.bytes(wb));
+            }
+            buffer.drop(heap, want);
+            if !same {
+                code = refused_redirect();
+            } else if end >= len(location) {
+                code = refused_location();
+            } else {
+                start = end;
+            }
+        }
+    }
+    if code != 0 {
+        return (path, code);
+    }
+    path = buffer.append(heap, path, location[start..len(location)]);
+    var has_query = false;
+    borrow path as &pb in {
+        has_query = index_of_byte(buffer.bytes(pb), byte_of('?')) >= 0;
+    }
+    if has_query {
+        path = buffer.append(heap, path, "&digest=");
+    } else {
+        path = buffer.append(heap, path, "?digest=");
+    }
+    path = buffer.append(heap, path, digest_text);
+    return (path, 0);
+}
+
+// Upload the blob in `file` (exactly `size` bytes, named `digest_text`): POST for a session,
+// then one PUT of the whole body to the session's `Location`. 0, or a refusal.
+pub fn blob_upload[&h, &n, &t, &a, &r, &d, &f](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, file: &!f File) -> [heap, net_out(""), conn_read, conn_write, file_read] int {
+    var answer = 0;
+    var opened = api_path(heap, repo, "blobs", "uploads/");
+    var location = buffer.empty(heap, 1);
+    borrow opened as &ob in {
+        let (reply, code) = round_trip(heap, net, host, port, auth, "POST", buffer.bytes(ob), "", "");
+        if code != 0 {
+            answer = code;
+        } else {
+            borrow reply as &rr in {
+                if reply_status(rr) == 202 {
+                    location = buffer.append(heap, location, reply_location(rr));
+                } else {
+                    answer = refusal_of(rr);
+                }
+            }
+        }
+        drop_reply(heap, reply);
+    }
+    buffer.drop(heap, opened);
+    if answer == 0 {
+        var target = buffer.empty(heap, 1);
+        var c = 0;
+        borrow location as &lb in {
+            let (t2, c2) = upload_target(heap, buffer.bytes(lb), host, port, digest_text);
+            buffer.drop(heap, target);
+            target = t2;
+            c = c2;
+        }
+        if c != 0 {
+            answer = c;
+        } else {
+            borrow target as &tb in {
+                let (reply, code) = round_trip_file(heap, net, host, port, auth, "PUT", buffer.bytes(tb), "application/octet-stream", file, size);
+                if code != 0 {
+                    answer = code;
+                } else {
+                    borrow reply as &rr in {
+                        if reply_status(rr) == 201 || reply_status(rr) == 200 {
+                            let shown = reply_digest(rr);
+                            if len(shown) > 0 && !digest.equal(shown, digest_text) {
+                                answer = refused_digest();
+                            }
+                        } else {
+                            answer = refusal_of(rr);
+                        }
+                    }
+                }
+                drop_reply(heap, reply);
+            }
+        }
+        buffer.drop(heap, target);
+    }
+    buffer.drop(heap, location);
+    return answer;
+}
+
+// PUT a manifest (or an index) at `reference` (a tag or a digest). The registry must
+// report the digest of what it stored, if it reports one at all, and that must be ours.
+pub fn manifest_put[&h, &n, &t, &a, &r, &x, &m, &b, &d](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], media: &m [byte], body: &b [byte], digest_text: &d [byte]) -> [heap, net_out(""), conn_read, conn_write] int {
+    let path = api_path(heap, repo, "manifests", reference);
+    var answer = 0;
+    borrow path as &pb in {
+        let (reply, code) = round_trip(heap, net, host, port, auth, "PUT", buffer.bytes(pb), media, body);
+        if code != 0 {
+            answer = code;
+        } else {
+            borrow reply as &rr in {
+                let s = reply_status(rr);
+                if s == 201 || s == 200 {
+                    let shown = reply_digest(rr);
+                    if len(shown) > 0 && !digest.equal(shown, digest_text) {
+                        answer = refused_digest();
+                    }
+                } else {
+                    answer = refusal_of(rr);
+                }
+            }
+        }
+        drop_reply(heap, reply);
+    }
+    buffer.drop(heap, path);
+    return answer;
+}
+
+// The refusal for a bare status (no reply object): 401 as unauthorized, or as the bearer challenge
+// when `bearer` says the server asked for one.
+fn refusal_of_status(s: int, bearer: bool) -> [] int {
+    if s == 401 {
+        if bearer {
+            return refused_bearer();
+        }
+        return refused_unauthorized();
+    }
+    if s == 403 {
+        return refused_denied();
+    }
+    if s == 404 {
+        return refused_not_found();
+    }
+    if s >= 400 && s < 500 {
+        return refused_rejected();
+    }
+    if s >= 500 {
+        return refused_server();
+    }
+    return refused_unexpected();
+}
+
+// Fetch a manifest or an index by tag or digest, whole (at most 1 MiB), and prove it: the digest
+// of the bytes is computed here, and must equal `reference` when that is a digest and the digest the
+// registry reports when it reports one. Answers the bytes and 0, or an empty buffer and a refusal.
+// `shown` receives the digest text of what was fetched (71 bytes).
+pub fn manifest_fetch[&h, &n, &t, &a, &r, &x, &o](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], shown: &!o [byte]) -> [heap, net_out(""), conn_read, conn_write] (buffer.Buffer, int) {
+    var extra = buffer.append(heap, buffer.empty(heap, 256), auth);
+    extra = buffer.append(heap, extra, "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json\r\n");
+    let path = api_path(heap, repo, "manifests", reference);
+    var out = buffer.empty(heap, 1);
+    var code = 0;
+    borrow extra as &eb in {
+        borrow path as &pb in {
+            let (reply, c) = round_trip_get(heap, net, host, port, buffer.bytes(eb), buffer.bytes(pb), 1048576);
+            code = c;
+            if c == 0 {
+                borrow reply as &rr in {
+                    if reply_status(rr) != 200 {
+                        code = refusal_of(rr);
+                    } else {
+                        let body = reply_body(rr);
+                        var raw = 0;
+                        region w {
+                            let sum = alloc_slice[w](32, byte_of(0));
+                            digest.of_bytes(body, sum);
+                            digest.text_into(sum, shown);
+                        }
+                        if len(reply_digest(rr)) > 0 && !digest.equal(reply_digest(rr), shown) {
+                            code = refused_digest();
+                        } else if len(reference) == 71 && digest.equal(reference[0..7], "sha256:") && !digest.equal(reference, shown) {
+                            code = refused_digest();
+                        } else {
+                            buffer.drop(heap, out);
+                            out = buffer.append(heap, buffer.empty(heap, len(body) + 1), body);
+                        }
+                    }
+                }
+            }
+            drop_reply(heap, reply);
+        }
+    }
+    buffer.drop(heap, extra);
+    buffer.drop(heap, path);
+    return (out, code);
+}
+
+// Download the blob `digest_text` into the store under the temporary name `tmp`, a piece at a time,
+// and publish it only if it is `size` bytes (when `size` is not negative) and hashes to its name.
+// The descriptor's size is the bound: a body is refused as soon as it passes it (so at most one piece
+// beyond it is ever read), whatever the registry announces or whether it announces anything.
+// 0, or a refusal; on a refusal nothing is left in the store.
+pub fn blob_fetch[&h, &n, &t, &a, &r, &d, &b, &m](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, tmp: &m [byte]) -> [heap, net_out(""), conn_read, conn_write, dir_write, file_write] int {
+    var expected = 0;
+    var code = 0;
+    region w {
+        let want = alloc_slice[w](32, byte_of(0));
+        if digest.parse_into(digest_text, want) != 0 {
+            code = refused_digest();
+        } else {
+            let path = api_path(heap, repo, "blobs", digest_text);
+            var head = buffer.empty(heap, 1);
+            borrow path as &pq in {
+                buffer.drop(heap, head);
+                head = request_head(heap, "GET", buffer.bytes(pq), host, port, auth, "", 0 - 1);
+            }
+            match http.begin(heap, net, host, port) {
+                http.Started::Failed(c) => {
+                    code = c;
+                }
+                http.Started::Ok(first) => {
+                    var ex = first;
+                    borrow head as &hb in {
+                        let (next, c1) = http.send(ex, buffer.bytes(hb));
+                        ex = next;
+                        code = c1;
+                    }
+                    if code == 0 {
+                        let (next, c2) = http.read_head(ex);
+                        ex = next;
+                        code = c2;
+                    }
+                    if code == 0 {
+                        var statuscode = 0;
+                        borrow ex as &er in {
+                            statuscode = http.status(er);
+                        }
+                        if statuscode != 200 {
+                            code = refusal_of_status(statuscode, false);
+                        } else {
+                            match store.begin(heap, blobs, tmp) {
+                                store.Began::Failed(c3) => {
+                                    code = store.refused_io();
+                                }
+                                store.Began::Ok(first_blob) => {
+                                    var blob = first_blob;
+                                    let piece = box_slice(heap, 65536, byte_of(0));
+                                    var total = 0;
+                                    var going = true;
+                                    while going && code == 0 {
+                                        borrow mut piece as &!pw in {
+                                            let (more, n) = http.read_body(ex, contents(pw));
+                                            ex = more;
+                                            if n > 0 {
+                                                total = total + n;
+                                                if size >= 0 && total > size {
+                                                    code = refused_size();
+                                                } else {
+                                                    let (nb, errno) = store.write(blob, contents(pw)[0..n]);
+                                                    blob = nb;
+                                                    if errno != 0 {
+                                                        code = store.refused_io();
+                                                    }
+                                                }
+                                            } else {
+                                                going = false;
+                                                if n < 0 {
+                                                    code = n;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    unbox_slice(heap, piece);
+                                    if code == 0 && size >= 0 && total != size {
+                                        code = refused_size();
+                                    }
+                                    if code == 0 {
+                                        let scratch = alloc_slice[w](32, byte_of(0));
+                                        let outcome = store.finish_expecting(heap, blobs, blob, tmp, scratch, want);
+                                        if outcome <= 0 {
+                                            code = outcome;
+                                            if outcome == store.refused_mismatch() {
+                                                code = refused_digest();
+                                            }
+                                        }
+                                    } else {
+                                        store.abandon(heap, blobs, blob, tmp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    http.end(heap, ex);
+                }
+            }
+            buffer.drop(heap, head);
+            buffer.drop(heap, path);
+        }
+    }
+    return code;
+}
+
+// ---- what both command-line tools need -------------------------------------------------------
+
+// A tag or digest the registry will accept as a reference: letters, digits, "_", ".", "-"
+// (a tag, at most 128 bytes), or "sha256:<hex>".
+pub fn reference_ok[&t](text: &t [byte]) -> [] bool {
+    if len(text) == 0 || len(text) > 128 {
+        return false;
+    }
+    if len(text) == 71 && digest.equal(text[0..7], "sha256:") {
+        return len(layout.hex_of(text)) == 64;
+    }
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        let alnum = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9';
+        if !alnum && c != '_' && c != '.' && c != '-' {
+            return false;
+        }
+        if i == 0 && (c == '.' || c == '-') {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn is_loopback[&t](host: &t [byte]) -> [] bool {
+    return digest.equal(host, "127.0.0.1") || digest.equal(host, "localhost") || digest.equal(host, "::1");
+}
+
+// A decimal port 1..65535 from `text`, or -1.
+pub fn port_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 5 {
+        return 0 - 1;
+    }
+    var value = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < '0' || c > '9' {
+            return 0 - 1;
+        }
+        value = value * 10 + (c - '0');
+        i = i + 1;
+    }
+    if value < 1 || value > 65535 {
+        return 0 - 1;
+    }
+    return value;
+}
+
+// Read a credentials file: one line, `user:password`, at most 1 KiB. The text (without its
+// line ending) and 0, or an empty buffer and `push_creds()`.
+pub fn read_credentials[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read("")] (buffer.Buffer, int) {
+    var out = buffer.empty(heap, 64);
+    var code = 0;
+    region a {
+        let raw = alloc_slice[a](1024, byte_of(0));
+        let n = fs_read(fs, path, raw);
+        if n <= 0 {
+            code = refused_creds();
+        } else {
+            var end = n;
+            while end > 0 && (int_of(raw[end - 1]) == '\n' || int_of(raw[end - 1]) == '\r') {
+                end = end - 1;
+            }
+            let line = raw[0..end];
+            if index_of_byte(line, byte_of(':')) < 1 || index_of_byte(line, byte_of('\n')) >= 0 {
+                code = refused_creds();
+            } else {
+                out = buffer.append(heap, out, line);
+            }
+        }
+    }
+    return (out, code);
+}

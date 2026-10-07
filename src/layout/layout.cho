@@ -110,6 +110,53 @@ pub fn read_blob[&h, &d, &n](heap: &!h Heap, blobs: &d Dir, hex: &n [byte], cap:
     return (body, code);
 }
 
+// The file `name` of `dir`, whole, if it is no longer than `cap`. No digest is checked:
+// for `index.json`, which is not a blob. The bytes and 0, or an empty buffer and a refusal.
+pub fn read_file[&h, &d, &n](heap: &!h Heap, dir: &d Dir, name: &n [byte], cap: int) -> [heap, dir_read, file_read] (buffer.Buffer, int) {
+    var body = buffer.empty(heap, 1024);
+    var code = 0;
+    match dir_open_read(dir, name) {
+        Opened::Failed(errno) => {
+            code = store.refused_missing();
+        }
+        Opened::Ok(file) => {
+            var handle = file;
+            let chunk = box_slice(heap, 16384, byte_of(0));
+            var going = true;
+            while going {
+                borrow mut chunk as &!cw in {
+                    let room = contents(cw);
+                    borrow mut handle as &!f in {
+                        match file_read(f, room) {
+                            Read::Got(got) => {
+                                body = buffer.append(heap, body, room[0..got]);
+                                var held = 0;
+                                borrow body as &sb in {
+                                    held = buffer.size(sb);
+                                }
+                                if held > cap {
+                                    code = refused_too_large();
+                                    going = false;
+                                }
+                            }
+                            Read::End => {
+                                going = false;
+                            }
+                            Read::Failed(errno) => {
+                                code = store.refused_io();
+                                going = false;
+                            }
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, chunk);
+            file_close(handle);
+        }
+    }
+    return (body, code);
+}
+
 // The string at `key` of the object at node `obj`: a view into the document, or an
 // empty slice when the key is absent or its value is not a string (`string_view`
 // itself answers an empty slice for any other kind of node).

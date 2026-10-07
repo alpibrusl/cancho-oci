@@ -49,6 +49,27 @@ sources = ["src/digest", "src/store", "src/image", "src/layout", "src/indexcli"]
 std = true
 out = "build/oci-index"
 
+# The test harness for oci.http (#9), held to its own ceiling.
+[[bin]]
+name = "http-probe"
+sources = ["src/http", "tests/probe/http"]
+std = true
+out = "build/http-probe"
+
+# Push an image from a layout to a registry (#9): the only program here with a network row.
+[[bin]]
+name = "oci-push"
+sources = ["src/digest", "src/store", "src/image", "src/layout", "src/http", "src/registry", "src/pushcli"]
+std = true
+out = "build/oci-push"
+
+# Fetch an image from a registry into a layout (#9).
+[[bin]]
+name = "oci-pull"
+sources = ["src/digest", "src/store", "src/image", "src/layout", "src/http", "src/registry", "src/pullcli"]
+std = true
+out = "build/oci-pull"
+
 [[test]]
 name = "scaffold"
 sources = ["tests/scaffold_test.cho"]

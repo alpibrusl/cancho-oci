@@ -523,6 +523,46 @@ pub fn layout_index_json[&h, &m, &r](heap: &!h Heap, index_digest: &m [byte], in
     return (json.finish(w1), 0);
 }
 
+// `index.json` of a layout with one entry of any of the media types v1 handles (a manifest, or an
+// image index), with the tag, if any, as the `ref.name` annotation. For a pulled image.
+pub fn layout_entry_json[&h, &m, &d, &r](heap: &!h Heap, media: &m [byte], entry_digest: &d [byte], entry_size: int, ref: &r [byte]) -> [heap] (buffer.Buffer, int) {
+    var code = 0;
+    if !digest_ok(entry_digest) || entry_size < 0 || !(digest.equal(media, media_manifest()) || digest.equal(media, media_index())) {
+        code = refused_text();
+    } else if !plain(ref) {
+        code = refused_ref();
+    }
+    if code != 0 {
+        return (buffer.empty(heap, 1), code);
+    }
+    var w1 = json.writer(heap, 512);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "schemaVersion");
+    w1 = json.put_int(heap, w1, 2);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_index());
+    w1 = json.put_key(heap, w1, "manifests");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media);
+    w1 = json.put_key(heap, w1, "digest");
+    w1 = json.put_string(heap, w1, entry_digest);
+    w1 = json.put_key(heap, w1, "size");
+    w1 = json.put_int(heap, w1, entry_size);
+    if len(ref) > 0 {
+        w1 = json.put_key(heap, w1, "annotations");
+        w1 = json.begin_object(heap, w1);
+        w1 = json.put_key(heap, w1, "org.opencontainers.image.ref.name");
+        w1 = json.put_string(heap, w1, ref);
+        w1 = json.end_object(heap, w1);
+    }
+    w1 = json.end_object(heap, w1);
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    return (json.finish(w1), 0);
+}
+
 // Replace `<dir>/<name>` with `bytes`, atomically: write a temporary, sync it, and
 // rename it over the name. For the two files of a layout that are not blobs
 // (`oci-layout`, `index.json`), which are meant to be replaced by a rebuild.

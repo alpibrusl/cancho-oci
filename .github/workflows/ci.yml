@@ -124,6 +124,14 @@ jobs:
         working-directory: oci
         run: python3 scripts/index_mutants.py
 
+      - name: oci-push and oci-pull -- a mock registry with every fault, then crane registry serve and registry:2 as real registries
+        working-directory: oci
+        run: python3 scripts/registry_check.py
+
+      - name: oci-push and oci-pull's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/registry_mutants.py --jobs 4
+
       - name: G1 across machines -- every digest equals the committed golden file (also checked on macOS/arm64 in the other job)
         working-directory: oci
         run: python3 scripts/golden_check.py

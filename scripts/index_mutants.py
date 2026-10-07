@@ -17,7 +17,7 @@ FILES = {"digest": "src/digest/digest.cho", "store": "src/store/store.cho", "ima
 
 MUTANTS = [
     ("layout", "a blob is not re-hashed when read", "if !digest.equal(raw, expected) {", "if false {"),
-    ("layout", "no cap on a document", "if held > cap {", "if false {"),
+    ("layout", "no cap on a document (read_blob)", "                                        if held > cap {", "                                        if false {"),
     ("layout", "a number that does not fit is accepted", "if n < 0 || !json.is_int(tape, n) || !json.fits_int(src, tape, n) {", "if n < 0 || !json.is_int(tape, n) {"),
     ("layout", "a digest with a wrong prefix is accepted", "ok = digest.parse_into(text, scratch) == 0;", "ok = digest.parse_hex_into(text[7..len(text)], scratch) == 0;"),
     ("indexcli", "a repeated platform accepted", "if platforms[k] == platform {", "if false {"),
@@ -35,7 +35,7 @@ MUTANTS = [
     ("indexcli", "an unknown flag accepted", '} else if !digest.equal(flag, "--manifest") {', '} else if false {'),
     ("indexcli", "arm64 named as amd64", 'if id == 1 {\n        return "arm64";', 'if id == 1 {\n        return "amd64";'),
     ("indexcli", "riscv64 recognised as arm64", 'if digest.equal(arch, "riscv64") {\n        return 2;', 'if digest.equal(arch, "riscv64") {\n        return 1;'),
-    ("image", "the ref annotation dropped from the layout index", '    if len(ref) > 0 {\n        w1 = json.put_key(heap, w1, "annotations");\n        w1 = json.begin_object(heap, w1);\n        w1 = json.put_key(heap, w1, "org.opencontainers.image.ref.name");\n        w1 = json.put_string(heap, w1, ref);\n        w1 = json.end_object(heap, w1);\n    }\n    w1 = json.end_object(heap, w1);\n    w1 = json.end_array(heap, w1);\n    w1 = json.end_object(heap, w1);\n    return (json.finish(w1), 0);\n}\n\n// Replace', '    w1 = json.end_object(heap, w1);\n    w1 = json.end_array(heap, w1);\n    w1 = json.end_object(heap, w1);\n    return (json.finish(w1), 0);\n}\n\n// Replace'),
+    ("image", "the ref annotation dropped from the layout index", '    if len(ref) > 0 {\n        w1 = json.put_key(heap, w1, "annotations");\n        w1 = json.begin_object(heap, w1);\n        w1 = json.put_key(heap, w1, "org.opencontainers.image.ref.name");\n        w1 = json.put_string(heap, w1, ref);\n        w1 = json.end_object(heap, w1);\n    }\n    w1 = json.end_object(heap, w1);\n    w1 = json.end_array(heap, w1);\n    w1 = json.end_object(heap, w1);\n    return (json.finish(w1), 0);\n}\n\n// `index.json` of a layout with one entry', '    w1 = json.end_object(heap, w1);\n    w1 = json.end_array(heap, w1);\n    w1 = json.end_object(heap, w1);\n    return (json.finish(w1), 0);\n}\n\n// `index.json` of a layout with one entry'),
     ("image", "the platform left out of an index entry", '    w1 = json.put_key(heap, w1, "platform");\n    w1 = json.begin_object(heap, w1);\n    w1 = json.put_key(heap, w1, "architecture");\n    w1 = json.put_string(heap, w1, arch);\n    w1 = json.put_key(heap, w1, "os");\n    w1 = json.put_string(heap, w1, os);\n    w1 = json.end_object(heap, w1);\n    return json.end_object(heap, w1);', '    return json.end_object(heap, w1);'),
     ("store", "a layer size miscounted by verify_sized", "                        size = got;", "                        size = got + 0 * got + 1;"),
 ]
