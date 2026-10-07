@@ -1,0 +1,316 @@
+edition 7;
+
+module oci.store;
+
+import oci.digest;
+import std.crypto;
+
+// `oci.store` -- a content-addressed blob store under one directory handle
+// (design 5.1, task #4): `<root>/<64 hex digits>`, written once and never
+// rewritten, so a blob's name is the proof of its contents.
+//
+// Every operation goes through a `Dir`, which opens one path component at a time
+// from a descriptor and refuses `..`, `.`, an empty name, a `/` in a name and
+// every symbolic link (docs/directory-handles.md). The store therefore cannot
+// be steered outside `root` by a name or a link, whatever it is asked for.
+//
+// A write is a small state machine: `begin` creates a temporary name with
+// `dir_open_new` (O_EXCL), `write` appends and hashes the same bytes, `finish`
+// syncs, closes, and publishes the file under its digest with `dir_rename_new`,
+// a rename that never replaces a name. If the digest is already stored, the new
+// copy is removed and the old blob is left untouched: a blob written twice is
+// not rewritten.
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+// What a write can refuse. Negative numbers; `rule_name` is the stable tag.
+pub fn refused_missing() -> [] int {
+    return 0 - 101;
+}
+
+pub fn refused_mismatch() -> [] int {
+    return 0 - 102;
+}
+
+pub fn refused_io() -> [] int {
+    return 0 - 103;
+}
+
+pub fn refused_stale() -> [] int {
+    return 0 - 104;
+}
+
+// The filesystem cannot rename without replacing (`ENOTSUP`): write-once cannot be
+// promised there, so nothing is published rather than risking a replaced blob.
+pub fn refused_unsupported() -> [] int {
+    return 0 - 105;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "ok";
+    }
+    if code == refused_missing() {
+        return "blob-missing";
+    }
+    if code == refused_mismatch() {
+        return "blob-digest-mismatch";
+    }
+    if code == refused_io() {
+        return "blob-io";
+    }
+    if code == refused_stale() {
+        return "blob-temp-in-use";
+    }
+    if code == refused_unsupported() {
+        return "blob-publish-unsupported";
+    }
+    return digest.rule_name(code);
+}
+
+pub fn created() -> [] int {
+    return 1;
+}
+
+pub fn existed() -> [] int {
+    return 2;
+}
+
+// An open temporary file, the digest so far, and the bytes written.
+pub res struct Blob {
+    file: File,
+    state: Box[[int]],
+    size: int,
+}
+
+pub enum Began {
+    Ok(Blob),
+    Failed(int),
+}
+
+fn eexist() -> [] int {
+    return 17;
+}
+
+// Start a blob under the temporary name `tmp` in `root`. A leftover of the same
+// name from a crash is removed once; a second collision is `refused_stale`.
+pub fn begin[&h, &d, &n](heap: &!h Heap, root: &d Dir, tmp: &n [byte]) -> [heap, dir_write] Began {
+    var attempt = 0;
+    while attempt < 2 {
+        match dir_open_new(root, tmp) {
+            Opened::Ok(file) => {
+                let state = box_slice(heap, 138, 0);
+                borrow mut state as &!s in {
+                    crypto.sha256_init(contents(s));
+                }
+                return Began::Ok(Blob { file: file, state: state, size: 0 });
+            }
+            Opened::Failed(errno) => {
+                if errno != eexist() {
+                    return Began::Failed(errno);
+                }
+                if attempt == 1 {
+                    return Began::Failed(refused_stale());
+                }
+                dir_remove(root, tmp);
+            }
+        }
+        attempt = attempt + 1;
+    }
+    return Began::Failed(refused_stale());
+}
+
+// Append `bytes` and hash them. Answers the blob back and 0, or a nonzero errno
+// (the blob is then to be dropped with `abandon`).
+pub fn write[&b](blob: Blob, bytes: &b [byte]) -> [file_write] (Blob, int) {
+    let Blob { file, state, size } = blob;
+    var handle = file;
+    var errno = 0;
+    var at = 0;
+    while at < len(bytes) && errno == 0 {
+        borrow mut handle as &!f in {
+            match file_write(f, bytes[at..len(bytes)]) {
+                Done::Ok(n) => {
+                    if n <= 0 {
+                        errno = 5;
+                    } else {
+                        at = at + n;
+                    }
+                }
+                Done::Failed(e) => {
+                    errno = e;
+                    if errno == 0 {
+                        errno = 5;
+                    }
+                }
+            }
+        }
+    }
+    if errno == 0 {
+        borrow mut state as &!s in {
+            crypto.sha256_update(contents(s), bytes);
+        }
+    }
+    return (Blob { file: handle, state: state, size: size + at }, errno);
+}
+
+// Drop a blob that will not be published: close and delete the temporary file.
+pub fn abandon[&h, &d, &n](heap: &!h Heap, root: &d Dir, blob: Blob, tmp: &n [byte]) -> [heap, dir_write] int {
+    let Blob { file, state, size } = blob;
+    file_close(file);
+    unbox_slice(heap, state);
+    dir_remove(root, tmp);
+    return size;
+}
+
+// Sync, close and publish. `raw` receives the 32-byte digest. Answers
+// `created()`, `existed()` (the digest was already stored; the temporary copy is
+// gone and the stored blob untouched), or a negative refusal.
+pub fn finish[&h, &d, &n, &o](heap: &!h Heap, root: &d Dir, blob: Blob, tmp: &n [byte], raw: &!o [byte]) -> [heap, dir_write, file_write] int {
+    let Blob { file, state, size } = blob;
+    var handle = file;
+    var synced = true;
+    borrow mut handle as &!f in {
+        match file_sync(f) {
+            Done::Ok(n) => {
+                synced = true;
+            }
+            Done::Failed(e) => {
+                synced = false;
+            }
+        }
+    }
+    file_close(handle);
+    borrow mut state as &!s in {
+        crypto.sha256_final(contents(s), raw);
+    }
+    unbox_slice(heap, state);
+    if !synced {
+        dir_remove(root, tmp);
+        return refused_io();
+    }
+    var outcome = 0;
+    region a {
+        let name = alloc_slice[a](64, byte_of(0));
+        digest.hex_into(raw, name);
+        match dir_rename_new(root, tmp, name) {
+            Done::Ok(n) => {
+                outcome = created();
+            }
+            Done::Failed(e) => {
+                if e == eexist() {
+                    dir_remove(root, tmp);
+                    outcome = existed();
+                } else if e == 95 || e == 45 {
+                    // EOPNOTSUPP on Linux, ENOTSUP on macOS: no atomic no-replace rename here.
+                    dir_remove(root, tmp);
+                    outcome = refused_unsupported();
+                } else {
+                    dir_remove(root, tmp);
+                    outcome = refused_io();
+                }
+            }
+        }
+    }
+    if outcome > 0 {
+        dir_sync(root);
+    }
+    return outcome;
+}
+
+// A whole in-memory blob: begin, write, finish.
+pub fn put[&h, &d, &n, &b, &o](heap: &!h Heap, root: &d Dir, tmp: &n [byte], bytes: &b [byte], raw: &!o [byte]) -> [heap, dir_write, file_write] int {
+    match begin(heap, root, tmp) {
+        Began::Failed(errno) => {
+            return refused_io();
+        }
+        Began::Ok(blob) => {
+            let (written, errno) = write(blob, bytes);
+            if errno != 0 {
+                abandon(heap, root, written, tmp);
+                return refused_io();
+            }
+            return finish(heap, root, written, tmp, raw);
+        }
+    }
+}
+
+// Hash an open file to the end, reading 64 KiB at a time. `raw` receives the
+// digest; the answer is the byte count, or a negative errno.
+pub fn hash_file[&h, &f, &o](heap: &!h Heap, file: &!f File, raw: &!o [byte]) -> [heap, file_read] int {
+    let chunk = box_slice(heap, 65536, byte_of(0));
+    let state = box_slice(heap, 138, 0);
+    borrow mut state as &!s in {
+        crypto.sha256_init(contents(s));
+    }
+    var total = 0;
+    var errno = 0;
+    var going = true;
+    while going {
+        borrow mut chunk as &!c in {
+            let room = contents(c);
+            match file_read(file, room) {
+                Read::Got(n) => {
+                    borrow mut state as &!s in {
+                        crypto.sha256_update(contents(s), room[0..n]);
+                    }
+                    total = total + n;
+                }
+                Read::End => {
+                    going = false;
+                }
+                Read::Failed(e) => {
+                    going = false;
+                    errno = e;
+                    if errno == 0 {
+                        errno = 5;
+                    }
+                }
+            }
+        }
+    }
+    borrow mut state as &!s in {
+        crypto.sha256_final(contents(s), raw);
+    }
+    unbox_slice(heap, state);
+    unbox_slice(heap, chunk);
+    if errno != 0 {
+        return 0 - errno;
+    }
+    return total;
+}
+
+// Does the stored blob named `hex` (64 lowercase hex digits) still hold the
+// bytes that name says? 0, `refused_missing`, `refused_mismatch`, or
+// `refused_io`.
+pub fn verify[&h, &d, &n](heap: &!h Heap, root: &d Dir, hex: &n [byte]) -> [heap, dir_read, file_read] int {
+    var want = 0;
+    region a {
+        let expected = alloc_slice[a](32, byte_of(0));
+        want = digest.parse_hex_into(hex, expected);
+        if want == 0 {
+            match dir_open_read(root, hex) {
+                Opened::Failed(errno) => {
+                    want = refused_missing();
+                }
+                Opened::Ok(file) => {
+                    var handle = file;
+                    let raw = alloc_slice[a](32, byte_of(0));
+                    var got = 0;
+                    borrow mut handle as &!f in {
+                        got = hash_file(heap, f, raw);
+                    }
+                    file_close(handle);
+                    if got < 0 {
+                        want = refused_io();
+                    } else if !digest.equal(raw, expected) {
+                        want = refused_mismatch();
+                    }
+                }
+            }
+        }
+    }
+    return want;
+}

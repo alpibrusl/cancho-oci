@@ -1,0 +1,233 @@
+edition 7;
+
+import std.io;
+import oci.digest;
+import oci.store;
+
+// store-probe: the test harness for `oci.store` (#4). Every path is opened
+// through a directory handle, so it can only reach beneath the directory it is
+// given.
+//
+//     store-probe hash   <dir> <name>            sha256 and size of <dir>/<name>
+//     store-probe put    <store> <srcdir> <name>  stream <srcdir>/<name> into <store>
+//     store-probe verify <store> <hex>            does the blob still match its name
+//
+// Output is one line on stdout; a refusal is `refused: <rule tag>` on stderr and
+// exit status 1.
+
+fn print_hex[&i, &r](io: &!i Io, raw: &r [byte]) -> [io_write] int {
+    region a {
+        let text = alloc_slice[a](71, byte_of(0));
+        digest.text_into(raw, text);
+        io.write_all(io, text);
+    }
+    return 0;
+}
+
+fn refuse[&i](io: &!i Io, code: int) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, store.rule_name(code));
+    io.error_all(io, "\n");
+    return 1;
+}
+
+fn open_root[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] DirOpened {
+    return open_dir(fs, path);
+}
+
+fn cmd_hash[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, file_read, io_write, err_write] int {
+    var status = 1;
+    match open_root(fs, arg(args, 2)) {
+        DirOpened::Failed(errno) => {
+            io.error_all(io, "refused: dir-open\n");
+        }
+        DirOpened::Ok(dir) => {
+            var root = dir;
+            borrow root as &d in {
+                match dir_open_read(d, arg(args, 3)) {
+                    Opened::Failed(errno) => {
+                        status = refuse(io, store.refused_missing());
+                    }
+                    Opened::Ok(file) => {
+                        var handle = file;
+                        region a {
+                            let raw = alloc_slice[a](32, byte_of(0));
+                            var size = 0;
+                            borrow mut handle as &!x in {
+                                size = store.hash_file(heap, x, raw);
+                            }
+                            if size < 0 {
+                                status = refuse(io, store.refused_io());
+                            } else {
+                                print_hex(io, raw);
+                                io.write_all(io, " ");
+                                io.print_nat(io, size);
+                                io.write_all(io, "\n");
+                                status = 0;
+                            }
+                        }
+                        file_close(handle);
+                    }
+                }
+            }
+            dir_close(root);
+        }
+    }
+    return status;
+}
+
+// Stream <srcdir>/<name> into the store in 64 KiB pieces, the way `build` will
+// write a layer it is still producing: the digest is only known at the end.
+fn stream_into[&h, &d, &s, &o](heap: &!h Heap, root: &d Dir, source: &!s File, tmp: &static [byte], raw: &!o [byte]) -> [heap, dir_write, file_write, file_read] int {
+    match store.begin(heap, root, tmp) {
+        store.Began::Failed(errno) => {
+            return store.refused_io();
+        }
+        store.Began::Ok(first) => {
+            var blob = first;
+            let chunk = box_slice(heap, 65536, byte_of(0));
+            var failed = 0;
+            var going = true;
+            while going {
+                borrow mut chunk as &!c in {
+                    let room = contents(c);
+                    match file_read(source, room) {
+                        Read::Got(n) => {
+                            let (next, errno) = store.write(blob, room[0..n]);
+                            blob = next;
+                            if errno != 0 {
+                                failed = errno;
+                                going = false;
+                            }
+                        }
+                        Read::End => {
+                            going = false;
+                        }
+                        Read::Failed(errno) => {
+                            failed = errno;
+                            going = false;
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, chunk);
+            if failed != 0 {
+                store.abandon(heap, root, blob, tmp);
+                return store.refused_io();
+            }
+            return store.finish(heap, root, blob, tmp, raw);
+        }
+    }
+}
+
+fn cmd_put[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var status = 1;
+    match open_root(fs, arg(args, 2)) {
+        DirOpened::Failed(errno) => {
+            io.error_all(io, "refused: dir-open\n");
+        }
+        DirOpened::Ok(store_dir) => {
+            var target = store_dir;
+            match open_root(fs, arg(args, 3)) {
+                DirOpened::Failed(errno) => {
+                    io.error_all(io, "refused: dir-open\n");
+                }
+                DirOpened::Ok(source_dir) => {
+                    var from = source_dir;
+                    borrow from as &sd in {
+                        match dir_open_read(sd, arg(args, 4)) {
+                            Opened::Failed(errno) => {
+                                status = refuse(io, store.refused_missing());
+                            }
+                            Opened::Ok(file) => {
+                                var handle = file;
+                                region a {
+                                    let raw = alloc_slice[a](32, byte_of(0));
+                                    var code = 0;
+                                    borrow target as &td in {
+                                        borrow mut handle as &!x in {
+                                            code = stream_into(heap, td, x, ".incoming-0", raw);
+                                        }
+                                    }
+                                    if code > 0 {
+                                        if code == store.created() {
+                                            io.write_all(io, "created ");
+                                        } else {
+                                            io.write_all(io, "existed ");
+                                        }
+                                        print_hex(io, raw);
+                                        io.write_all(io, "\n");
+                                        status = 0;
+                                    } else {
+                                        status = refuse(io, code);
+                                    }
+                                }
+                                file_close(handle);
+                            }
+                        }
+                    }
+                    dir_close(from);
+                }
+            }
+            dir_close(target);
+        }
+    }
+    return status;
+}
+
+fn cmd_verify[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, file_read, io_write, err_write] int {
+    var status = 1;
+    match open_root(fs, arg(args, 2)) {
+        DirOpened::Failed(errno) => {
+            io.error_all(io, "refused: dir-open\n");
+        }
+        DirOpened::Ok(dir) => {
+            var root = dir;
+            borrow root as &d in {
+                let code = store.verify(heap, d, arg(args, 3));
+                if code == 0 {
+                    io.write_all(io, "ok\n");
+                    status = 0;
+                } else {
+                    status = refuse(io, code);
+                }
+            }
+            dir_close(root);
+        }
+    }
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow fs as &f in {
+                borrow mut io as &!i in {
+                    if arg_count(g) < 4 {
+                        io.error_all(i, "usage: store-probe hash|put|verify ...\n");
+                    } else if digest.equal(arg(g, 1), "hash") {
+                        status = cmd_hash(h, f, i, g);
+                    } else if digest.equal(arg(g, 1), "put") && arg_count(g) >= 5 {
+                        status = cmd_put(h, f, i, g);
+                    } else if digest.equal(arg(g, 1), "verify") {
+                        status = cmd_verify(h, f, i, g);
+                    } else {
+                        io.error_all(i, "unknown command\n");
+                    }
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(fs);
+    release(io);
+    return status;
+}

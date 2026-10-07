@@ -17,9 +17,16 @@ out = "build/oci-build"
 # authority ceiling like every other program (G5).
 [[bin]]
 name = "tar-probe"
-sources = ["src/tar", "tests/probe"]
+sources = ["src/tar", "tests/probe/tar"]
 std = true
 out = "build/tar-probe"
+
+# The test harness for oci.digest and oci.store (#4), held to its own ceiling.
+[[bin]]
+name = "store-probe"
+sources = ["src/digest", "src/store", "tests/probe/store"]
+std = true
+out = "build/store-probe"
 
 [[test]]
 name = "scaffold"
@@ -29,4 +36,9 @@ std = true
 [[test]]
 name = "tar"
 sources = ["src/tar", "tests/tar_test.cho"]
+std = true
+
+[[test]]
+name = "digest"
+sources = ["src/digest", "tests/digest_test.cho"]
 std = true

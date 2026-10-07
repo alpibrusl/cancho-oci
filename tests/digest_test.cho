@@ -1,0 +1,83 @@
+edition 5;
+
+import oci.digest;
+import std.test;
+
+// Known answers (FIPS 180-4 / `sha256sum`): the empty message and "abc".
+
+fn test_the_empty_message() -> [] int {
+    region a {
+        let raw = alloc_slice[a](32, byte_of(0));
+        let text = alloc_slice[a](71, byte_of(0));
+        digest.of_bytes("", raw);
+        digest.text_into(raw, text);
+        test.assert(digest.equal(text, "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    }
+    return 0;
+}
+
+fn test_abc() -> [] int {
+    region a {
+        let raw = alloc_slice[a](32, byte_of(0));
+        let hex = alloc_slice[a](64, byte_of(0));
+        digest.of_bytes("abc", raw);
+        digest.hex_into(raw, hex);
+        test.assert(digest.equal(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    }
+    return 0;
+}
+
+fn test_parse_round_trips() -> [] int {
+    region a {
+        let raw = alloc_slice[a](32, byte_of(0));
+        let back = alloc_slice[a](32, byte_of(0));
+        let text = alloc_slice[a](71, byte_of(0));
+        digest.of_bytes("abc", raw);
+        digest.text_into(raw, text);
+        test.assert_eq(digest.parse_into(text, back), 0);
+        test.assert(digest.equal(raw, back));
+    }
+    return 0;
+}
+
+fn test_the_text_form_is_strict() -> [] int {
+    region a {
+        let raw = alloc_slice[a](32, byte_of(9));
+        test.assert_eq(digest.parse_into("sha512:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_algorithm());
+        test.assert_eq(digest.parse_into("sha25", raw), digest.refused_algorithm());
+        test.assert_eq(digest.parse_into("sha256:abc", raw), digest.refused_length());
+        test.assert_eq(digest.parse_into("sha256:", raw), digest.refused_length());
+        test.assert_eq(digest.parse_into("sha256:BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_into("sha256:ga7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_into("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad ", raw), digest.refused_length());
+        test.assert_eq(int_of(raw[0]), 9);
+    }
+    return 0;
+}
+
+fn test_every_rule_has_a_tag() -> [] int {
+    test.assert(digest.equal(digest.rule_name(0 - 1), "digest-algorithm"));
+    test.assert(digest.equal(digest.rule_name(0 - 2), "digest-length"));
+    test.assert(digest.equal(digest.rule_name(0 - 3), "digest-hex"));
+    test.assert(digest.equal(digest.rule_name(0 - 4), "unknown"));
+    return 0;
+}
+
+fn test_only_lowercase_hex_digits_are_digits() -> [] int {
+    region a {
+        let raw = alloc_slice[a](32, byte_of(9));
+        // Every neighbour of a hex range: '/' and ':' around 0-9, '@' 'G' '[' around A-Z,
+        // '`' and 'g' around a-f.
+        test.assert_eq(digest.parse_hex_into("/a7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_hex_into(":a7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_hex_into("@a7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_hex_into("Ga7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_hex_into("[a7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_hex_into("`a7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_hex_into("ga7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", raw), digest.refused_hex());
+        test.assert_eq(digest.parse_hex_into("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", raw), 0);
+        test.assert_eq(int_of(raw[0]), 1);
+        test.assert_eq(int_of(raw[31]), 239);
+    }
+    return 0;
+}

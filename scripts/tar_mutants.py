@@ -48,7 +48,7 @@ def main():
             m.mkdir()
             (m / "tar.cho").write_text(SRC.replace(old, new))
             probe = m / "probe"
-            b = subprocess.run(["cancho", "build", str(m / "tar.cho"), str(ROOT / "tests/probe/main.cho"), "--std", "-o", str(probe)],
+            b = subprocess.run(["cancho", "build", str(m / "tar.cho"), str(ROOT / "tests/probe/tar/main.cho"), "--std", "-o", str(probe)],
                                capture_output=True, text=True)
             if b.returncode != 0:
                 broken.append(f"{label}: the mutant does not build ({b.stderr.strip()[:120]})")
