@@ -1,0 +1,10 @@
+edition 5;
+
+import std.test;
+
+// The scaffold's own test: the harness runs, a failing assertion would trap.
+// Real tests arrive with the code they judge (#3 onward).
+
+fn test_the_harness_runs() -> [] int {
+    return test.assert_eq(1 + 1, 2);
+}

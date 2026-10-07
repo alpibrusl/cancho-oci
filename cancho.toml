@@ -1,0 +1,19 @@
+[package]
+name = "cancho-oci"
+cancho = "25448b8f0d1e899dbfa7663aa0e5a521acd2a3dd"   # the compiler these sources were written for
+
+# One program per capability row (docs/design.md 5.5): a program's authority is
+# the union of what its main reaches, so `build` (files, no network) and `push`
+# (one registry) are separate binaries and their reports never mix.
+# `push` arrives with #9; the ceiling for each binary lives in ceilings/.
+
+[[bin]]
+name = "oci-build"
+sources = ["src/build"]
+std = true
+out = "build/oci-build"
+
+[[test]]
+name = "scaffold"
+sources = ["tests/scaffold_test.cho"]
+std = true

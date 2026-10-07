@@ -32,6 +32,17 @@ Building an image is I/O and hashing, so the aim is parity with `crane` and `ko`
 - The push path needs a TLS client; cancho's own TLS has not had its independent review, so the authority report for `push` may be unbounded until it has.
 - How a registry address becomes a literal for capability narrowing (the same question as in cancho-dns).
 
+## Building
+
+```sh
+git clone https://github.com/alpibrusl/cancho && git clone https://github.com/alpibrusl/cancho-oci
+REV=$(sed -n 's/^cancho *= *"\([0-9a-f]*\)".*/\1/p' cancho-oci/cancho.toml)   # the compiler these sources were written for
+(cd cancho && git checkout "$REV" && cargo build --release -p cancho)
+export PATH="$PWD/cancho/target/release:$PATH"
+cd cancho-oci && cancho build && cancho test
+python3 scripts/authority_ceiling.py            # G5: authority within its committed ceiling
+```
+
 ## Contributing
 
 Design before code, in `docs/design.md`, with claims measured; a gate is fixed before the code it judges and must be able to fail; a claim that turns out false is corrected in place.
