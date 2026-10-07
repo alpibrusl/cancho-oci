@@ -82,7 +82,9 @@ jobs:
 
       - name: Tools the image gate validates with (OCI JSON schemas via jsonschema, skopeo, crane pinned)
         run: |
-          pip install jsonschema referencing
+          # the runner ships jsonschema 4.10, which has no `registry=`; pin versions that do
+          pip install --user --upgrade 'jsonschema==4.23.0' 'referencing==0.35.1'
+          python3 -c 'import jsonschema, importlib.metadata as m; print("jsonschema", m.version("jsonschema"))'
           sudo apt-get install -y -q skopeo
           go install github.com/google/go-containerregistry/cmd/crane@v0.20.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
