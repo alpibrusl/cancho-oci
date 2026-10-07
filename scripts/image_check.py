@@ -212,6 +212,7 @@ def main():
     rng = random.Random(a.seed)
     have_skopeo, have_crane = shutil.which("skopeo"), shutil.which("crane")
     server, registry = None, None
+    crane_gzip_only = []
     if have_crane:
         import socket, time
         with socket.socket() as sock:
@@ -262,8 +263,19 @@ def main():
                     ref = f"{registry}/case{n}:t"
                     rc, text = tool(["crane", "push", str(image), ref, "--insecure"])
                     if ok(rc == 0, f"case {n}: crane push of the layout failed: {text[:200]}"):
+                        # --fast checks the manifest, the config and the digest chain without opening any layer.
+                        rc, text = tool(["crane", "validate", "--remote", ref, "--insecure", "--fast"])
+                        ok(rc == 0, f"case {n}: crane validate --fast refused the pushed image: {text[:300]}")
+                        # The full check opens each layer, and crane (go-containerregistry v0.20.2) assumes it is gzip:
+                        # an uncompressed layer, which the spec allows, fails with exactly this message. Anything else
+                        # is a real failure. When the gzip task (#6) lands this branch stops being taken.
                         rc, text = tool(["crane", "validate", "--remote", ref, "--insecure"])
-                        ok(rc == 0, f"case {n}: crane validate refused the pushed image: {text[:200]}")
+                        if rc == 0:
+                            pass
+                        elif "gzip: invalid header" in text:
+                            crane_gzip_only.append(n)
+                        else:
+                            ok(False, f"case {n}: crane validate refused the pushed image for a new reason: {text[:300]}")
                         rc, text = tool(["crane", "digest", ref, "--insecure"])
                         want = index["manifests"][0]["digest"]
                         ok(rc == 0 and text.strip() == want, f"case {n}: the registry's manifest digest {text.strip()!r} is not ours {want!r}")
@@ -297,6 +309,8 @@ def main():
         server.terminate()
         server.wait(timeout=10)
     notes = []
+    if crane_gzip_only:
+        notes.append(f"crane's full layer validation assumes gzip and declined {len(crane_gzip_only)} uncompressed layers (known, see design 5.6)")
     if not have_skopeo:
         notes.append("skopeo NOT installed: not run")
     if not have_crane:

@@ -141,7 +141,8 @@ What building it found:
 4. **Owning a `File` discharges `file_write`** (and `dir_*` writes need `dir_write`): the compiler refused my first row for `write_file` as "declared but never performed". Rows are exact in both directions.
 5. **`write_file` does not mint a heap**: the helper took a `Heap` it never used, which the compiler also refused; removing it made the function's authority smaller, not larger.
 
-6. **`crane validate --path` does not exist** (my memory of its flags was wrong; its docs say `--remote` and `--tarball`). `crane push PATH IMAGE` is what reads an OCI layout directory, so the check became a push to an in-memory registry followed by a remote validation: a stronger test than the one I first wrote, and a rehearsal of #9's round trip.
+6. **`crane` cannot validate an uncompressed layer.** `crane validate --remote` opens each layer and assumes gzip, so our uncompressed `application/vnd.oci.image.layer.v1.tar` (which the spec allows and `skopeo` accepts) fails with `validating layers: gzip: invalid header`, while `--fast` (manifest, config and digest chain) passes and the registry reports our manifest digest unchanged. It is a limitation of that tool, but the most widely used one: **gzip is therefore not optional for v1** (#6), and design 5.6's "likely in v1" is now "in v1". The gate accepts exactly that message and no other, so it flips on its own when #6 lands.
+7. **`crane validate --path` does not exist** (my memory of its flags was wrong; its docs say `--remote` and `--tarball`). `crane push PATH IMAGE` is what reads an OCI layout directory, so the check became a push to an in-memory registry followed by a remote validation: a stronger test than the one I first wrote, and a rehearsal of #9's round trip.
 
 Not done, and said so: one layer only; no `created` time, no `author`, no `architecture` variants (design 5.4); the `docker load` and `podman` checks are task #7's, where a runnable binary exists.
 
@@ -162,7 +163,7 @@ A non-root user needs a numeric `User` in the config (`65532`, say); an `/etc/pa
 
 ### 5.6 Compression
 
-`std` has no DEFLATE. Uncompressed layers are valid OCI (`application/vnd.oci.image.layer.v1.tar`), so **M1 ships uncompressed** and everything else (G1, G2, signatures, push) can be built and measured without a compressor. A DEFLATE encoder is a separate, gated task (#6): stored blocks first (trivially correct, no size gain, needed for the gzip framing), then fixed Huffman, then dynamic only if measured size justifies it, always deterministic (no timestamp in the gzip header, fixed OS byte). Size matters for the intended edge targets, where bandwidth is the constraint, so #6 is **likely in v1, not optional**, but it must not block the core. Its gate states the loss against `gzip -9` and `zopfli` plainly; a first encoder will lose.
+`std` has no DEFLATE. Uncompressed layers are valid OCI (`application/vnd.oci.image.layer.v1.tar`), so **M1 ships uncompressed** and everything else (G1, G2, signatures, push) can be built and measured without a compressor. A DEFLATE encoder is a separate, gated task (#6): stored blocks first (trivially correct, no size gain, needed for the gzip framing), then fixed Huffman, then dynamic only if measured size justifies it, always deterministic (no timestamp in the gzip header, fixed OS byte). Size matters for the intended edge targets, where bandwidth is the constraint, and `crane` rejects uncompressed layers in a full validation (5.3, task #5), so #6 is **in v1, not optional**, but it must not block the core. Its gate states the loss against `gzip -9` and `zopfli` plainly; a first encoder will lose.
 
 ### 5.7 Registry client (from memory of the Distribution spec 1.1, re-read in #9)
 
