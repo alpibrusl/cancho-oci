@@ -114,7 +114,7 @@ jobs:
           python3 scripts/build_check.py --cases 30 --seed 1 --run --crane
           python3 scripts/build_check.py --cases 30 --seed 2
 
-      - name: oci-index -- a multi-platform image: schemas, an independent byte-level model, skopeo picks each architecture, crane validates every image under the index
+      - name: oci-index -- a multi-platform image checked against the schemas and an independent byte-level model, skopeo picks each architecture, crane validates every image under the index
         working-directory: oci
         run: |
           python3 scripts/index_check.py --cases 16 --seed 1
