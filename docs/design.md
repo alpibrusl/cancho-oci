@@ -130,7 +130,7 @@ Not tested, and said so: a failing `fsync` or a failing `write` cannot be provok
 - the chain is consistent: index to manifest to config and layer, each digest and size equal to the blob's own sha256 and length, `diff_ids` equal to the digest of the layer, and the store holds exactly those three blobs;
 - the bytes equal what Python's `json.dumps(model, separators=(",", ":"), ensure_ascii=False)` writes for an independently built model, including Unicode and quote and backslash escaping;
 - building twice in different directories gives identical files, and rebuilding in place replaces `index.json` atomically and changes nothing;
-- `skopeo inspect`, `skopeo copy` (which re-verifies every digest) and `crane validate` accept it (CI; not installed on the Mac this was written on, so their first run is the Linux CI);
+- `skopeo inspect` and `skopeo copy` (which re-verifies every digest) accept it, and `crane push` sends it to an in-memory registry (`crane registry serve`) where `crane validate --remote` accepts it and the registry's manifest digest equals the one we computed (CI; neither tool is installed on the Mac this was written on, so their first run is the Linux CI);
 - 20 of 20 mutants killed (`scripts/image_mutants.py`).
 
 What building it found:
@@ -140,6 +140,8 @@ What building it found:
 3. **cancho binaries are dynamic by default** (linked to libc only); a static one builds with a linker wrapper that adds `-static` (1.2 MB, "not a dynamic executable", per cancho's `docs/package-system.md`). The end-to-end gate of #7 builds `cancho-hooks` that way, because a `scratch` image has no libc.
 4. **Owning a `File` discharges `file_write`** (and `dir_*` writes need `dir_write`): the compiler refused my first row for `write_file` as "declared but never performed". Rows are exact in both directions.
 5. **`write_file` does not mint a heap**: the helper took a `Heap` it never used, which the compiler also refused; removing it made the function's authority smaller, not larger.
+
+6. **`crane validate --path` does not exist** (my memory of its flags was wrong; its docs say `--remote` and `--tarball`). `crane push PATH IMAGE` is what reads an OCI layout directory, so the check became a push to an in-memory registry followed by a remote validation: a stronger test than the one I first wrote, and a rehearsal of #9's round trip.
 
 Not done, and said so: one layer only; no `created` time, no `author`, no `architecture` variants (design 5.4); the `docker load` and `podman` checks are task #7's, where a runnable binary exists.
 

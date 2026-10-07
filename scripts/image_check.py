@@ -10,7 +10,9 @@ For random configs it builds a layout with image-probe (a layer from tar-probe) 
   3. the config, manifest and index bytes equal what Python's `json.dumps(model, separators=(",", ":"),
      ensure_ascii=False)` writes for an independently built model: key order, escaping and all;
   4. building twice, in different directories, gives byte-identical files (G1);
-  5. `skopeo` and `crane`, when installed, accept it; their absence is printed, never silent;
+  5. `skopeo` accepts it, and `crane` pushes it to an in-memory registry (`crane registry serve`), validates
+     the pushed image, and the registry's manifest digest is the one we computed; a missing tool is printed,
+     never silent;
   6. every refusal case names its rule tag, and a refusal writes no index.json.
 
     image_check.py [--cases N] [--seed S] [--probe build/image-probe] [--tar-probe build/tar-probe]
@@ -209,6 +211,22 @@ def main():
     a = ap.parse_args()
     rng = random.Random(a.seed)
     have_skopeo, have_crane = shutil.which("skopeo"), shutil.which("crane")
+    server, registry = None, None
+    if have_crane:
+        import socket, time
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        server = subprocess.Popen(["crane", "registry", "serve", "--address", f"127.0.0.1:{port}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                registry = f"127.0.0.1:{port}"
+                break
+            except OSError:
+                time.sleep(0.1)
+        if not registry:
+            fail("the in-memory registry (crane registry serve) did not start")
 
     with tempfile.TemporaryDirectory() as t:
         t = Path(t)
@@ -223,7 +241,7 @@ def main():
             code, out, err = probe(a.probe, image, src, case)
             if not ok(code == 0, f"case {n}: probe refused {err!r} for {case}"):
                 continue
-            check_layout(image, layer, case, f"case {n}")
+            index = check_layout(image, layer, case, f"case {n}")
             # G1: the same inputs elsewhere give the same bytes
             image2 = work / "again" / "image"
             skeleton(image2)
@@ -240,9 +258,15 @@ def main():
                     ok(rc == 0, f"case {n}: skopeo refused the layout: {text[:200]}")
                     rc, text = tool(["skopeo", "copy", target, f"dir:{work / 'copy'}"])
                     ok(rc == 0, f"case {n}: skopeo copy (which re-verifies every digest) failed: {text[:200]}")
-                if have_crane:
-                    rc, text = tool(["crane", "validate", "--path", str(image)])
-                    ok(rc == 0, f"case {n}: crane validate refused the layout: {text[:200]}")
+                if have_crane and registry:
+                    ref = f"{registry}/case{n}:t"
+                    rc, text = tool(["crane", "push", str(image), ref, "--insecure"])
+                    if ok(rc == 0, f"case {n}: crane push of the layout failed: {text[:200]}"):
+                        rc, text = tool(["crane", "validate", "--remote", ref, "--insecure"])
+                        ok(rc == 0, f"case {n}: crane validate refused the pushed image: {text[:200]}")
+                        rc, text = tool(["crane", "digest", ref, "--insecure"])
+                        want = index["manifests"][0]["digest"]
+                        ok(rc == 0 and text.strip() == want, f"case {n}: the registry's manifest digest {text.strip()!r} is not ours {want!r}")
 
         # refusals
         work = t / "refusals"
@@ -269,6 +293,9 @@ def main():
         p = subprocess.run(args, capture_output=True, text=True)
         ok(p.returncode == 1 and "blob-missing" in p.stderr, f"a missing layer was not refused: {p.returncode} {p.stderr!r}")
 
+    if server:
+        server.terminate()
+        server.wait(timeout=10)
     notes = []
     if not have_skopeo:
         notes.append("skopeo NOT installed: not run")
