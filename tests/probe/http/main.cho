@@ -1,0 +1,146 @@
+edition 7;
+
+import std.buffer;
+import std.io;
+import oci.http;
+
+// http-probe: the test harness for `oci.http` (#9). One request, the response on stdout:
+//
+//     http-probe <host> <port> <METHOD> <path>
+//
+// Prints `STATUS <n>`, then `HEAD <name>: <value>` for each of a few headers, then `BODY`,
+// then the body exactly as decoded, piece by piece. A refusal is `refused: <rule tag>` on
+// stderr and exit status 1.
+
+fn number[&t](text: &t [byte]) -> [] int {
+    var value = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < '0' || c > '9' {
+            return 0 - 1;
+        }
+        value = value * 10 + (c - '0');
+        i = i + 1;
+    }
+    if len(text) == 0 {
+        return 0 - 1;
+    }
+    return value;
+}
+
+fn show[&i, &e](io: &!i Io, ex: &e http.Exchange, name: &static [byte]) -> [io_write] int {
+    let v = http.header(ex, name);
+    if len(v) > 0 {
+        io.write_all(io, "HEAD ");
+        io.write_all(io, name);
+        io.write_all(io, ": ");
+        io.write_all(io, v);
+        io.write_all(io, "\n");
+    }
+    return 0;
+}
+
+fn exchange[&h, &n, &i, &g](heap: &!h Heap, net: &n Net(""), io: &!i Io, args: &g Args) -> [heap, args, net_out(""), conn_read, conn_write, io_write, err_write] int {
+    let host = arg(args, 1);
+    let port = number(arg(args, 2));
+    var req = buffer.empty(heap, 256);
+    req = buffer.append(heap, req, arg(args, 3));
+    req = buffer.append(heap, req, " ");
+    req = buffer.append(heap, req, arg(args, 4));
+    req = buffer.append(heap, req, " HTTP/1.1\r\nHost: ");
+    req = buffer.append(heap, req, host);
+    req = buffer.append(heap, req, ":");
+    req = buffer.push_nat(heap, req, port);
+    req = buffer.append(heap, req, "\r\nUser-Agent: http-probe\r\nConnection: close\r\n\r\n");
+    var status = 1;
+    match http.begin(heap, net, host, port) {
+        http.Started::Failed(code) => {
+            io.error_all(io, "refused: ");
+            io.error_all(io, http.rule_name(code));
+            io.error_all(io, "\n");
+        }
+        http.Started::Ok(first) => {
+            var ex = first;
+            var code = 0;
+            borrow req as &rb in {
+                let (next, c) = http.send(ex, buffer.bytes(rb));
+                ex = next;
+                code = c;
+            }
+            if code == 0 {
+                let (next, c) = http.read_head(ex);
+                ex = next;
+                code = c;
+            }
+            if code == 0 {
+                borrow ex as &er in {
+                    io.write_all(io, "STATUS ");
+                    io.print_nat(io, http.status(er));
+                    io.write_all(io, "\n");
+                    show(io, er, "content-type");
+                    show(io, er, "content-length");
+                    show(io, er, "location");
+                    show(io, er, "docker-content-digest");
+                    show(io, er, "www-authenticate");
+                    io.write_all(io, "BODY\n");
+                }
+                let piece = box_slice(heap, 4096, byte_of(0));
+                var going = true;
+                while going {
+                    borrow mut piece as &!pw in {
+                        let (next, n) = http.read_body(ex, contents(pw));
+                        ex = next;
+                        if n > 0 {
+                            io.write_all(io, contents(pw)[0..n]);
+                        } else {
+                            going = false;
+                            if n < 0 {
+                                code = n;
+                            }
+                        }
+                    }
+                }
+                unbox_slice(heap, piece);
+            }
+            http.end(heap, ex);
+            if code == 0 {
+                status = 0;
+            } else {
+                io.error_all(io, "\nrefused: ");
+                io.error_all(io, http.rule_name(code));
+                io.error_all(io, "\n");
+            }
+        }
+    }
+    buffer.drop(heap, req);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(fs);
+    release(clock);
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow net as &n in {
+                borrow mut io as &!i in {
+                    if arg_count(g) != 5 {
+                        io.error_all(i, "usage: http-probe <host> <port> <METHOD> <path>\n");
+                    } else {
+                        status = exchange(h, n, i, g);
+                    }
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(net);
+    release(io);
+    return status;
+}

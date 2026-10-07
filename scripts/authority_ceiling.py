@@ -117,13 +117,24 @@ fn main(world: World) -> [] int {
 
 
 # No ceiling may ever grant these, whatever the JSON says: the tools build and inspect images, they do not
-# reach a network, run other programs, read the clock, handle signals, call foreign code or open files by path
+# listen on a network, run other programs, read the clock, handle signals, call foreign code or open files by path
 # for writing (writes go through directory handles). Granting one means editing this list in the same PR.
 FORBIDDEN = ("net", "conn_", "listen", "accept", "exec", "clock", "signals", "ffi", "fs_write", "udp", "poller")
 
+# The only programs that may speak to a network, and the only network effects they may have: dial out, read and
+# write on what they dialled. They may not listen, accept, resolve through a poller, or do anything else on the list.
+NETWORK_CLIENTS = {"oci-push", "oci-pull", "http-probe"}
+CLIENT_EFFECTS = {"net_out", "conn_read", "conn_write"}
 
-def forbidden_in(ceil):
-    return [e for e in ceil["effects"] if any(e.startswith(f) for f in FORBIDDEN)]
+
+def forbidden_in(ceil, name=""):
+    out = []
+    for e in ceil["effects"]:
+        if any(e.startswith(f) for f in FORBIDDEN):
+            if name in NETWORK_CLIENTS and e in CLIENT_EFFECTS:
+                continue
+            out.append(e)
+    return out
 
 
 def selftest():
@@ -132,10 +143,17 @@ def selftest():
     bad = 0
     for b in bins():
         ceil_b = json.loads((ROOT / "ceilings" / f"{b['name']}.json").read_text())
-        forbidden = forbidden_in(ceil_b)
+        forbidden = forbidden_in(ceil_b, b['name'])
         if forbidden:
             print(f"SELFTEST FAIL: the ceiling of {b['name']} grants forbidden effects {forbidden}")
             bad = 1
+    # the network row of a client is allowed and must be visible in its ceiling: the reviewer sees `net_out ""`
+    for b in bins():
+        if b["name"] in NETWORK_CLIENTS:
+            labels = json.loads((ROOT / "ceilings" / f"{b['name']}.json").read_text())["labels"]
+            if not any(l["name"] == "net_out" for l in labels):
+                print(f"SELFTEST FAIL: {b['name']} is a network client but its ceiling has no net_out row")
+                bad = 1
     if bad:
         return 1
     ceil = json.loads((ROOT / "ceilings" / "tar-probe.json").read_text())

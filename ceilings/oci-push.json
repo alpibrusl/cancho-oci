@@ -1,0 +1,58 @@
+{
+  "bounded": true,
+  "effects": [
+    "args",
+    "conn_read",
+    "conn_write",
+    "dir_read",
+    "err_write",
+    "file_read",
+    "fs_read",
+    "heap",
+    "io_write",
+    "net_out"
+  ],
+  "labels": [
+    {
+      "name": "args",
+      "argument": null
+    },
+    {
+      "name": "conn_read",
+      "argument": null
+    },
+    {
+      "name": "conn_write",
+      "argument": null
+    },
+    {
+      "name": "dir_read",
+      "argument": null
+    },
+    {
+      "name": "err_write",
+      "argument": null
+    },
+    {
+      "name": "file_read",
+      "argument": null
+    },
+    {
+      "name": "fs_read",
+      "argument": ""
+    },
+    {
+      "name": "heap",
+      "argument": null
+    },
+    {
+      "name": "io_write",
+      "argument": null
+    },
+    {
+      "name": "net_out",
+      "argument": ""
+    }
+  ],
+  "foreign_symbols": []
+}

@@ -1,0 +1,43 @@
+{
+  "bounded": true,
+  "effects": [
+    "args",
+    "conn_read",
+    "conn_write",
+    "err_write",
+    "heap",
+    "io_write",
+    "net_out"
+  ],
+  "labels": [
+    {
+      "name": "args",
+      "argument": null
+    },
+    {
+      "name": "conn_read",
+      "argument": null
+    },
+    {
+      "name": "conn_write",
+      "argument": null
+    },
+    {
+      "name": "err_write",
+      "argument": null
+    },
+    {
+      "name": "heap",
+      "argument": null
+    },
+    {
+      "name": "io_write",
+      "argument": null
+    },
+    {
+      "name": "net_out",
+      "argument": ""
+    }
+  ],
+  "foreign_symbols": []
+}

@@ -245,6 +245,17 @@ Push and pull over HTTPS using `packages/http-request` on `packages/tls`: bearer
 
 **The TLS question.** cancho has its own TLS (`packages/tls`, `packages/x509`, on `std` crypto), so `push` can have **no foreign code and a bounded authority report**. It has **not had its independent review** (cancho's #209): until it does, the doc and README may say "no foreign code" and must not say "audited". Interop with a real registry (`ghcr.io`) is part of G2/#9, not assumed.
 
+**Built and measured (task #9a, `src/http`, `src/registry`, `src/pushcli`, `src/pullcli`).** `oci-push` and `oci-pull` speak the distribution protocol over **plain HTTP** (`--plain-http` is required for now; TLS is #9b, so nothing here claims to reach `ghcr.io`). `oci.http` is a small HTTP/1.1 client over `tcp_connect`: head cap 16 KiB, line cap 8 KiB, bodies by Content-Length, chunked or until close, every state refused by name. `oci.registry` does the protocol with defensive rules:
+
+- an upload `Location` may only point to the **same host**; a foreign one is refused, never followed;
+- the digest of a manifest is computed locally and compared with the reference asked for and with the `Docker-Content-Digest` the registry reports; a blob is published to the store only if its size and digest match the descriptor (the descriptor's size is the bound, a longer body is cut off and refused);
+- credentials (`--basic-file`) are sent only over plain HTTP to loopback; a Bearer challenge is refused by name rather than half-supported;
+- a pulled layout is rebuilt, byte for byte, by `oci.image.layout_entry_json`, and `oci-pull --platform linux/arch` picks one image out of an index.
+
+The gate (`scripts/registry_check.py`, 241 checks locally): round trips against a mock registry (`scripts/mock_registry.py`) including pushes that repeat, chunked replies, pulling by digest and by platform; 20 injected faults (foreign or relative `Location`, wrong digests, a wrong or oversized blob (also chunked), short bodies, long or many headers, bad status, a swapped manifest, a bearer challenge, `HEAD` unsupported...), each checked for its refusal code **and for its side effects** (nothing published, nothing written outside the output directory); the pulled `index.json` is compared with an independent byte-level model; and, where available, `crane registry serve` and `registry:2` as real registries. `scripts/registry_mutants.py` has 30 mutants, all killed. The authority ceilings: only `oci-push`, `oci-pull` and `http-probe` may hold `net_out`, `conn_read` and `conn_write`; the build and index binaries still have no network.
+
+Known gaps, stated: no read deadlines (a server that stalls hangs a read; planned under #15); no Bearer token flow; no TLS yet, so `ghcr.io` is untested; monolithic uploads only; no cross-repository mount.
+
 ### 5.8 Provenance
 
 An SBOM and a signature are attached to an image as OCI artifacts, through the **referrers API** (a manifest with a `subject` field, listed by `GET /v2/<name>/referrers/<digest>`), with the **tag-schema fallback** for registries that lack it. The SBOM's content comes from the binary's **authority report** and the dependency hashes the project pins, which is something no other image tool can say about a cancho program. Signature: over the manifest digest, **ECDSA P-256 or Ed25519** (both in `std`; see 10), with a `verify` command that needs no network. Interoperability with `cosign` is a goal **only if tested**; until then the doc says what interoperates and what does not.

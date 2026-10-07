@@ -1,0 +1,585 @@
+edition 7;
+
+module oci.http;
+
+// `oci.http` -- an HTTP/1.1 client, one exchange at a time (design 5.7, task #9). There
+// is no client in cancho's packages (`http.request` reads a server's incoming
+// requests), so this is it, and it is deliberately small: one connection per exchange
+// (`Connection: close`), no keep-alive, no redirects followed (a registry's `Location`
+// is data to be checked by the caller, not a hop to take), no compression.
+//
+// An `Exchange` owns the connection and its buffers. The caller sends a request head
+// and body, reads the response head, then reads the body a piece at a time; a body is
+// never held whole unless the caller chooses to. Three body framings are decoded:
+// `Content-Length`, `Transfer-Encoding: chunked`, and "until the server closes".
+//
+// A response head is capped (16 KiB) and so is every line of it, so a server that never
+// stops sending headers is refused, not buffered. What this cannot yet do, and says so:
+// there is no deadline, so a server that stops answering stalls the read (a poller
+// would bound it; that is hardening, task #15).
+
+pub fn head_cap() -> [] int {
+    return 16384;
+}
+
+pub fn line_cap() -> [] int {
+    return 8192;
+}
+
+pub fn refused_dial() -> [] int {
+    return 0 - 801;
+}
+
+pub fn refused_send() -> [] int {
+    return 0 - 802;
+}
+
+pub fn refused_truncated() -> [] int {
+    return 0 - 803;
+}
+
+pub fn refused_head_too_large() -> [] int {
+    return 0 - 804;
+}
+
+pub fn refused_malformed() -> [] int {
+    return 0 - 805;
+}
+
+pub fn refused_body() -> [] int {
+    return 0 - 806;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == refused_dial() {
+        return "http-dial";
+    }
+    if code == refused_send() {
+        return "http-send";
+    }
+    if code == refused_truncated() {
+        return "http-truncated";
+    }
+    if code == refused_head_too_large() {
+        return "http-head-too-large";
+    }
+    if code == refused_malformed() {
+        return "http-malformed";
+    }
+    if code == refused_body() {
+        return "http-body";
+    }
+    return "unknown";
+}
+
+// st: 0 bytes in `buf`, 1 read position in `buf`, 2 status, 3 bytes of head, 4
+//     Content-Length (-1 when absent), 5 chunked (1/0), 6 body mode (0 length,
+//     1 chunked, 2 until close), 7 bytes left in the current length or chunk,
+//     8 chunk state (0 size line next, 1 data, 2 CRLF after data, 3 done)
+pub res struct Exchange {
+    conn: Conn,
+    buf: Box[[byte]],
+    st: Box[[int]],
+    head: Box[[byte]],
+}
+
+pub enum Started {
+    Ok(Exchange),
+    Failed(int),
+}
+
+// Dial `host:port` (the builtin resolves names). One exchange, one connection.
+pub fn begin[&h, &n, &t](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int) -> [heap, net_out("")] Started {
+    match tcp_connect(net, host, port) {
+        Dialed::Failed(errno) => {
+            return Started::Failed(refused_dial());
+        }
+        Dialed::Ok(conn) => {
+            let st = box_slice(heap, 9, 0);
+            borrow mut st as &!sw in {
+                contents(sw)[4] = 0 - 1;
+            }
+            return Started::Ok(Exchange { conn: conn, buf: box_slice(heap, 16384, byte_of(0)), st: st, head: box_slice(heap, 16384, byte_of(0)) });
+        }
+    }
+}
+
+pub fn end[&h](heap: &!h Heap, ex: Exchange) -> [heap] int {
+    let Exchange { conn, buf, st, head } = ex;
+    conn_close(conn);
+    unbox_slice(heap, buf);
+    unbox_slice(heap, st);
+    unbox_slice(heap, head);
+    return 0;
+}
+
+// Write all of `bytes`. The exchange back and 0, or a refusal.
+pub fn send[&b](ex: Exchange, bytes: &b [byte]) -> [conn_write] (Exchange, int) {
+    let Exchange { conn, buf, st, head } = ex;
+    var c = conn;
+    var code = 0;
+    var at = 0;
+    while at < len(bytes) && code == 0 {
+        borrow mut c as &!cw in {
+            match conn_write(cw, bytes[at..len(bytes)]) {
+                Sent::Wrote(n) => {
+                    if n <= 0 {
+                        code = refused_send();
+                    } else {
+                        at = at + n;
+                    }
+                }
+                Sent::Again => {
+                    code = refused_send();
+                }
+                Sent::Failed(errno) => {
+                    code = refused_send();
+                }
+            }
+        }
+    }
+    return (Exchange { conn: c, buf: buf, st: st, head: head }, code);
+}
+
+// Refill the read buffer when it is empty. 1 when there are bytes, 0 at the end of the
+// stream, -1 on an error.
+fn fill[&c, &b, &s](conn: &!c Conn, buf: &!b [byte], st: &!s [int]) -> [conn_read] int {
+    if st[1] < st[0] {
+        return 1;
+    }
+    match conn_read(conn, buf) {
+        Received::Data(n) => {
+            st[0] = n;
+            st[1] = 0;
+            return 1;
+        }
+        Received::End => {
+            return 0;
+        }
+        Received::Again => {
+            return 0 - 1;
+        }
+        Received::Failed(errno) => {
+            return 0 - 1;
+        }
+    }
+}
+
+// The next byte (0..255), -1 at the end of the stream, -2 on an error.
+fn next_byte[&c, &b, &s](conn: &!c Conn, buf: &!b [byte], st: &!s [int]) -> [conn_read] int {
+    let f = fill(conn, buf, st);
+    if f == 0 {
+        return 0 - 1;
+    }
+    if f < 0 {
+        return 0 - 2;
+    }
+    let v = int_of(buf[st[1]]);
+    st[1] = st[1] + 1;
+    return v;
+}
+
+// One line, without its line ending, into `line`: its length; -1 at the end of the
+// stream before any byte; -2 when the line would not fit; -3 on an error. A bare LF
+// ends a line too (a lenient reader of the line, strict about where it ends).
+fn read_line[&c, &b, &s, &l](conn: &!c Conn, buf: &!b [byte], st: &!s [int], line: &!l [byte]) -> [conn_read] int {
+    var n = 0;
+    var first = true;
+    while true {
+        let v = next_byte(conn, buf, st);
+        if v == 0 - 1 {
+            if first {
+                return 0 - 1;
+            }
+            return 0 - 3;
+        }
+        if v < 0 {
+            return 0 - 3;
+        }
+        first = false;
+        if v == '\n' {
+            if n > 0 && int_of(line[n - 1]) == '\r' {
+                return n - 1;
+            }
+            return n;
+        }
+        if n >= len(line) {
+            return 0 - 2;
+        }
+        line[n] = byte_of(v);
+        n = n + 1;
+    }
+    return 0 - 3;
+}
+
+// Case-insensitive equality of `a` (a header name from the wire) with `b` (lower case).
+fn same_name[&a, &b](x: &a [byte], y: &b [byte]) -> [] bool {
+    if len(x) != len(y) {
+        return false;
+    }
+    var i = 0;
+    while i < len(x) {
+        var c = int_of(x[i]);
+        if c >= 'A' && c <= 'Z' {
+            c = c + 32;
+        }
+        if c != int_of(y[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn number_in[&t](text: &t [byte]) -> [] int {
+    var value = 0;
+    var seen = false;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c >= '0' && c <= '9' {
+            if value > 100000000000000 {
+                return 0 - 1;
+            }
+            value = value * 10 + (c - '0');
+            seen = true;
+        } else if c != ' ' && c != '\t' {
+            return 0 - 1;
+        }
+        i = i + 1;
+    }
+    if !seen {
+        return 0 - 1;
+    }
+    return value;
+}
+
+// The text of `bytes` between the first byte that is not a space and the last, as a view.
+fn trim[&t](text: &t [byte]) -> [] &t [byte] {
+    var a = 0;
+    var b = len(text);
+    while a < b && (int_of(text[a]) == ' ' || int_of(text[a]) == '\t') {
+        a = a + 1;
+    }
+    while b > a && (int_of(text[b - 1]) == ' ' || int_of(text[b - 1]) == '\t' || int_of(text[b - 1]) == '\r') {
+        b = b - 1;
+    }
+    return text[a..b];
+}
+
+// Read the response head: the status line and every header, into the exchange's head
+// buffer (one header per line, "\n" separated), and decide how the body is framed.
+// The exchange back and 0, or a refusal. The status is `status(ex)`.
+pub fn read_head(ex: Exchange) -> [conn_read] (Exchange, int) {
+    let Exchange { conn, buf, st, head } = ex;
+    var c = conn;
+    var code = 0;
+    borrow mut c as &!cw in {
+        borrow mut buf as &!bw in {
+            borrow mut st as &!sw in {
+                borrow mut head as &!hw in {
+                    let b = contents(bw);
+                    let s = contents(sw);
+                    let h = contents(hw);
+                    region a {
+                        let line = alloc_slice[a](8192, byte_of(0));
+                        var used = 0;
+                        var n = read_line(cw, b, s, line);
+                        if n < 0 {
+                            code = refused_truncated();
+                            if n == 0 - 2 {
+                                code = refused_head_too_large();
+                            }
+                        } else if n < 12 || int_of(line[0]) != 'H' || int_of(line[1]) != 'T' || int_of(line[2]) != 'T' || int_of(line[3]) != 'P' || int_of(line[4]) != '/' {
+                            code = refused_malformed();
+                        } else {
+                            // "HTTP/1.1 201 Created": the status is the three digits after the first space
+                            var sp = 0;
+                            while sp < n && int_of(line[sp]) != ' ' {
+                                sp = sp + 1;
+                            }
+                            let status = number_in(line[sp + 1..sp + 4]);
+                            if sp + 4 > n || status < 100 || status > 599 {
+                                code = refused_malformed();
+                            } else {
+                                s[2] = status;
+                                var going = true;
+                                while going && code == 0 {
+                                    n = read_line(cw, b, s, line);
+                                    if n < 0 {
+                                        code = refused_truncated();
+                                        if n == 0 - 2 {
+                                            code = refused_head_too_large();
+                                        }
+                                    } else if n == 0 {
+                                        going = false;
+                                    } else if used + n + 1 > len(h) {
+                                        code = refused_head_too_large();
+                                    } else {
+                                        var k = 0;
+                                        while k < n {
+                                            h[used + k] = line[k];
+                                            k = k + 1;
+                                        }
+                                        h[used + n] = byte_of('\n');
+                                        used = used + n + 1;
+                                    }
+                                }
+                                s[3] = used;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let ex2 = Exchange { conn: c, buf: buf, st: st, head: head };
+    if code != 0 {
+        return (ex2, code);
+    }
+    return frame(ex2);
+}
+
+// The value of header `name` (lower case) in `h` (the head, one header per line), trimmed,
+// or an empty view.
+fn header_in[&t, &n](h: &t [byte], name: &n [byte]) -> [] &t [byte] {
+    var at = 0;
+    while at < len(h) {
+        var end = at;
+        while end < len(h) && int_of(h[end]) != '\n' {
+            end = end + 1;
+        }
+        var colon = at;
+        while colon < end && int_of(h[colon]) != ':' {
+            colon = colon + 1;
+        }
+        if colon < end && same_name(h[at..colon], name) {
+            return trim(h[colon + 1..end]);
+        }
+        at = end + 1;
+    }
+    return h[0..0];
+}
+
+// The value of header `name` (lower case) in the response, trimmed, or an empty view.
+pub fn header[&e, &n](ex: &e Exchange, name: &n [byte]) -> [] &e [byte] {
+    return header_in(contents(ex.head)[0..contents(ex.st)[3]], name);
+}
+
+pub fn status[&e](ex: &e Exchange) -> [] int {
+    return contents(ex.st)[2];
+}
+
+// Decide the body framing from the headers: chunked wins over a length (RFC 9112 6.3);
+// a length that is not a number, or two that differ, is a refusal.
+fn frame(ex: Exchange) -> [] (Exchange, int) {
+    let Exchange { conn, buf, st, head } = ex;
+    var code = 0;
+    borrow head as &hr in {
+        borrow mut st as &!sw in {
+            let s = contents(sw);
+            let h = contents(hr)[0..s[3]];
+            let te = header_in(h, "transfer-encoding");
+            let cl = header_in(h, "content-length");
+            var mode = 2;
+            var length = 0 - 1;
+            if len(cl) > 0 {
+                length = number_in(cl);
+                if length < 0 {
+                    code = refused_malformed();
+                } else {
+                    mode = 0;
+                }
+            }
+            if len(te) > 0 {
+                if same_name(te, "chunked") {
+                    mode = 1;
+                } else {
+                    code = refused_malformed();
+                }
+            }
+            s[4] = length;
+            s[5] = 0;
+            if mode == 1 {
+                s[5] = 1;
+            }
+            s[6] = mode;
+            s[7] = length;
+            s[8] = 0;
+            // No body for these, whatever the headers say.
+            if s[2] == 204 || s[2] == 304 || s[2] >= 100 && s[2] < 200 {
+                s[6] = 0;
+                s[7] = 0;
+            }
+        }
+    }
+    return (Exchange { conn: conn, buf: buf, st: st, head: head }, code);
+}
+
+// Up to `want` bytes of body into `out`: from the read buffer if it holds any, else
+// straight from the connection. The count (at least 1), 0 when the stream ends, -1 on an error.
+fn pull[&c, &b, &s, &o](conn: &!c Conn, buf: &!b [byte], st: &!s [int], out: &!o [byte], want: int) -> [conn_read] int {
+    var room = want;
+    if room > len(out) {
+        room = len(out);
+    }
+    if room < 1 {
+        return 0 - 1;
+    }
+    if st[1] < st[0] {
+        var n = st[0] - st[1];
+        if n > room {
+            n = room;
+        }
+        var i = 0;
+        while i < n {
+            out[i] = buf[st[1] + i];
+            i = i + 1;
+        }
+        st[1] = st[1] + n;
+        return n;
+    }
+    match conn_read(conn, out[0..room]) {
+        Received::Data(n) => {
+            return n;
+        }
+        Received::End => {
+            return 0;
+        }
+        Received::Again => {
+            return 0 - 1;
+        }
+        Received::Failed(errno) => {
+            return 0 - 1;
+        }
+    }
+}
+
+// A chunk-size line: hexadecimal digits, then optionally ";extension". The size, or -1.
+fn chunk_size[&t](line: &t [byte]) -> [] int {
+    var value = 0;
+    var seen = false;
+    var i = 0;
+    while i < len(line) {
+        let c = int_of(line[i]);
+        var d = 0 - 1;
+        if c >= '0' && c <= '9' {
+            d = c - '0';
+        } else if c >= 'a' && c <= 'f' {
+            d = c - 'a' + 10;
+        } else if c >= 'A' && c <= 'F' {
+            d = c - 'A' + 10;
+        }
+        if d < 0 {
+            if c == ';' || c == ' ' || c == '\t' {
+                i = len(line);
+            } else {
+                return 0 - 1;
+            }
+        } else {
+            if value > 1152921504606846975 / 16 {
+                return 0 - 1;
+            }
+            value = value * 16 + d;
+            seen = true;
+            i = i + 1;
+        }
+    }
+    if !seen {
+        return 0 - 1;
+    }
+    return value;
+}
+
+// The next piece of the body into `out` (never more than `len(out)` bytes): its length,
+// 0 when the body is complete, or a refusal (`http-truncated`: the stream ended early;
+// `http-body`: bad chunk framing). The exchange is handed back for the next call.
+pub fn read_body[&o](ex: Exchange, out: &!o [byte]) -> [conn_read] (Exchange, int) {
+    let Exchange { conn, buf, st, head } = ex;
+    var c = conn;
+    var result = 0;
+    borrow mut c as &!cw in {
+        borrow mut buf as &!bw in {
+            borrow mut st as &!sw in {
+                let b = contents(bw);
+                let s = contents(sw);
+                if s[6] == 0 {
+                    if s[7] > 0 {
+                        let n = pull(cw, b, s, out, s[7]);
+                        if n > 0 {
+                            s[7] = s[7] - n;
+                            result = n;
+                        } else {
+                            result = refused_truncated();
+                        }
+                    }
+                } else if s[6] == 2 {
+                    let n = pull(cw, b, s, out, len(out));
+                    if n > 0 {
+                        result = n;
+                    } else if n < 0 {
+                        result = refused_truncated();
+                    }
+                } else {
+                    var going = true;
+                    while going {
+                        going = false;
+                        if s[8] == 0 {
+                            region a {
+                                let line = alloc_slice[a](128, byte_of(0));
+                                let n = read_line(cw, b, s, line);
+                                if n < 0 {
+                                    result = refused_truncated();
+                                } else {
+                                    let size = chunk_size(line[0..n]);
+                                    if size < 0 {
+                                        result = refused_body();
+                                    } else if size == 0 {
+                                        s[8] = 3;
+                                        // trailers, up to the blank line that ends the message
+                                        var more = true;
+                                        while more && result == 0 {
+                                            let t = read_line(cw, b, s, line);
+                                            if t < 0 {
+                                                result = refused_truncated();
+                                            } else if t == 0 {
+                                                more = false;
+                                            }
+                                        }
+                                    } else {
+                                        s[7] = size;
+                                        s[8] = 1;
+                                        going = true;
+                                    }
+                                }
+                            }
+                        } else if s[8] == 1 {
+                            let n = pull(cw, b, s, out, s[7]);
+                            if n > 0 {
+                                s[7] = s[7] - n;
+                                if s[7] == 0 {
+                                    s[8] = 2;
+                                }
+                                result = n;
+                            } else {
+                                result = refused_truncated();
+                            }
+                        } else if s[8] == 2 {
+                            region a2 {
+                                let line = alloc_slice[a2](8, byte_of(0));
+                                let n = read_line(cw, b, s, line);
+                                if n != 0 {
+                                    result = refused_body();
+                                } else {
+                                    s[8] = 0;
+                                    going = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return (Exchange { conn: c, buf: buf, st: st, head: head }, result);
+}

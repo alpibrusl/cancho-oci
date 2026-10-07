@@ -1,0 +1,472 @@
+edition 7;
+
+import std.buffer;
+import std.io;
+import std.json;
+import oci.digest;
+import oci.image;
+import oci.layout;
+import oci.registry;
+import oci.store;
+
+// oci-push: send an image from an OCI layout to a registry (design 5.7, task #9).
+//
+//     oci-push --image <dir> --registry <host[:port]> --repo <name> --plain-http
+//              [--tag <ref>] [--basic-file <path>]
+//
+// The layout's `index.json` names one image or one multi-platform index. Every document is
+// re-hashed as it is read, every blob is re-hashed before it is sent, blobs the registry
+// already has are skipped, a manifest is only pushed after the blobs it names, and the top
+// manifest goes under `--tag` (or the layout's own `ref.name`, or its digest).
+//
+// `--plain-http` is required for now: TLS is the next step (task #9, second slice), and an
+// unencrypted push has to be asked for by name. Credentials (`--basic-file`: one line,
+// `user:password`) are only ever sent over plain HTTP to a loopback host.
+//
+// This program's authority report is the only one in the project with a network row, and
+// it is `net_out("")`: the registry is a run-time argument, so the compiler can name no host
+// for it. The host the program may talk to is enforced in code: the one on the command
+// line, and a `Location` that names any other is refused (`registry-redirect-foreign-host`).
+//
+// A refusal is `refused: <rule tag>` on stderr (with the HTTP status and the registry's first
+// error code when it gave one) and exit status 1.
+
+fn push_flag() -> [] int {
+    return 0 - 1001;
+}
+
+fn push_missing() -> [] int {
+    return 0 - 1002;
+}
+
+fn push_plain() -> [] int {
+    return 0 - 1003;
+}
+
+fn push_creds_http() -> [] int {
+    return 0 - 1004;
+}
+
+fn push_registry() -> [] int {
+    return 0 - 1005;
+}
+
+fn push_tag() -> [] int {
+    return 0 - 1006;
+}
+
+fn push_dir() -> [] int {
+    return 0 - 1007;
+}
+
+fn push_skeleton() -> [] int {
+    return 0 - 1008;
+}
+
+fn push_layout() -> [] int {
+    return 0 - 1009;
+}
+
+fn rule_of(code: int) -> [] &static [byte] {
+    if code == push_flag() {
+        return "push-flag";
+    }
+    if code == push_missing() {
+        return "push-missing";
+    }
+    if code == push_plain() {
+        return "push-plain-http-required";
+    }
+    if code == push_creds_http() {
+        return "push-credentials-over-plain-http";
+    }
+    if code == push_registry() {
+        return "push-registry";
+    }
+    if code == push_tag() {
+        return "push-tag";
+    }
+    if code == push_dir() {
+        return "push-dir-open";
+    }
+    if code == push_skeleton() {
+        return "push-layout-skeleton";
+    }
+    if code == push_layout() {
+        return "push-layout";
+    }
+    if code <= 0 - 600 && code > 0 - 700 {
+        return layout.rule_name(code);
+    }
+    if code <= 0 - 800 && code > 0 - 1000 {
+        return registry.rule_name(code);
+    }
+    return store.rule_name(code);
+}
+
+fn printable[&t, &i](io: &!i Io, text: &t [byte], limit: int) -> [io_write] int {
+    var k = 0;
+    while k < len(text) && k < limit {
+        let c = int_of(text[k]);
+        if c >= 32 && c < 127 {
+            putchar(io, c);
+        } else {
+            putchar(io, '?');
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, rule_of(code));
+    if len(culprit) > 0 {
+        io.error_all(io, " (");
+        io.error_all(io, culprit);
+        io.error_all(io, ")");
+    }
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// Make sure the blob `digest_text` (descriptor size `size`) is in the registry: skipped if it
+// is already there, else re-hashed and uploaded. Prints one line. 0 or a refusal.
+fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+    let hex = layout.hex_of(digest_text);
+    if len(hex) == 0 || size < 0 {
+        return push_layout();
+    }
+    let there = registry.blob_status(heap, net, host, port, auth, repo, digest_text);
+    if there < 0 {
+        return there;
+    }
+    if there == 0 {
+        io.write_all(io, "blob ");
+        io.write_all(io, digest_text);
+        io.write_all(io, " already there\n");
+        return 0;
+    }
+    // Re-hash before sending: never upload bytes that are not the bytes the name promises.
+    let (vc, actual) = store.verify_sized(heap, blobs, hex);
+    if vc != 0 {
+        return vc;
+    }
+    if actual != size {
+        return push_layout();
+    }
+    var code = 0;
+    match dir_open_read(blobs, hex) {
+        Opened::Failed(errno) => {
+            code = store.refused_missing();
+        }
+        Opened::Ok(file) => {
+            var handle = file;
+            borrow mut handle as &!f in {
+                code = registry.blob_upload(heap, net, host, port, auth, repo, digest_text, size, f);
+            }
+            file_close(handle);
+        }
+    }
+    if code == 0 {
+        io.write_all(io, "blob ");
+        io.write_all(io, digest_text);
+        io.write_all(io, " uploaded (");
+        io.print_nat(io, size);
+        io.write_all(io, " bytes)\n");
+    }
+    return code;
+}
+
+// Push the config and layers a manifest names (`body`), then the manifest itself at
+// `reference`. 0 or a refusal.
+fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], body: &d [byte], digest_text: &g [byte], blobs: &k Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+    var code = 0;
+    region a2 {
+        let tape = alloc_slice[a2](json.tape_len(body), 0);
+        if json.parse(body, tape) < 0 {
+            code = layout.refused_json();
+        } else {
+            let cfg = json.get(body, tape, 0, "config");
+            let layers = json.get(body, tape, 0, "layers");
+            if cfg < 0 || layers < 0 || !json.is_array(tape, layers) {
+                code = push_layout();
+            } else {
+                code = ensure_blob(heap, net, host, port, auth, repo, layout.text_of(body, tape, cfg, "digest"), layout.number_of(body, tape, cfg, "size"), blobs, io);
+                var l = 0;
+                while code == 0 && l < json.count(tape, layers) {
+                    let node = json.at(tape, layers, l);
+                    code = ensure_blob(heap, net, host, port, auth, repo, layout.text_of(body, tape, node, "digest"), layout.number_of(body, tape, node, "size"), blobs, io);
+                    l = l + 1;
+                }
+                if code == 0 {
+                    code = registry.manifest_put(heap, net, host, port, auth, repo, reference, layout.text_of(body, tape, 0, "mediaType"), body, digest_text);
+                    if code == 0 {
+                        io.write_all(io, "manifest ");
+                        io.write_all(io, digest_text);
+                        io.write_all(io, " pushed as ");
+                        io.write_all(io, reference);
+                        io.write_all(io, "\n");
+                    }
+                }
+            }
+        }
+    }
+    return code;
+}
+
+// The layout's one entry: push its image, or the images of its index and then the index.
+fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte], image_dir: &k Dir, blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+    let (index_doc, c0) = layout.read_file(heap, image_dir, "index.json", layout.max_document());
+    var code = c0;
+    if code == 0 {
+        borrow index_doc as &ib in {
+            let src = buffer.bytes(ib);
+            region a {
+                let tape = alloc_slice[a](json.tape_len(src), 0);
+                if json.parse(src, tape) < 0 {
+                    code = layout.refused_json();
+                } else {
+                    let manifests = json.get(src, tape, 0, "manifests");
+                    if manifests < 0 || !json.is_array(tape, manifests) || json.count(tape, manifests) != 1 {
+                        code = push_layout();
+                    } else {
+                        let entry = json.at(tape, manifests, 0);
+                        let top_digest = layout.text_of(src, tape, entry, "digest");
+                        let top_hex = layout.hex_of(top_digest);
+                        let media = layout.text_of(src, tape, entry, "mediaType");
+                        let notes = json.get(src, tape, entry, "annotations");
+                        var reference = top_digest;
+                        if notes >= 0 {
+                            let named = layout.text_of(src, tape, notes, "org.opencontainers.image.ref.name");
+                            if len(named) > 0 {
+                                reference = named;
+                            }
+                        }
+                        if len(tag) > 0 {
+                            reference = tag;
+                        }
+                        if len(top_hex) == 0 {
+                            code = push_layout();
+                        } else if !registry.reference_ok(reference) {
+                            code = push_tag();
+                        } else {
+                            let (body, c1) = layout.read_blob(heap, blobs, top_hex, layout.max_document());
+                            code = c1;
+                            if code == 0 {
+                                borrow body as &bb in {
+                                    let doc = buffer.bytes(bb);
+                                    if digest.equal(media, image.media_manifest()) {
+                                        code = push_manifest(heap, net, host, port, auth, repo, reference, doc, top_digest, blobs, io);
+                                    } else if digest.equal(media, image.media_index()) {
+                                        region b {
+                                            let t2 = alloc_slice[b](json.tape_len(doc), 0);
+                                            if json.parse(doc, t2) < 0 {
+                                                code = layout.refused_json();
+                                            } else {
+                                                let kids = json.get(doc, t2, 0, "manifests");
+                                                if kids < 0 || !json.is_array(t2, kids) || json.count(t2, kids) < 1 {
+                                                    code = push_layout();
+                                                }
+                                                var m = 0;
+                                                while code == 0 && m < json.count(t2, kids) {
+                                                    let kid = json.at(t2, kids, m);
+                                                    let kid_digest = layout.text_of(doc, t2, kid, "digest");
+                                                    let kid_hex = layout.hex_of(kid_digest);
+                                                    if len(kid_hex) == 0 {
+                                                        code = push_layout();
+                                                    } else {
+                                                        let (kid_body, c2) = layout.read_blob(heap, blobs, kid_hex, layout.max_document());
+                                                        code = c2;
+                                                        if code == 0 {
+                                                            borrow kid_body as &kb in {
+                                                                code = push_manifest(heap, net, host, port, auth, repo, kid_digest, buffer.bytes(kb), kid_digest, blobs, io);
+                                                            }
+                                                        }
+                                                        buffer.drop(heap, kid_body);
+                                                    }
+                                                    m = m + 1;
+                                                }
+                                                if code == 0 {
+                                                    code = registry.manifest_put(heap, net, host, port, auth, repo, reference, image.media_index(), doc, top_digest);
+                                                    if code == 0 {
+                                                        io.write_all(io, "index ");
+                                                        io.write_all(io, top_digest);
+                                                        io.write_all(io, " pushed as ");
+                                                        io.write_all(io, reference);
+                                                        io.write_all(io, "\n");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        code = push_layout();
+                                    }
+                                }
+                            }
+                            buffer.drop(heap, body);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, index_doc);
+    return code;
+}
+
+fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, image_path: &static [byte], host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte]) -> [heap, fs_read(""), net_out(""), conn_read, conn_write, dir_read, file_read, io_write, err_write] int {
+    var status = 1;
+    match open_dir(fs, image_path) {
+        DirOpened::Failed(errno) => {
+            status = refuse(io, push_dir(), image_path);
+        }
+        DirOpened::Ok(top) => {
+            var image_dir = top;
+            borrow image_dir as &id in {
+                match dir_enter(id, "blobs") {
+                    DirOpened::Failed(errno) => {
+                        status = refuse(io, push_skeleton(), image_path);
+                    }
+                    DirOpened::Ok(blobs_dir) => {
+                        var blobs = blobs_dir;
+                        borrow blobs as &bd in {
+                            match dir_enter(bd, "sha256") {
+                                DirOpened::Failed(errno) => {
+                                    status = refuse(io, push_skeleton(), image_path);
+                                }
+                                DirOpened::Ok(sha_dir) => {
+                                    var sha = sha_dir;
+                                    borrow sha as &sd in {
+                                        let code = push_layout_entry(heap, net, host, port, auth, repo, tag, id, sd, io);
+                                        if code == 0 {
+                                            io.write_all(io, "ok\n");
+                                            status = 0;
+                                        } else {
+                                            status = refuse(io, code, "");
+                                        }
+                                    }
+                                    dir_close(sha);
+                                }
+                            }
+                        }
+                        dir_close(blobs);
+                    }
+                }
+            }
+            dir_close(image_dir);
+        }
+    }
+    return status;
+}
+
+fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, dir_read, file_read, io_write, err_write] int {
+    var image_path = "";
+    var registry_text = "";
+    var repo = "";
+    var tag = "";
+    var basic_file = "";
+    var plain = false;
+    var bad = "";
+    var at = 1;
+    while at < arg_count(args) && len(bad) == 0 {
+        let flag = arg(args, at);
+        if digest.equal(flag, "--plain-http") {
+            plain = true;
+            at = at + 1;
+        } else if at + 1 >= arg_count(args) {
+            bad = flag;
+        } else {
+            let value = arg(args, at + 1);
+            if digest.equal(flag, "--image") {
+                image_path = value;
+            } else if digest.equal(flag, "--registry") {
+                registry_text = value;
+            } else if digest.equal(flag, "--repo") {
+                repo = value;
+            } else if digest.equal(flag, "--tag") {
+                tag = value;
+            } else if digest.equal(flag, "--basic-file") {
+                basic_file = value;
+            } else {
+                bad = flag;
+            }
+            at = at + 2;
+        }
+    }
+    if len(bad) > 0 {
+        return refuse(io, push_flag(), bad);
+    }
+    if len(image_path) == 0 || len(registry_text) == 0 || len(repo) == 0 {
+        return refuse(io, push_missing(), "--image, --registry and --repo are required");
+    }
+    if !plain {
+        return refuse(io, push_plain(), "TLS is not wired in yet; pass --plain-http to push over plain HTTP");
+    }
+    if !registry.name_ok(repo) {
+        return refuse(io, registry.refused_name(), repo);
+    }
+    // host[:port]; the port defaults to 80 for plain HTTP.
+    var host = registry_text;
+    var port = 80;
+    let colon = index_of_byte(registry_text, byte_of(':'));
+    if colon >= 0 {
+        host = registry_text[0..colon];
+        port = registry.port_of(registry_text[colon + 1..len(registry_text)]);
+    }
+    if len(host) == 0 || port < 0 || index_of_byte(host, byte_of('/')) >= 0 || index_of_byte(host, byte_of('@')) >= 0 {
+        return refuse(io, push_registry(), registry_text);
+    }
+    if len(tag) > 0 && !registry.reference_ok(tag) {
+        return refuse(io, push_tag(), tag);
+    }
+    if len(basic_file) > 0 && !registry.is_loopback(host) {
+        return refuse(io, push_creds_http(), host);
+    }
+    var auth = buffer.empty(heap, 1);
+    if len(basic_file) > 0 {
+        let (creds, c) = registry.read_credentials(heap, fs, basic_file);
+        if c != 0 {
+            buffer.drop(heap, creds);
+            buffer.drop(heap, auth);
+            return refuse(io, c, basic_file);
+        }
+        borrow creds as &cb in {
+            buffer.drop(heap, auth);
+            auth = registry.auth_line(heap, buffer.bytes(cb));
+        }
+        buffer.drop(heap, creds);
+    }
+    var status = 1;
+    borrow auth as &ab in {
+        status = with_dirs(heap, fs, net, io, image_path, host, port, buffer.bytes(ab), repo, tag);
+    }
+    buffer.drop(heap, auth);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(clock);
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow fs as &f in {
+                borrow net as &n in {
+                    borrow mut io as &!i in {
+                        status = run(h, f, n, i, g);
+                    }
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(fs);
+    release(net);
+    release(io);
+    return status;
+}
