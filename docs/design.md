@@ -86,12 +86,25 @@ Media types in v1: `application/vnd.oci.image.manifest.v1+json`, `application/vn
 | mtime | `0`, or `SOURCE_DATE_EPOCH` if set | any real time breaks G1 |
 | uid / gid, names | `0` / `0`, empty | the build machine's user must not leak |
 | mode | `0755` for entries named executable on the command line, `0644` for files, `0755` for directories | decided here, not read from disk |
-| Header format | **ustar only**; names up to 100 bytes, or 255 with the prefix field | PAX headers add variable fields; v1 refuses a path that needs one (see 10) |
+| Header format | **ustar only**; names up to 100 bytes, or up to 155 + "/" + 100 with the prefix field | PAX headers add variable fields; v1 refuses a path that needs one (see 10) |
 | Entry types | regular files and directories | a symlink or device in the input is refused, not followed |
 | Duplicate paths | refused | |
 | Padding and end of archive | two zero blocks, no extra padding | the spec for tar allows variation, so we pin it |
 
 The config's `created` is omitted or fixed to the epoch value; `history` entries carry no time. These are the decisions G1's mutants attack: a swapped sort, a leaked mtime, a locale-dependent comparison, a hash-ordered map.
+
+**Built and measured (task #3, `src/tar/tar.cho`).** The writer is a pure function, one 512-byte header at a time (`oci.tar.header`), with every function's effect row empty. It is held to three things:
+
+- **Byte-identical to Python's `tarfile`** (`scripts/tar_diff.py`): about 1,000 random archives over four seeds, names at the edges of the 100-byte field and the 155 + 100 split, sizes and times up to the 11-digit ceiling, directories and executables. Python's `USTAR_FORMAT` is the independent writer; GNU or bsd `tar -t` and Python read every archive back, and file data is checked against its fixed pattern.
+- **Twenty refusal cases**, each naming its rule tag (`tar-name-absolute`, `tar-name-component`, `tar-name-not-utf8`, `tar-name-nul`, `tar-name-too-long`, `tar-size-too-large`, `tar-time-out-of-range`, `tar-dir-has-size`, `tar-order`, `tar-duplicate`).
+- **Fifteen mutants killed** (`scripts/tar_mutants.py`): a reversed sort, a leaked uid, a lost executable bit, a dropped directory slash, an off-by-one prefix limit, a checksum off by one, a lifted size ceiling, and the path-safety checks removed one at a time.
+
+What building it found, each of which changed the design:
+
+1. **Two deliberate differences from `tarfile`.** The device fields (`devmajor`, `devminor`) are zeros: older Pythons write `0000000` there and Python 3.14 writes NULs, and they mean nothing for a file or a directory, so the oracle normalises that one field and recomputes the checksum. And a name that `tarfile` can hold only as *the whole path in `prefix` with an empty `name` field* (a directory whose last component is longer than 99 bytes) is **refused** with `tar-name-too-long`: the header is legal but readers disagree about it.
+2. **The split rule is `tarfile`'s:** the first `/` that leaves a prefix of at most 155 bytes and a non-empty rest of at most 100. Any valid split would do for a reader; this one is chosen so the oracle can compare bytes.
+3. **macOS `bsdtar` hides a file whose basename starts with `._`** (AppleDouble metadata) from `tar -t`. Python and GNU tar list it. The generator avoids such names; it says nothing about `oci.tar`, but it is a trap for anyone verifying on a Mac.
+4. **A one-shot `std.crypto.sha256` traps above about 64 KiB** (its message is copied into a 64 KiB arena; `std/crypto.cho` now also has `sha256_init`/`update`/`final`, which #4 uses). cancho-tools carries its own incremental hasher for the same reason.
 
 ### 5.4 The static-binary check, and architecture
 

@@ -56,6 +56,15 @@ jobs:
         working-directory: oci
         run: cancho test
 
+      - name: G1 (layers) -- oci.tar is byte-identical to Python's tarfile on random archives, and refuses what it must
+        working-directory: oci
+        run: |
+          for seed in 1 2 3; do python3 scripts/tar_diff.py --cases 300 --seed $seed; done
+
+      - name: G1 (layers) -- the writer's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/tar_mutants.py --cases 100
+
       - name: G5 -- every binary's authority is within its committed ceiling
         working-directory: oci
         run: python3 scripts/authority_ceiling.py

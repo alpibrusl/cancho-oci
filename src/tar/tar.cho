@@ -1,0 +1,406 @@
+edition 5;
+
+module oci.tar;
+
+import std.utf8;
+
+// `oci.tar` -- one ustar header at a time, as a pure function of its inputs
+// (design 5.3, task #3). Nothing here reads a clock, a user name or the disk:
+// owner, group, modes and times are *decided by the caller*, so two builds of the
+// same inputs give the same bytes.
+//
+// The layout is POSIX ustar, byte for byte what Python's `tarfile` writes for
+// `USTAR_FORMAT` with uid = gid = 0 and empty user and group names, because that
+// is the independent writer the gate compares against (scripts/tar_diff.py).
+// Two deliberate differences, both documented in docs/design.md 5.3: the device
+// fields are zeros (older Pythons write "0000000" there, newer ones zeros, and
+// they mean nothing for a file or a directory), and a name that tarfile can only
+// hold by putting the whole path in `prefix` and leaving `name` empty is refused.
+//
+//     offset  size  field
+//          0   100  name
+//        100     8  mode      7 octal digits, NUL
+//        108     8  uid       "0000000" NUL
+//        116     8  gid       "0000000" NUL
+//        124    12  size      11 octal digits, NUL
+//        136    12  mtime     11 octal digits, NUL
+//        148     8  checksum  6 octal digits, NUL, space
+//        156     1  typeflag  '0' file, '5' directory
+//        157   100  linkname  zeros
+//        257     6  magic     "ustar" NUL
+//        263     2  version   "00"
+//        265    32  uname     zeros
+//        297    32  gname     zeros
+//        329     8  devmajor  zeros (meaningful for devices only; none here)
+//        337     8  devminor  zeros
+//        345   155  prefix
+//        500    12  zeros
+//
+// A refusal is a negative number, and `rule_name` is its stable tag: the tag
+// table below is the only place the two are tied together.
+
+pub fn block_size() -> [] int {
+    return 512;
+}
+
+// 11 octal digits: the largest a ustar size or mtime field can hold. Larger is
+// a refusal; v1 does not use the base-256 or PAX extensions (design 10, item 2).
+pub fn max_field() -> [] int {
+    return 8589934591;
+}
+
+pub fn kind_file() -> [] int {
+    return 0;
+}
+
+pub fn kind_dir() -> [] int {
+    return 1;
+}
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+pub fn refused_buffer_short() -> [] int {
+    return 0 - 1;
+}
+
+pub fn refused_kind() -> [] int {
+    return 0 - 2;
+}
+
+pub fn refused_name_empty() -> [] int {
+    return 0 - 3;
+}
+
+pub fn refused_name_absolute() -> [] int {
+    return 0 - 4;
+}
+
+pub fn refused_name_nul() -> [] int {
+    return 0 - 5;
+}
+
+pub fn refused_name_not_utf8() -> [] int {
+    return 0 - 6;
+}
+
+pub fn refused_name_component() -> [] int {
+    return 0 - 7;
+}
+
+pub fn refused_name_too_long() -> [] int {
+    return 0 - 8;
+}
+
+pub fn refused_size_too_large() -> [] int {
+    return 0 - 9;
+}
+
+pub fn refused_dir_has_size() -> [] int {
+    return 0 - 10;
+}
+
+pub fn refused_time_out_of_range() -> [] int {
+    return 0 - 11;
+}
+
+pub fn refused_duplicate() -> [] int {
+    return 0 - 12;
+}
+
+pub fn refused_order() -> [] int {
+    return 0 - 13;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "ok";
+    }
+    if code == refused_buffer_short() {
+        return "tar-buffer-short";
+    }
+    if code == refused_kind() {
+        return "tar-kind";
+    }
+    if code == refused_name_empty() {
+        return "tar-name-empty";
+    }
+    if code == refused_name_absolute() {
+        return "tar-name-absolute";
+    }
+    if code == refused_name_nul() {
+        return "tar-name-nul";
+    }
+    if code == refused_name_not_utf8() {
+        return "tar-name-not-utf8";
+    }
+    if code == refused_name_component() {
+        return "tar-name-component";
+    }
+    if code == refused_name_too_long() {
+        return "tar-name-too-long";
+    }
+    if code == refused_size_too_large() {
+        return "tar-size-too-large";
+    }
+    if code == refused_dir_has_size() {
+        return "tar-dir-has-size";
+    }
+    if code == refused_time_out_of_range() {
+        return "tar-time-out-of-range";
+    }
+    if code == refused_duplicate() {
+        return "tar-duplicate";
+    }
+    if code == refused_order() {
+        return "tar-order";
+    }
+    return "unknown";
+}
+
+// Zero bytes that follow `size` bytes of data to reach the next 512 boundary.
+pub fn padding(size: int) -> [] int {
+    return (512 - size % 512) % 512;
+}
+
+// Bytewise, unsigned: -1 when `x` sorts first, 0 when equal, 1 when `y` does.
+// A prefix sorts before what it prefixes, so "a" comes before "a/b".
+pub fn compare[&a, &b](x: &a [byte], y: &b [byte]) -> [] int {
+    var i = 0;
+    while i < len(x) && i < len(y) {
+        let p = int_of(x[i]);
+        let q = int_of(y[i]);
+        if p < q {
+            return 0 - 1;
+        }
+        if p > q {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if len(x) < len(y) {
+        return 0 - 1;
+    }
+    if len(x) > len(y) {
+        return 1;
+    }
+    return 0;
+}
+
+// The order every archive is written in: strictly increasing, so a duplicate
+// is as much a refusal as an entry out of place. The caller keeps the previous
+// name; the first entry has no previous and is not checked.
+pub fn check_order[&a, &b](prev: &a [byte], name: &b [byte]) -> [] int {
+    let c = compare(prev, name);
+    if c == 0 {
+        return refused_duplicate();
+    }
+    if c > 0 {
+        return refused_order();
+    }
+    return 0;
+}
+
+// A path in an image layer is relative, UTF-8, has no NUL, and no empty, "."
+// or ".." component: nothing that could name a place outside the layer.
+fn check_name[&n](name: &n [byte]) -> [] int {
+    let total = len(name);
+    if total == 0 {
+        return refused_name_empty();
+    }
+    if int_of(name[0]) == '/' {
+        return refused_name_absolute();
+    }
+    var i = 0;
+    while i < total {
+        if int_of(name[i]) == 0 {
+            return refused_name_nul();
+        }
+        i = i + 1;
+    }
+    if !utf8.is_valid(name) {
+        return refused_name_not_utf8();
+    }
+    var start = 0;
+    var at = 0;
+    while at <= total {
+        var edge = at == total;
+        if !edge {
+            edge = int_of(name[at]) == '/';
+        }
+        if edge {
+            let width = at - start;
+            if width == 0 {
+                return refused_name_component();
+            }
+            if width == 1 && int_of(name[start]) == '.' {
+                return refused_name_component();
+            }
+            if width == 2 && int_of(name[start]) == '.' && int_of(name[start + 1]) == '.' {
+                return refused_name_component();
+            }
+            start = at + 1;
+        }
+        at = at + 1;
+    }
+    return 0;
+}
+
+// Byte `i` of the name as it is stored: a directory's name ends in "/".
+fn stored[&n](name: &n [byte], dir: bool, i: int) -> [] int {
+    if i < len(name) {
+        return int_of(name[i]);
+    }
+    return '/';
+}
+
+// Where the stored name is cut into prefix and name, or -1 when it fits in the
+// 100-byte name field whole, or -2 when no cut works. The cut is at the first
+// "/" that leaves a prefix of at most 155 bytes and a non-empty rest of at most
+// 100 -- the same choice Python's `tarfile` makes, so the bytes agree.
+fn split_at[&n](name: &n [byte], dir: bool) -> [] int {
+    var total = len(name);
+    if dir {
+        total = total + 1;
+    }
+    if total <= 100 {
+        return 0 - 1;
+    }
+    var p = 0;
+    while p < total - 1 && p <= 155 {
+        if stored(name, dir, p) == '/' && total - p - 1 <= 100 {
+            return p;
+        }
+        p = p + 1;
+    }
+    return 0 - 2;
+}
+
+fn zero[&o](out: &!o [byte], from: int, to: int) -> [] int {
+    var i = from;
+    while i < to {
+        out[i] = byte_of(0);
+        i = i + 1;
+    }
+    return to;
+}
+
+// `digits` octal digits of `value`, then a NUL. The caller has checked it fits.
+fn put_octal[&o](out: &!o [byte], at: int, digits: int, value: int) -> [] int {
+    var rest = value;
+    var i = digits - 1;
+    while i >= 0 {
+        out[at + i] = byte_of('0' + rest % 8);
+        rest = rest / 8;
+        i = i - 1;
+    }
+    out[at + digits] = byte_of(0);
+    return at + digits + 1;
+}
+
+fn put_text[&o, &t](out: &!o [byte], at: int, text: &t [byte]) -> [] int {
+    var i = 0;
+    while i < len(text) {
+        out[at + i] = text[i];
+        i = i + 1;
+    }
+    return at + len(text);
+}
+
+// Write the 512-byte header of one entry into `out[0..512]`.
+//
+//   name        relative path, no trailing "/" (a directory's is added)
+//   kind        `kind_file()` or `kind_dir()`
+//   size        bytes of data that follow; 0 for a directory
+//   executable  mode 0755 instead of 0644 (a directory is always 0755)
+//   mtime       seconds; the caller passes 0 or SOURCE_DATE_EPOCH
+//
+// Answers 0, or a negative refusal (`rule_name`). `out` is untouched when it is
+// refused before any byte is written.
+pub fn header[&o, &n](out: &!o [byte], name: &n [byte], kind: int, size: int, executable: bool, mtime: int) -> [] int {
+    if len(out) < 512 {
+        return refused_buffer_short();
+    }
+    if kind != kind_file() && kind != kind_dir() {
+        return refused_kind();
+    }
+    let named = check_name(name);
+    if named != 0 {
+        return named;
+    }
+    if size < 0 || size > max_field() {
+        return refused_size_too_large();
+    }
+    let dir = kind == kind_dir();
+    if dir && size != 0 {
+        return refused_dir_has_size();
+    }
+    if mtime < 0 || mtime > max_field() {
+        return refused_time_out_of_range();
+    }
+    let cut = split_at(name, dir);
+    if cut == 0 - 2 {
+        return refused_name_too_long();
+    }
+
+    zero(out, 0, 512);
+
+    var total = len(name);
+    if dir {
+        total = total + 1;
+    }
+    if cut < 0 {
+        var i = 0;
+        while i < total {
+            out[i] = byte_of(stored(name, dir, i));
+            i = i + 1;
+        }
+    } else {
+        var i = 0;
+        while i < cut {
+            out[345 + i] = byte_of(stored(name, dir, i));
+            i = i + 1;
+        }
+        var j = cut + 1;
+        while j < total {
+            out[j - cut - 1] = byte_of(stored(name, dir, j));
+            j = j + 1;
+        }
+    }
+
+    var mode = 420;
+    if executable || dir {
+        mode = 493;
+    }
+    put_octal(out, 100, 7, mode);
+    put_octal(out, 108, 7, 0);
+    put_octal(out, 116, 7, 0);
+    put_octal(out, 124, 11, size);
+    put_octal(out, 136, 11, mtime);
+    if dir {
+        out[156] = byte_of('5');
+    } else {
+        out[156] = byte_of('0');
+    }
+    put_text(out, 257, "ustar");
+    out[263] = byte_of('0');
+    out[264] = byte_of('0');
+
+    // The checksum is the sum of every header byte with its own field read as
+    // eight spaces.
+    var i = 148;
+    while i < 156 {
+        out[i] = byte_of(' ');
+        i = i + 1;
+    }
+    var sum = 0;
+    var k = 0;
+    while k < 512 {
+        sum = sum + int_of(out[k]);
+        k = k + 1;
+    }
+    put_octal(out, 148, 6, sum);
+    out[155] = byte_of(' ');
+    return 0;
+}

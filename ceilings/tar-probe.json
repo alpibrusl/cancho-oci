@@ -1,0 +1,23 @@
+{
+  "bounded": true,
+  "effects": [
+    "err_write",
+    "io_read",
+    "io_write"
+  ],
+  "labels": [
+    {
+      "name": "err_write",
+      "argument": null
+    },
+    {
+      "name": "io_read",
+      "argument": null
+    },
+    {
+      "name": "io_write",
+      "argument": null
+    }
+  ],
+  "foreign_symbols": []
+}

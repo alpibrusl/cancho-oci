@@ -1,0 +1,170 @@
+edition 5;
+
+import std.io;
+import oci.tar;
+
+// tar-probe: the test harness for `oci.tar` (#3). It reads entry specs on stdin,
+// one per line, and writes the archive to stdout:
+//
+//     F <size> <mtime> <path>     a regular file of <size> bytes
+//     X <size> <mtime> <path>     the same, executable
+//     D 0 <mtime> <path>          a directory
+//
+// File data is a fixed pattern, byte i = (i * 7 + 3) % 251, so a reader that
+// knows the rule can check the contents too. A size above 1,000,000 writes the
+// header alone, no data and no padding, so the size field can be tested at its
+// ceiling without a multi-gigabyte pipe.
+//
+// On a refusal `refused: <rule tag>` goes to stderr and the exit status is 1;
+// whatever reached stdout before it is not an archive. Paths are given in the
+// order the archive keeps them; `oci.tar` checks that order, it does not sort.
+
+fn read_line[&i, &l](io: &!i Io, line: &!l [byte]) -> [io_read] int {
+    var n = 0;
+    var c = getchar(io);
+    if c < 0 {
+        return 0 - 1;
+    }
+    while c >= 0 && c != '\n' {
+        if n >= len(line) {
+            return 0 - 2;
+        }
+        line[n] = byte_of(c);
+        n = n + 1;
+        c = getchar(io);
+    }
+    return n;
+}
+
+// Parse a decimal number starting at `at`; answers the value and leaves the
+// position after it in `pos[0]`, or -1 when there is no digit.
+fn number[&l, &p](line: &l [byte], at: int, pos: &!p [int]) -> [] int {
+    var i = at;
+    var value = 0;
+    var seen = false;
+    while i < len(line) && int_of(line[i]) >= '0' && int_of(line[i]) <= '9' {
+        value = value * 10 + (int_of(line[i]) - '0');
+        seen = true;
+        i = i + 1;
+    }
+    pos[0] = i;
+    if !seen {
+        return 0 - 1;
+    }
+    return value;
+}
+
+fn emit[&i, &h](io: &!i Io, block: &h [byte], count: int) -> [io_write] int {
+    var k = 0;
+    while k < count {
+        putchar(io, int_of(block[k]));
+        k = k + 1;
+    }
+    return count;
+}
+
+fn emit_zero[&i](io: &!i Io, count: int) -> [io_write] int {
+    var k = 0;
+    while k < count {
+        putchar(io, 0);
+        k = k + 1;
+    }
+    return count;
+}
+
+fn refuse[&i](io: &!i Io, code: int) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, tar.rule_name(code));
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// Byte `at` of the pattern every file is filled with.
+fn pattern(at: int) -> [] int {
+    return (at * 7 + 3) % 251;
+}
+
+fn emit_data[&i](io: &!i Io, size: int) -> [io_write] int {
+    var k = 0;
+    while k < size {
+        putchar(io, pattern(k));
+        k = k + 1;
+    }
+    return emit_zero(io, tar.padding(size));
+}
+
+fn run[&i](io: &!i Io) -> [io_read, io_write, err_write] int {
+    var status = 0;
+    region a {
+        let line = alloc_slice[a](2048, byte_of(0));
+        let prev = alloc_slice[a](2048, byte_of(0));
+        let head = alloc_slice[a](512, byte_of(0));
+        let pos = alloc_slice[a](1, 0);
+        var prev_len = 0;
+        var first = true;
+        var done = false;
+        while !done {
+            let n = read_line(io, line);
+            if n < 0 {
+                done = true;
+            } else if n > 0 {
+                let letter = int_of(line[0]);
+                var kind = tar.kind_file();
+                var executable = false;
+                if letter == 'D' {
+                    kind = tar.kind_dir();
+                }
+                if letter == 'X' {
+                    executable = true;
+                }
+                let size = number(line, 2, pos);
+                let mtime = number(line, pos[0] + 1, pos);
+                let start = pos[0] + 1;
+                let path = line[start..n];
+                var code = 0;
+                if !first {
+                    code = tar.check_order(prev[0..prev_len], path);
+                }
+                if code == 0 {
+                    code = tar.header(head, path, kind, size, executable, mtime);
+                }
+                if code != 0 {
+                    status = refuse(io, code);
+                    done = true;
+                } else {
+                    var m = 0;
+                    while m < len(path) {
+                        prev[m] = path[m];
+                        m = m + 1;
+                    }
+                    prev_len = len(path);
+                    first = false;
+                    emit(io, head, 512);
+                    if kind == tar.kind_file() && size <= 1000000 {
+                        emit_data(io, size);
+                    }
+                }
+            }
+        }
+        if status == 0 {
+            emit_zero(io, 1024);
+        }
+    }
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(fs);
+    release(heap);
+    release(args);
+    release(net);
+    release(clock);
+    var status = 0;
+    borrow mut io as &!i in {
+        status = run(i);
+    }
+    release(io);
+    return status;
+}

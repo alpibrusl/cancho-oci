@@ -1,0 +1,136 @@
+edition 5;
+
+import oci.tar;
+import std.test;
+
+// Unit tests of `oci.tar` against values computed by Python's `tarfile`
+// (scripts/tar_diff.py is the randomized, byte-for-byte version of the same
+// comparison; these are the few facts worth stating in the language itself).
+
+fn field_is[&h, &t](head: &h [byte], at: int, text: &t [byte]) -> [] bool {
+    var i = 0;
+    while i < len(text) {
+        if head[at + i] != text[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_a_file_header() -> [] int {
+    region a {
+        let head = alloc_slice[a](512, byte_of(9));
+        test.assert_eq(tar.header(head, "hello", tar.kind_file(), 5, false, 0), 0);
+        test.assert(field_is(head, 0, "hello"));
+        test.assert_eq(int_of(head[5]), 0);
+        test.assert(field_is(head, 100, "0000644"));
+        test.assert(field_is(head, 124, "00000000005"));
+        test.assert(field_is(head, 136, "00000000000"));
+        test.assert(field_is(head, 148, "006766"));
+        test.assert_eq(int_of(head[154]), 0);
+        test.assert_eq(int_of(head[155]), ' ');
+        test.assert_eq(int_of(head[156]), '0');
+        test.assert(field_is(head, 257, "ustar"));
+        test.assert(field_is(head, 263, "00"));
+    }
+    return 0;
+}
+
+fn test_an_executable_with_a_time() -> [] int {
+    region a {
+        let head = alloc_slice[a](512, byte_of(0));
+        test.assert_eq(tar.header(head, "bin/run", tar.kind_file(), 1000, true, 1700000000), 0);
+        test.assert(field_is(head, 100, "0000755"));
+        test.assert(field_is(head, 124, "00000001750"));
+        test.assert(field_is(head, 136, "14524770400"));
+        test.assert(field_is(head, 148, "007314"));
+    }
+    return 0;
+}
+
+fn test_a_directory_ends_in_a_slash() -> [] int {
+    region a {
+        let head = alloc_slice[a](512, byte_of(0));
+        test.assert_eq(tar.header(head, "etc", tar.kind_dir(), 0, false, 0), 0);
+        test.assert(field_is(head, 0, "etc/"));
+        test.assert_eq(int_of(head[156]), '5');
+        test.assert(field_is(head, 100, "0000755"));
+        test.assert(field_is(head, 148, "006520"));
+    }
+    return 0;
+}
+
+fn test_a_long_name_is_split_at_the_first_slash_that_fits() -> [] int {
+    region a {
+        let head = alloc_slice[a](512, byte_of(0));
+        // 60 + "/" + 100: the name field holds the last 100, the prefix the 60.
+        let name = alloc_slice[a](161, byte_of('p'));
+        name[60] = byte_of('/');
+        var i = 61;
+        while i < 161 {
+            name[i] = byte_of('r');
+            i = i + 1;
+        }
+        test.assert_eq(tar.header(head, name, tar.kind_file(), 0, false, 0), 0);
+        test.assert_eq(int_of(head[0]), 'r');
+        test.assert_eq(int_of(head[99]), 'r');
+        test.assert_eq(int_of(head[345]), 'p');
+        test.assert_eq(int_of(head[345 + 59]), 'p');
+        test.assert_eq(int_of(head[345 + 60]), 0);
+    }
+    return 0;
+}
+
+fn test_a_refusal_leaves_the_buffer_alone() -> [] int {
+    region a {
+        let head = alloc_slice[a](512, byte_of(7));
+        test.assert_eq(tar.header(head, "a/../b", tar.kind_file(), 0, false, 0), tar.refused_name_component());
+        test.assert_eq(int_of(head[0]), 7);
+        test.assert_eq(int_of(head[511]), 7);
+        test.assert_eq(tar.header(head, "/abs", tar.kind_file(), 0, false, 0), tar.refused_name_absolute());
+        test.assert_eq(tar.header(head, "d", tar.kind_dir(), 3, false, 0), tar.refused_dir_has_size());
+        test.assert_eq(tar.header(head, "f", tar.kind_file(), 8589934592, false, 0), tar.refused_size_too_large());
+        test.assert_eq(int_of(head[0]), 7);
+    }
+    return 0;
+}
+
+fn test_a_short_buffer_is_refused() -> [] int {
+    region a {
+        let head = alloc_slice[a](511, byte_of(0));
+        test.assert_eq(tar.header(head, "f", tar.kind_file(), 0, false, 0), tar.refused_buffer_short());
+    }
+    return 0;
+}
+
+fn test_order_is_strict_and_a_prefix_comes_first() -> [] int {
+    test.assert_eq(tar.compare("a", "a/b"), 0 - 1);
+    test.assert_eq(tar.compare("a/b", "a"), 1);
+    test.assert_eq(tar.compare("a", "a"), 0);
+    test.assert_eq(tar.compare("a-b", "a/b"), 0 - 1);
+    test.assert_eq(tar.check_order("a", "b"), 0);
+    test.assert_eq(tar.check_order("b", "a"), tar.refused_order());
+    test.assert_eq(tar.check_order("a", "a"), tar.refused_duplicate());
+    return 0;
+}
+
+fn test_padding_reaches_the_next_block() -> [] int {
+    test.assert_eq(tar.padding(0), 0);
+    test.assert_eq(tar.padding(1), 511);
+    test.assert_eq(tar.padding(511), 1);
+    test.assert_eq(tar.padding(512), 0);
+    test.assert_eq(tar.padding(513), 511);
+    return 0;
+}
+
+fn test_every_rule_has_a_tag() -> [] int {
+    var code = 0 - 1;
+    while code >= 0 - 13 {
+        test.assert(len(tar.rule_name(code)) > 3);
+        test.assert(tar.rule_name(code)[0] == byte_of('t'));
+        code = code - 1;
+    }
+    test.assert_eq(len(tar.rule_name(0 - 14)), 7);
+    return 0;
+}
