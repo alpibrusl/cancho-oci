@@ -136,6 +136,36 @@ def check_image(image, rec, case_name, arch):
     return index
 
 
+def runtime():
+    """The container runtime to run an image in: Docker when its daemon answers, else Podman, else None.
+    (On the GitHub runner rootless Podman cannot unshare a user namespace; Docker's daemon is there and works.)"""
+    if shutil.which("docker") and shutil.which("skopeo"):
+        rc, _ = tool(["docker", "info"])
+        if rc == 0:
+            return "docker"
+    if shutil.which("podman") and shutil.which("skopeo"):
+        return "podman"
+    return None
+
+
+def run_image(rt, layout_ref, entrypoint, name):
+    """Load the OCI layout `layout_ref` (oci:dir:tag) into the runtime and run it. Returns (rc, stdout, stderr, load_error)."""
+    if rt == "docker":
+        load = ["skopeo", "copy", layout_ref, f"docker-daemon:{name}:1"]
+        runc = ["docker", "run", "--rm"] + (["--entrypoint", entrypoint] if entrypoint else []) + [f"{name}:1"]
+        drop = ["docker", "rmi", "-f", f"{name}:1"]
+    else:
+        load = ["skopeo", "copy", layout_ref, f"containers-storage:{name}:1"]
+        runc = ["podman", "run", "--rm"] + (["--entrypoint", entrypoint] if entrypoint else []) + [f"{name}:1"]
+        drop = ["podman", "rmi", "-f", f"{name}:1"]
+    rc, text = tool(load)
+    if rc != 0:
+        return None, "", "", text
+    p = subprocess.run(runc, capture_output=True, text=True)
+    tool(drop)
+    return p.returncode, p.stdout, p.stderr, ""
+
+
 def tool(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, (p.stdout + p.stderr).strip()
@@ -152,7 +182,8 @@ def main():
     rng = random.Random(a.seed)
     exe = a.build
     host_arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64", "riscv64": "riscv64"}.get(platform.machine(), "")
-    have_skopeo, have_crane, have_podman = shutil.which("skopeo"), shutil.which("crane"), shutil.which("podman")
+    have_skopeo, have_crane = shutil.which("skopeo"), shutil.which("crane")
+    rt = runtime() if (a.run or a.dogfood) else None
     ran_run = False
 
     with tempfile.TemporaryDirectory() as t:
@@ -220,19 +251,16 @@ def main():
                     ok(rc == 0, f"case {n}: skopeo refused the image: {text[:200]}")
                     rc, text = tool(["skopeo", "copy", target, f"dir:{w / 'copy'}"])
                     ok(rc == 0, f"case {n}: skopeo copy failed: {text[:200]}")
-            if a.run and have_podman and arch == host_arch and not ran_run and have_skopeo:
+            if a.run and rt and arch == host_arch and not ran_run:
                 ran_run = True
-                ref_ = rec["ref"] or "t"
-                # skopeo needs a tag to find the image in the layout; fall back to the digest form
                 src = f"oci:{out}" + (f":{rec['ref']}" if rec["ref"] else "")
-                rc, text = tool(["skopeo", "copy", src, "containers-storage:localhost/oci-build-check:1"])
-                if ok(rc == 0, f"case {n}: skopeo copy into podman's storage failed: {text[:300]}"):
-                    rc, text = tool(["podman", "run", "--rm", "--entrypoint", "/" + bins[0][1], "localhost/oci-build-check:1"])
-                    ok(rc == 0, f"case {n}: the image did not run (podman exit {rc}): {text[:300]}")
-                    tool(["podman", "rmi", "-f", "localhost/oci-build-check:1"])
+                rc, so, se, load_err = run_image(rt, src, "/" + bins[0][1], "localhost/oci-build-check")
+                if ok(rc is not None, f"case {n}: loading the image into {rt} failed: {load_err[:300]}"):
+                    ok(rc == 0, f"case {n}: the image did not run in {rt} (exit {rc}): {se[:300]}")
+                    print(f"run: the {arch} image ran in {rt} (entrypoint /{bins[0][1]}, exit {rc})")
 
         if a.run and not ran_run:
-            print(f"note: --run asked, but it needs podman, skopeo and a {host_arch or platform.machine()} image in the first cases; not run")
+            print(f"note: --run asked, but it needs a working docker or podman, skopeo and a {host_arch or platform.machine()} image in the first cases; not run (runtime: {rt})")
 
         # ---- refusals
         w = t / "refusals"
@@ -356,8 +384,8 @@ def main():
 
     if a.dogfood:
         # oci-build packages itself: the proof that a real cancho program, not a hand-made stub, runs in a scratch image.
-        if not (have_podman and have_skopeo and host_arch):
-            fail("--dogfood needs podman, skopeo and a supported host architecture")
+        if not (rt and host_arch):
+            fail("--dogfood needs a working docker or podman, skopeo and a supported host architecture")
         else:
             with tempfile.TemporaryDirectory() as t2:
                 t2 = Path(t2)
@@ -366,16 +394,13 @@ def main():
                 skeleton(out)
                 code, stdout, err = build(exe, src.parent, out, f"linux/{host_arch}", ["--bin", f"{src.name}:oci-build", "--ref", "dogfood"])
                 if ok(code == 0, f"dogfood: could not package {src}: {err!r}"):
-                    rc, text = tool(["skopeo", "copy", f"oci:{out}:dogfood", "containers-storage:localhost/oci-dogfood:1"])
-                    if ok(rc == 0, f"dogfood: skopeo copy failed: {text[:300]}"):
-                        # With no arguments the tool refuses and says why: output that only the binary inside the
-                        # container can have produced.
-                        p = subprocess.run(["podman", "run", "--rm", "localhost/oci-dogfood:1"], capture_output=True, text=True)
-                        ok(p.returncode == 1 and "refused: build-missing" in p.stderr,
-                           f"dogfood: the packaged oci-build did not run as expected in the container: exit {p.returncode} {p.stderr!r}")
-                        # The image must be the static binary alone, and it must not be runnable by a loader-needing build.
-                        tool(["podman", "rmi", "-f", "localhost/oci-dogfood:1"])
-                        print("dogfood: oci-build ran inside a scratch container built by oci-build")
+                    # With no arguments the tool refuses and says why: output that only the binary inside the
+                    # container can have produced.
+                    rc, so, se, load_err = run_image(rt, f"oci:{out}:dogfood", None, "localhost/oci-dogfood")
+                    if ok(rc is not None, f"dogfood: loading into {rt} failed: {load_err[:300]}"):
+                        ok(rc == 1 and "refused: build-missing" in se,
+                           f"dogfood: the packaged oci-build did not run as expected in the container: exit {rc} {se!r}")
+                        print(f"dogfood: oci-build ran inside a scratch container built by oci-build ({rt}): {se.strip()[:90]}")
 
     notes = []
     if not have_skopeo:
