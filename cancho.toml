@@ -9,7 +9,7 @@ cancho = "25448b8f0d1e899dbfa7663aa0e5a521acd2a3dd"   # the compiler these sourc
 
 [[bin]]
 name = "oci-build"
-sources = ["src/build"]
+sources = ["src/digest", "src/tar", "src/elf", "src/place", "src/store", "src/image", "src/layer", "src/build"]
 std = true
 out = "build/oci-build"
 
@@ -53,4 +53,9 @@ std = true
 [[test]]
 name = "image"
 sources = ["src/digest", "src/image", "tests/image_test.cho"]
+std = true
+
+[[test]]
+name = "elf"
+sources = ["src/elf", "tests/elf_test.cho"]
 std = true

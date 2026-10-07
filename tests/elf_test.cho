@@ -1,0 +1,143 @@
+edition 5;
+
+import oci.elf;
+import std.test;
+
+// Headers built by hand, so each refusal can be tested without a real binary.
+
+fn put[&b](buf: &!b [byte], at: int, n: int, value: int) -> [] int {
+    var v = value;
+    var i = 0;
+    while i < n {
+        buf[at + i] = byte_of(v % 256);
+        v = v / 256;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// A header for a static 64-bit little-endian executable: ET_EXEC, `machine`, one program header.
+fn header[&b](h: &!b [byte], machine: int) -> [] int {
+    var i = 0;
+    while i < 64 {
+        h[i] = byte_of(0);
+        i = i + 1;
+    }
+    h[0] = byte_of(127);
+    h[1] = byte_of('E');
+    h[2] = byte_of('L');
+    h[3] = byte_of('F');
+    h[4] = byte_of(2);
+    h[5] = byte_of(1);
+    h[6] = byte_of(1);
+    put(h, 16, 2, 2);
+    put(h, 18, 2, machine);
+    put(h, 32, 8, 64);
+    put(h, 54, 2, 56);
+    put(h, 56, 2, 1);
+    return 0;
+}
+
+fn test_the_three_machines() -> [] int {
+    region a {
+        let h = alloc_slice[a](64, byte_of(0));
+        header(h, 62);
+        test.assert_eq(elf.check_head(h), 0);
+        test.assert_eq(len(elf.arch_name(h)), 5);
+        header(h, 183);
+        test.assert_eq(elf.check_head(h), 0);
+        test.assert_eq(int_of(elf.arch_name(h)[0]), 'a');
+        test.assert_eq(len(elf.arch_name(h)), 5);
+        header(h, 243);
+        test.assert_eq(elf.check_head(h), 0);
+        test.assert_eq(len(elf.arch_name(h)), 7);
+    }
+    return 0;
+}
+
+fn test_what_is_refused() -> [] int {
+    region a {
+        let h = alloc_slice[a](64, byte_of(0));
+        header(h, 62);
+        test.assert_eq(elf.check_head(h[0..63]), elf.refused_short());
+        test.assert_eq(elf.check_head(h[0..4]), elf.refused_short());
+        test.assert_eq(elf.check_head(h[0..3]), elf.refused_short());
+        // a short file that is not ELF is "not ELF", not "truncated"
+        h[0] = byte_of('#');
+        test.assert_eq(elf.check_head(h[0..18]), elf.refused_not_elf());
+        h[0] = byte_of(127);
+        h[1] = byte_of('X');
+        test.assert_eq(elf.check_head(h), elf.refused_not_elf());
+        header(h, 62);
+        h[4] = byte_of(1);
+        test.assert_eq(elf.check_head(h), elf.refused_class());
+        header(h, 62);
+        h[5] = byte_of(2);
+        test.assert_eq(elf.check_head(h), elf.refused_class());
+        header(h, 62);
+        put(h, 16, 2, 1);
+        test.assert_eq(elf.check_head(h), elf.refused_type());
+        header(h, 62);
+        put(h, 16, 2, 3);
+        test.assert_eq(elf.check_head(h), 0);
+        header(h, 3);
+        test.assert_eq(elf.check_head(h), elf.refused_machine());
+        header(h, 40);
+        test.assert_eq(elf.check_head(h), elf.refused_machine());
+    }
+    return 0;
+}
+
+fn test_the_program_header_table_is_bounded() -> [] int {
+    region a {
+        let h = alloc_slice[a](64, byte_of(0));
+        header(h, 62);
+        test.assert_eq(elf.phoff(h), 64);
+        test.assert_eq(elf.phnum(h), 1);
+        put(h, 54, 2, 32);
+        test.assert_eq(elf.phoff(h), 0 - 1);
+        header(h, 62);
+        put(h, 56, 2, 0);
+        test.assert_eq(elf.phoff(h), 0 - 1);
+        put(h, 56, 2, 65);
+        test.assert_eq(elf.phoff(h), 0 - 1);
+        put(h, 56, 2, 64);
+        test.assert_eq(elf.phoff(h), 64);
+        h[39] = byte_of(1);
+        test.assert_eq(elf.phoff(h), 0 - 1);
+    }
+    return 0;
+}
+
+fn test_a_dynamic_executable_has_an_interpreter() -> [] int {
+    region a {
+        let table = alloc_slice[a](168, byte_of(0));
+        // PT_PHDR (6), PT_INTERP (3), PT_LOAD (1)
+        put(table, 0, 4, 6);
+        put(table, 56, 4, 3);
+        put(table, 56 + 8, 8, 680);
+        put(table, 56 + 32, 8, 28);
+        put(table, 112, 4, 1);
+        test.assert_eq(elf.interp_index(table, 3), 1);
+        test.assert_eq(elf.phdr_offset(table, 1), 680);
+        test.assert_eq(elf.phdr_filesz(table, 1), 28);
+        // the same table without the interpreter: a static executable
+        put(table, 56, 4, 1);
+        test.assert_eq(elf.interp_index(table, 3), 0 - 1);
+        // a PT_DYNAMIC (2) alone is not a loader: a static-PIE has one and runs
+        put(table, 56, 4, 2);
+        test.assert_eq(elf.interp_index(table, 3), 0 - 1);
+    }
+    return 0;
+}
+
+fn test_every_rule_has_a_tag() -> [] int {
+    var code = 0 - 301;
+    while code >= 0 - 308 {
+        test.assert(len(elf.rule_name(code)) > 4);
+        test.assert(int_of(elf.rule_name(code)[0]) == 'e');
+        code = code - 1;
+    }
+    test.assert_eq(len(elf.rule_name(0 - 309)), 7);
+    return 0;
+}

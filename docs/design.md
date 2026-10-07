@@ -146,9 +146,38 @@ What building it found:
 
 Not done, and said so: one layer only; no `created` time, no `author`, no `architecture` variants (design 5.4); the `docker load` and `podman` checks are task #7's, where a runnable binary exists.
 
+**Built and measured (task #7: `src/elf`, `src/place`, `src/layer`, `src/build`).** `oci-build` turns static executables and files into a `FROM scratch` image:
+
+```
+oci-build --root <dir> --out <image-dir> --platform linux/<arch> --bin <src>:<dest> [--file <src>:<dest>]...
+          [--entrypoint W]... [--cmd W]... [--env N=V]... [--label k=v]... [--port P/tcp]...
+          [--user U] [--workdir D] [--ref TAG] [--source-date-epoch N]
+```
+
+Every `<src>` is opened beneath `--root` through a directory handle, so a path, a `..` or a symlink cannot reach outside it; the layer is streamed into the blob store (sources are measured first, so a bad path is refused before anything is written); the first `--bin` is the entrypoint unless one is given. The gate (`scripts/build_check.py`, 444 checks at 24 cases, 30 per seed in CI):
+
+- **The layer equals Python's `tarfile`** (USTAR) for the same entries, byte for byte: implied parent directories, bytewise order, 0755 for executables and directories and 0644 for files, the chosen time, the real file contents including sizes at and around the 64 KiB read chunk, on all three architectures;
+- the config, manifest and index equal the independent JSON model and validate against the OCI schemas; the digest chain is consistent; the printed digest is the index's;
+- **building twice, in another directory and with every source file's time changed, gives identical bytes**: nothing about the build machine leaks;
+- 46 refusal cases, each with its rule tag and the path it is about, and a refusal leaves no `index.json` and no temporary file: a dynamic executable, an executable for another architecture, a non-ELF `--bin`, a truncated ELF, 32-bit and big-endian ELF, a relocatable file, an unknown machine, a bad program-header size, count or offset, a missing source, a symlink or `..` out of the root, a duplicate or unsafe destination, a malformed `--bin`, an unknown flag, a bad platform or epoch, more than 64 entries, a missing layout skeleton. A **static-PIE** (an `ET_DYN` with a `PT_DYNAMIC` and no `PT_INTERP`) is accepted, because it runs without a loader;
+- 31 of 31 mutants killed (`scripts/build_mutants.py`);
+- **authority** (G5): the report of `oci-build` is bounded and lists only `args`, `dir_read`, `dir_write`, `err_write`, `file_read`, `file_write`, `fs_read("")` (to open the two roots), `heap` and `io_write`: **no network, no `exec`, no clock, no signals, no foreign code, and no path-based `fs_write`.** No committed ceiling may grant any of those; widening that list means editing `scripts/authority_ceiling.py` itself;
+- in CI, on x86-64 Linux: the host-architecture image is loaded into Docker (or Podman) and run, and `oci-build` is linked statically (`scripts/static-cc`, cancho's own `-static` wrapper), packaged by itself, and run in a `scratch` container where it prints its own refusal.
+
+What building it found:
+
+1. **A loader is the test, not `PT_DYNAMIC`.** A static-PIE has a dynamic section and no interpreter and runs in `scratch`; refusing on `PT_DYNAMIC` would have rejected valid binaries.
+2. **Order of checks matters for the message.** A short script is "not ELF", not "truncated" (the magic is checked as soon as four bytes exist), and an unsupported platform is refused before any source is read.
+3. **For a bad destination the refusal names the first bad entry**, which may be an implied parent directory (`a/..`), not the whole argument.
+4. **The mutation gate found a real hole in my tests twice:** a nested path after an implied directory (`a/b` then `a`) was untested, and an ELF bound that the next check also enforces was invisible from outside and needed the unit test. One mutant, `layer-source-changed` (a source changing between measuring and writing), cannot be provoked from outside and has none.
+5. **Hand-made ELF executables** (`scripts/make_elf.py`: `exit(0)` as raw syscalls, no libc, one per architecture, plus dynamic and corrupted variants) made every ELF case testable without a Linux toolchain on a Mac, and are small enough to run in a real `scratch` container.
+6. **Limits, chosen and enforced:** 64 entries and 8 KiB of names per layer, one layer, sources read twice (once to measure, once to write); an insertion sort is fine at that size.
+
+Not run on the Mac this was written on, so CI is their first run: `skopeo` and `crane` on `oci-build`'s output, the Podman run, and the static self-packaging.
+
 ### 5.4 The static-binary check, and architecture
 
-`build` reads the input binary's **ELF header** and program headers (plain byte parsing, no foreign code) and refuses a dynamic binary: a `PT_INTERP` or a `DT_NEEDED` entry means it would need libraries a `scratch` image does not have, and the refusal names them. `e_machine` gives the architecture (`x86-64` is `amd64`, `AArch64` is `arm64`, `RISC-V` is `riscv64`), so a binary that does not match `--platform` is refused. The builder is **architecture-independent**: it can package any ELF it can read, not only what cancho compiles to. cancho's compiler reaches `aarch64`, `riscv64` and `x64` (`docs/backend-limits.md` §1.3); a 32-bit ARM binary from another toolchain needs a variant (`v6`/`v7`) that is not in `e_machine`, so v1 refuses it unless `--variant` is given. Edge and IoT gateways are mostly `arm64` or `riscv64`, so multi-architecture (#8) is first-class, not an afterthought.
+`build` reads the input binary's **ELF header** and program headers (plain byte parsing, no foreign code) and refuses a dynamic binary: a `PT_INTERP` means it needs a loader a `scratch` image does not have. (Built in task #7: the refusal `elf-dynamic` names the *entry*; naming the loader path and the `DT_NEEDED` libraries is not built.) `e_machine` gives the architecture (`x86-64` is `amd64`, `AArch64` is `arm64`, `RISC-V` is `riscv64`), so a binary that does not match `--platform` is refused. The builder is **architecture-independent**: it can package any ELF it can read, not only what cancho compiles to. cancho's compiler reaches `aarch64`, `riscv64` and `x64` (`docs/backend-limits.md` §1.3); a 32-bit ARM binary from another toolchain needs a variant (`v6`/`v7`) that is not in `e_machine`, so v1 refuses it unless `--variant` is given. Edge and IoT gateways are mostly `arm64` or `riscv64`, so multi-architecture (#8) is first-class, not an afterthought.
 
 A non-root user needs a numeric `User` in the config (`65532`, say); an `/etc/passwd` entry is optional and supplied by the user as a file. **CA certificates are never bundled**: they come from a file the caller names, because a bundled bundle is a third-party dependency this project exists to avoid, and what to trust is a policy decision for the deployment.
 

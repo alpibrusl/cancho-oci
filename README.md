@@ -2,7 +2,7 @@
 
 **Container images without a container daemon.** A tool written in [cancho](https://github.com/alpibrusl/cancho) that assembles an [OCI image](https://github.com/opencontainers/image-spec) from a static binary: a deterministic layer, a config, a manifest and an image layout, byte-for-byte the same every time it is built from the same inputs, and optionally pushed to a registry. No Docker, no shell, no `RUN` steps, and an authority report that says what the tool can reach.
 
-**Status: design stage; the building blocks are built.** The deterministic tar writer, the digest and write-once blob store, and the image config, manifest and layout writer exist, each held to a differential test against an independent implementation and a mutation gate. There is no `build` command yet, no benchmark and no claim beyond what is written here. The plan and its tasks are in the epic (see the issues). The first deliverable is `docs/design.md`: scope, the authority row, the reproducibility and security policy, the gates and the benchmark cells, written before any code.
+**Status: alpha; `oci-build` works.** It builds a `FROM scratch` image from static executables and files, reproducibly, with an authority report that has no network. The pieces under it (the deterministic tar writer, the digest and write-once blob store, the image JSON writer, the ELF check) are each held to a differential test against an independent implementation and a mutation gate. Not yet: gzip layers (needed for full `crane` validation), multi-architecture indexes, a registry client, SBOM and signatures. There is no benchmark yet and no claim beyond what is written in `docs/design.md`. The plan and its tasks are in the epic (see the issues).
 
 ## Why
 

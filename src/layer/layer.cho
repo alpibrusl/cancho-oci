@@ -1,0 +1,469 @@
+edition 7;
+
+module oci.layer;
+
+import oci.digest;
+import oci.elf;
+import oci.place;
+import oci.store;
+import oci.tar;
+
+// `oci.layer` -- the one layer of a `FROM scratch` image, from `--bin src:dest`
+// and `--file src:dest` arguments (design 4 and 5.3, task #7).
+//
+// The entries are a small table in two caller-provided slices: `names` (the
+// bytes of every entry's path, one after another) and `meta` (six numbers per
+// entry: name start, name length, kind, executable, the argument that named it,
+// size). Everything else follows from that table: implied parent directories
+// are added, entries are sorted bytewise (what `oci.tar` requires), each source
+// is measured and, when it is a `--bin`, checked to be a static executable for
+// the platform, and the tar is streamed into the blob store in 64 KiB pieces.
+//
+// A refusal is a negative number; `state[2]` then holds the table entry it is
+// about (or -1), so the caller can name the path.
+
+pub fn stride() -> [] int {
+    return 6;
+}
+
+pub fn max_entries() -> [] int {
+    return 64;
+}
+
+pub fn names_cap() -> [] int {
+    return 8192;
+}
+
+pub fn state_len() -> [] int {
+    return 4;
+}
+
+pub fn refused_too_many() -> [] int {
+    return 0 - 401;
+}
+
+pub fn refused_names_full() -> [] int {
+    return 0 - 402;
+}
+
+pub fn refused_duplicate() -> [] int {
+    return 0 - 403;
+}
+
+pub fn refused_spec() -> [] int {
+    return 0 - 404;
+}
+
+pub fn refused_source() -> [] int {
+    return 0 - 405;
+}
+
+pub fn refused_changed() -> [] int {
+    return 0 - 406;
+}
+
+pub fn refused_io() -> [] int {
+    return 0 - 407;
+}
+
+pub fn refused_empty() -> [] int {
+    return 0 - 408;
+}
+
+// Which module's rule a code belongs to is decided by its range: tar -1..-13,
+// store -101.., image -201.., elf -301.., layer -401...
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == refused_too_many() {
+        return "layer-too-many-entries";
+    }
+    if code == refused_names_full() {
+        return "layer-names-too-long";
+    }
+    if code == refused_duplicate() {
+        return "layer-duplicate";
+    }
+    if code == refused_spec() {
+        return "layer-spec";
+    }
+    if code == refused_source() {
+        return "layer-source";
+    }
+    if code == refused_changed() {
+        return "layer-source-changed";
+    }
+    if code == refused_io() {
+        return "layer-io";
+    }
+    if code == refused_empty() {
+        return "layer-empty";
+    }
+    if code > 0 - 100 {
+        return tar.rule_name(code);
+    }
+    if code > 0 - 200 {
+        return store.rule_name(code);
+    }
+    if code <= 0 - 300 && code > 0 - 400 {
+        return elf.rule_name(code);
+    }
+    return "unknown";
+}
+
+// Add one entry unless it is already there. A directory already present as a
+// directory is fine (every file under it asks for it); anything else repeated is
+// a refusal naming the earlier entry.
+fn add[&n, &m, &s, &t](names: &!n [byte], meta: &!m [int], state: &!s [int], name: &t [byte], kind: int, exec: int, spec: int) -> [] int {
+    let count = state[0];
+    let used = state[1];
+    var e = 0;
+    while e < count {
+        let start = meta[e * 6];
+        let width = meta[e * 6 + 1];
+        if tar.compare(names[start..start + width], name) == 0 {
+            if meta[e * 6 + 2] == 1 && kind == 1 {
+                return 0;
+            }
+            state[2] = e;
+            return refused_duplicate();
+        }
+        e = e + 1;
+    }
+    if count >= max_entries() {
+        return refused_too_many();
+    }
+    if used + len(name) > len(names) {
+        return refused_names_full();
+    }
+    var i = 0;
+    while i < len(name) {
+        names[used + i] = name[i];
+        i = i + 1;
+    }
+    meta[count * 6] = used;
+    meta[count * 6 + 1] = len(name);
+    meta[count * 6 + 2] = kind;
+    meta[count * 6 + 3] = exec;
+    meta[count * 6 + 4] = spec;
+    meta[count * 6 + 5] = 0 - 1;
+    state[0] = count + 1;
+    state[1] = used + len(name);
+    return 0;
+}
+
+// Where the "src" ends in "src:dest", or -1 when there is no usable split.
+fn split_at[&t](spec: &t [byte]) -> [] int {
+    let k = index_of_byte(spec, byte_of(':'));
+    if k < 1 || k >= len(spec) - 1 {
+        return 0 - 1;
+    }
+    return k;
+}
+
+pub fn source_of[&t](spec: &t [byte]) -> [] &t [byte] {
+    return spec[0..split_at(spec)];
+}
+
+pub fn dest_of[&t](spec: &t [byte]) -> [] &t [byte] {
+    return spec[split_at(spec) + 1..len(spec)];
+}
+
+// Build the table from the arguments. Every flag of this tool takes exactly one
+// value, so the arguments are read in pairs from argv[1]: `--bin src:dest` and
+// `--file src:dest` become entries (with their parent directories), and every
+// other pair is not this module's business. Answers the entry count or a refusal.
+pub fn collect[&g, &n, &m, &s](args: &g Args, names: &!n [byte], meta: &!m [int], state: &!s [int]) -> [args] int {
+    state[0] = 0;
+    state[1] = 0;
+    state[2] = 0 - 1;
+    var i = 1;
+    while i < arg_count(args) {
+        let flag = arg(args, i);
+        let is_bin = digest.equal(flag, "--bin");
+        let is_file = digest.equal(flag, "--file");
+        if is_bin || is_file {
+            if i + 1 >= arg_count(args) {
+                return refused_spec();
+            }
+            let spec = arg(args, i + 1);
+            if split_at(spec) < 0 {
+                return refused_spec();
+            }
+            let dest = dest_of(spec);
+            var j = 1;
+            while j < len(dest) {
+                if int_of(dest[j]) == '/' {
+                    let code = add(names, meta, state, dest[0..j], 1, 0, 0 - 1);
+                    if code != 0 {
+                        return code;
+                    }
+                }
+                j = j + 1;
+            }
+            var exec = 0;
+            if is_bin {
+                exec = 1;
+            }
+            let code = add(names, meta, state, dest, 0, exec, i + 1);
+            if code != 0 {
+                return code;
+            }
+        }
+        i = i + 2;
+    }
+    if state[0] == 0 {
+        return refused_empty();
+    }
+    return state[0];
+}
+
+fn name_of[&n, &m](names: &n [byte], meta: &m [int], e: int) -> [] &n [byte] {
+    return names[meta[e * 6]..meta[e * 6] + meta[e * 6 + 1]];
+}
+
+pub fn name_at[&n, &m](names: &n [byte], meta: &m [int], e: int) -> [] &n [byte] {
+    return name_of(names, meta, e);
+}
+
+// Insertion sort of the table by path, bytewise: the order `oci.tar` requires.
+pub fn sort[&n, &m](names: &n [byte], meta: &!m [int], count: int) -> [] int {
+    var i = 1;
+    while i < count {
+        var j = i;
+        while j > 0 && tar.compare(name_of(names, meta, j - 1), name_of(names, meta, j)) > 0 {
+            var k = 0;
+            while k < 6 {
+                let held = meta[j * 6 + k];
+                meta[j * 6 + k] = meta[(j - 1) * 6 + k];
+                meta[(j - 1) * 6 + k] = held;
+                k = k + 1;
+            }
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Is the open file a static executable for `arch`? 0 or an `oci.elf` refusal.
+fn inspect[&f, &a](file: &!f File, arch: &a [byte]) -> [file_read] int {
+    var code = 0;
+    region r {
+        let head = alloc_slice[r](64, byte_of(0));
+        var got = 0;
+        match file_pread(file, 0, head) {
+            Read::Got(n) => {
+                got = n;
+            }
+            Read::End => {
+                code = elf.refused_short();
+            }
+            Read::Failed(e) => {
+                code = refused_io();
+            }
+        }
+        if code == 0 {
+            code = elf.check_head(head[0..got]);
+        }
+        if code == 0 && !digest.equal(elf.arch_name(head), arch) {
+            code = elf.refused_arch_mismatch();
+        }
+        if code == 0 {
+            let at = elf.phoff(head);
+            let count = elf.phnum(head);
+            if at < 0 {
+                code = elf.refused_phdrs();
+            } else {
+                let table = alloc_slice[r](count * 56, byte_of(0));
+                match file_pread(file, at, table) {
+                    Read::Got(n) => {
+                        if n < count * 56 {
+                            code = elf.refused_phdrs();
+                        }
+                    }
+                    Read::End => {
+                        code = elf.refused_phdrs();
+                    }
+                    Read::Failed(e) => {
+                        code = refused_io();
+                    }
+                }
+                if code == 0 && elf.interp_index(table, count) >= 0 {
+                    code = elf.refused_dynamic();
+                }
+            }
+        }
+    }
+    return code;
+}
+
+// Measure every file, check every `--bin`, and dry-run every header so a bad
+// path is refused before anything is written. `state[2]` names the culprit.
+pub fn measure[&g, &r, &n, &m, &s, &a](args: &g Args, root: &r Dir, names: &n [byte], meta: &!m [int], count: int, state: &!s [int], arch: &a [byte], mtime: int) -> [args, dir_read, file_read] int {
+    var e = 0;
+    while e < count {
+        let kind = meta[e * 6 + 2];
+        var size = 0;
+        if kind == 0 {
+            let spec = arg(args, meta[e * 6 + 4]);
+            match place.open_file(root, source_of(spec)) {
+                Opened::Failed(errno) => {
+                    state[2] = e;
+                    return refused_source();
+                }
+                Opened::Ok(file) => {
+                    var handle = file;
+                    var code = 0;
+                    borrow mut handle as &!f in {
+                        size = place.size_of(f);
+                        if size < 0 {
+                            code = refused_io();
+                        } else if meta[e * 6 + 3] == 1 {
+                            code = inspect(f, arch);
+                        }
+                    }
+                    file_close(handle);
+                    if code != 0 {
+                        state[2] = e;
+                        return code;
+                    }
+                }
+            }
+        }
+        meta[e * 6 + 5] = size;
+        var header_code = 0;
+        region h {
+            let scratch = alloc_slice[h](512, byte_of(0));
+            header_code = tar.header(scratch, name_of(names, meta, e), kind, size, meta[e * 6 + 3] == 1, mtime);
+        }
+        if header_code != 0 {
+            state[2] = e;
+            return header_code;
+        }
+        e = e + 1;
+    }
+    return 0;
+}
+
+// Write `size` bytes of the file at `rel` into the blob, then the padding. Answers
+// the blob back and 0, or a refusal (the blob is then to be abandoned).
+fn put_file[&r, &c, &z, &p](blob: store.Blob, root: &r Dir, rel: &p [byte], size: int, chunk: &!c [byte], zeros: &z [byte]) -> [dir_read, file_read, file_write] (store.Blob, int) {
+    var current = blob;
+    var code = 0;
+    match place.open_file(root, rel) {
+        Opened::Failed(errno) => {
+            code = refused_source();
+        }
+        Opened::Ok(file) => {
+            var handle = file;
+            var total = 0;
+            var going = true;
+            while going {
+                borrow mut handle as &!f in {
+                    match file_read(f, chunk) {
+                        Read::Got(n) => {
+                            let (next, errno) = store.write(current, chunk[0..n]);
+                            current = next;
+                            total = total + n;
+                            if errno != 0 {
+                                code = refused_io();
+                                going = false;
+                            } else if total > size {
+                                code = refused_changed();
+                                going = false;
+                            }
+                        }
+                        Read::End => {
+                            going = false;
+                        }
+                        Read::Failed(errno) => {
+                            code = refused_io();
+                            going = false;
+                        }
+                    }
+                }
+            }
+            file_close(handle);
+            if code == 0 && total != size {
+                code = refused_changed();
+            }
+            if code == 0 {
+                let pad = tar.padding(size);
+                if pad > 0 {
+                    let (next, errno) = store.write(current, zeros[0..pad]);
+                    current = next;
+                    if errno != 0 {
+                        code = refused_io();
+                    }
+                }
+            }
+        }
+    }
+    return (current, code);
+}
+
+// Stream the whole layer into the store under `tmp`: each header, each file's
+// bytes, the padding, and the two zero blocks that end an archive. `raw`
+// receives the layer's digest. Answers (outcome, size): `store.created()` or
+// `store.existed()` and the tar's length, or a refusal and 0.
+pub fn write[&h, &b, &r, &g, &n, &m, &t, &o](heap: &!h Heap, blobs: &b Dir, root: &r Dir, args: &g Args, names: &n [byte], meta: &m [int], count: int, mtime: int, tmp: &t [byte], raw: &!o [byte]) -> [heap, args, dir_read, dir_write, file_read, file_write] (int, int) {
+    match store.begin(heap, blobs, tmp) {
+        store.Began::Failed(errno) => {
+            return (refused_io(), 0);
+        }
+        store.Began::Ok(first) => {
+            var blob = first;
+            let chunk = box_slice(heap, 65536, byte_of(0));
+            let zeros = box_slice(heap, 512, byte_of(0));
+            let header = box_slice(heap, 512, byte_of(0));
+            var code = 0;
+            var written = 0;
+            var e = 0;
+            while e < count && code == 0 {
+                borrow mut header as &!hw in {
+                    let kind = meta[e * 6 + 2];
+                    code = tar.header(contents(hw), name_of(names, meta, e), kind, meta[e * 6 + 5], meta[e * 6 + 3] == 1, mtime);
+                    if code == 0 {
+                        let (next, errno) = store.write(blob, contents(hw));
+                        blob = next;
+                        written = written + 512;
+                        if errno != 0 {
+                            code = refused_io();
+                        }
+                    }
+                }
+                if code == 0 && meta[e * 6 + 2] == 0 {
+                    let spec = arg(args, meta[e * 6 + 4]);
+                    borrow mut chunk as &!cw in {
+                        borrow zeros as &zr in {
+                            let (next, c2) = put_file(blob, root, source_of(spec), meta[e * 6 + 5], contents(cw), contents(zr));
+                            blob = next;
+                            code = c2;
+                        }
+                    }
+                    written = written + meta[e * 6 + 5] + tar.padding(meta[e * 6 + 5]);
+                }
+                e = e + 1;
+            }
+            if code == 0 {
+                borrow zeros as &zr in {
+                    let (next, errno) = store.write(blob, contents(zr));
+                    let (last, errno2) = store.write(next, contents(zr));
+                    blob = last;
+                    written = written + 1024;
+                    if errno != 0 || errno2 != 0 {
+                        code = refused_io();
+                    }
+                }
+            }
+            unbox_slice(heap, chunk);
+            unbox_slice(heap, zeros);
+            unbox_slice(heap, header);
+            if code != 0 {
+                store.abandon(heap, blobs, blob, tmp);
+                return (code, 0);
+            }
+            let outcome = store.finish(heap, blobs, blob, tmp, raw);
+            return (outcome, written);
+        }
+    }
+}

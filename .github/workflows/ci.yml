@@ -100,6 +100,22 @@ jobs:
         working-directory: oci
         run: python3 scripts/image_mutants.py
 
+      - name: oci-build -- layers equal the tarfile oracle, images validate and reproduce, ELF and path refusals, an image runs in a container
+        working-directory: oci
+        run: |
+          python3 scripts/build_check.py --cases 30 --seed 1 --run
+          python3 scripts/build_check.py --cases 30 --seed 2
+
+      - name: oci-build packages itself -- a static build runs in a scratch container (docker)
+        working-directory: oci
+        run: |
+          sh scripts/static_build.sh
+          python3 scripts/build_check.py --cases 3 --dogfood build/oci-build-static
+
+      - name: oci-build's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/build_mutants.py
+
       - name: G5 -- every binary's authority is within its committed ceiling
         working-directory: oci
         run: python3 scripts/authority_ceiling.py
