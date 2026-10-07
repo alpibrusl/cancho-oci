@@ -28,6 +28,13 @@ sources = ["src/digest", "src/store", "tests/probe/store"]
 std = true
 out = "build/store-probe"
 
+# The test harness for oci.image (#5), held to its own ceiling.
+[[bin]]
+name = "image-probe"
+sources = ["src/digest", "src/store", "src/image", "tests/probe/image"]
+std = true
+out = "build/image-probe"
+
 [[test]]
 name = "scaffold"
 sources = ["tests/scaffold_test.cho"]
@@ -41,4 +48,9 @@ std = true
 [[test]]
 name = "digest"
 sources = ["src/digest", "tests/digest_test.cho"]
+std = true
+
+[[test]]
+name = "image"
+sources = ["src/digest", "src/image", "tests/image_test.cho"]
 std = true

@@ -1,0 +1,514 @@
+edition 7;
+
+module oci.image;
+
+import oci.digest;
+import std.buffer;
+import std.json;
+
+// `oci.image` -- the JSON of an OCI image and its layout marker (design 5.2, task #5):
+// the image config, the image manifest, the index and `oci-layout`.
+//
+// Determinism is this module's obligation (design 5.2): the spec does not require a
+// canonical JSON form, so a digest is over the exact bytes written here, and the
+// bytes are a function of the arguments alone. The key order is the order of the
+// calls below; there is no whitespace; integers are the only numbers; and nothing
+// reads a clock, so the config has no `created` field (it is optional in the spec).
+//
+// Lists reach the builders as one text, one item per line ("\n"), because a slice
+// of strings cannot be a struct field here. An item may not be empty or hold a
+// control character, and a newline is one, so `plain` is also what settles that a
+// single-valued field (user, workdir, ref) cannot smuggle in a second line.
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+pub fn refused_arch() -> [] int {
+    return 0 - 201;
+}
+
+pub fn refused_os() -> [] int {
+    return 0 - 202;
+}
+
+pub fn refused_text() -> [] int {
+    return 0 - 203;
+}
+
+pub fn refused_env() -> [] int {
+    return 0 - 204;
+}
+
+pub fn refused_label() -> [] int {
+    return 0 - 205;
+}
+
+pub fn refused_port() -> [] int {
+    return 0 - 206;
+}
+
+pub fn refused_ref() -> [] int {
+    return 0 - 207;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "ok";
+    }
+    if code == refused_arch() {
+        return "image-arch";
+    }
+    if code == refused_os() {
+        return "image-os";
+    }
+    if code == refused_text() {
+        return "image-text";
+    }
+    if code == refused_env() {
+        return "image-env";
+    }
+    if code == refused_label() {
+        return "image-label";
+    }
+    if code == refused_port() {
+        return "image-port";
+    }
+    if code == refused_ref() {
+        return "image-ref";
+    }
+    return digest.rule_name(code);
+}
+
+pub fn media_manifest() -> [] &static [byte] {
+    return "application/vnd.oci.image.manifest.v1+json";
+}
+
+pub fn media_config() -> [] &static [byte] {
+    return "application/vnd.oci.image.config.v1+json";
+}
+
+pub fn media_index() -> [] &static [byte] {
+    return "application/vnd.oci.image.index.v1+json";
+}
+
+pub fn media_layer() -> [] &static [byte] {
+    return "application/vnd.oci.image.layer.v1.tar";
+}
+
+// The marker file `oci-layout`.
+pub fn layout_text() -> [] &static [byte] {
+    return "{\"imageLayoutVersion\":\"1.0.0\"}";
+}
+
+// What v1 builds for (design 4): three architectures and one OS. A binary for
+// anything else, including 32-bit ARM whose variant `e_machine` does not carry,
+// is refused rather than guessed.
+pub fn arch_ok[&a](arch: &a [byte]) -> [] bool {
+    return digest.equal(arch, "amd64") || digest.equal(arch, "arm64") || digest.equal(arch, "riscv64");
+}
+
+pub fn os_ok[&o](os: &o [byte]) -> [] bool {
+    return digest.equal(os, "linux");
+}
+
+// The end of the line that starts at `at` (the index of its "\n", or the length).
+fn line_end[&t](text: &t [byte], at: int) -> [] int {
+    var i = at;
+    while i < len(text) && int_of(text[i]) != '\n' {
+        i = i + 1;
+    }
+    return i;
+}
+
+// No control characters: below 32, or DEL.
+fn plain[&t](text: &t [byte]) -> [] bool {
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 32 || c == 127 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Every line of `text` is non-empty and plain. `kind` is 0 (any), 1 (`NAME=value`,
+// name non-empty), 2 (a port, `<digits>/tcp` or `<digits>/udp`).
+fn lines_ok[&t](text: &t [byte], kind: int) -> [] int {
+    var at = 0;
+    while at < len(text) {
+        let end = line_end(text, at);
+        let item = text[at..end];
+        if len(item) == 0 || !plain(item) {
+            return refused_text();
+        }
+        if kind == 1 {
+            var eq = 0 - 1;
+            var i = 0;
+            while i < len(item) && eq < 0 {
+                if int_of(item[i]) == '=' {
+                    eq = i;
+                }
+                i = i + 1;
+            }
+            if eq < 1 {
+                return 1;
+            }
+        }
+        if kind == 2 && !port_ok(item) {
+            return refused_port();
+        }
+        at = end + 1;
+    }
+    return 0;
+}
+
+// An object must not repeat a key: JSON with a duplicate name means different things
+// to different readers. For labels the key is the part before the first "="; for
+// ports it is the whole item. Answers 0, or 1 when `kind` (1 labels, 2 ports) repeats.
+fn keys_unique[&t](text: &t [byte], kind: int) -> [] int {
+    var at = 0;
+    while at < len(text) {
+        let end = line_end(text, at);
+        let key = key_of(text[at..end], kind);
+        var other = end + 1;
+        while other < len(text) {
+            let other_end = line_end(text, other);
+            if digest.equal(key, key_of(text[other..other_end], kind)) {
+                return 1;
+            }
+            other = other_end + 1;
+        }
+        at = end + 1;
+    }
+    return 0;
+}
+
+fn key_of[&t](item: &t [byte], kind: int) -> [] &t [byte] {
+    if kind == 2 {
+        return item;
+    }
+    var eq = 0;
+    while eq < len(item) && int_of(item[eq]) != '=' {
+        eq = eq + 1;
+    }
+    return item[0..eq];
+}
+
+fn port_ok[&t](item: &t [byte]) -> [] bool {
+    var slash = 0 - 1;
+    var i = 0;
+    while i < len(item) && slash < 0 {
+        if int_of(item[i]) == '/' {
+            slash = i;
+        }
+        i = i + 1;
+    }
+    if slash < 1 || slash > 5 {
+        return false;
+    }
+    var k = 0;
+    while k < slash {
+        if int_of(item[k]) < '0' || int_of(item[k]) > '9' {
+            return false;
+        }
+        k = k + 1;
+    }
+    let proto = item[slash + 1..len(item)];
+    return digest.equal(proto, "tcp") || digest.equal(proto, "udp");
+}
+
+// A `diff_id` / digest in the "sha256:<hex>" form.
+fn digest_ok[&t](text: &t [byte]) -> [] bool {
+    var raw = 0;
+    region a {
+        let scratch = alloc_slice[a](32, byte_of(0));
+        raw = digest.parse_into(text, scratch);
+    }
+    return raw == 0;
+}
+
+fn put_array[&h, &t](heap: &!h Heap, w: json.Writer, text: &t [byte]) -> [heap] json.Writer {
+    var out = json.begin_array(heap, w);
+    var at = 0;
+    while at < len(text) {
+        let end = line_end(text, at);
+        out = json.put_string(heap, out, text[at..end]);
+        at = end + 1;
+    }
+    return json.end_array(heap, out);
+}
+
+// `NAME=value` lines as an object `{"NAME":"value"}`.
+fn put_labels[&h, &t](heap: &!h Heap, w: json.Writer, text: &t [byte]) -> [heap] json.Writer {
+    var out = json.begin_object(heap, w);
+    var at = 0;
+    while at < len(text) {
+        let end = line_end(text, at);
+        let item = text[at..end];
+        var eq = 0;
+        while int_of(item[eq]) != '=' {
+            eq = eq + 1;
+        }
+        out = json.put_key(heap, out, item[0..eq]);
+        out = json.put_string(heap, out, item[eq + 1..len(item)]);
+        at = end + 1;
+    }
+    return json.end_object(heap, out);
+}
+
+// Port lines as `{"8080/tcp":{}}`.
+fn put_ports[&h, &t](heap: &!h Heap, w: json.Writer, text: &t [byte]) -> [heap] json.Writer {
+    var out = json.begin_object(heap, w);
+    var at = 0;
+    while at < len(text) {
+        let end = line_end(text, at);
+        out = json.put_key(heap, out, text[at..end]);
+        out = json.begin_object(heap, out);
+        out = json.end_object(heap, out);
+        at = end + 1;
+    }
+    return json.end_object(heap, out);
+}
+
+fn put_descriptor[&h, &m, &d](heap: &!h Heap, w: json.Writer, media: &m [byte], digest_text: &d [byte], size: int) -> [heap] json.Writer {
+    var out = json.begin_object(heap, w);
+    out = json.put_key(heap, out, "mediaType");
+    out = json.put_string(heap, out, media);
+    out = json.put_key(heap, out, "digest");
+    out = json.put_string(heap, out, digest_text);
+    out = json.put_key(heap, out, "size");
+    out = json.put_int(heap, out, size);
+    return json.end_object(heap, out);
+}
+
+// The image config for one layer whose uncompressed digest is `diff_id`.
+//
+//   entrypoint, cmd, env, labels, ports   one item per line; empty text omits the key
+//   user, workdir                         empty text omits the key
+//
+// Answers the JSON and 0, or an empty buffer and a refusal.
+pub fn config_json[&h, &a, &o, &e, &c, &v, &u, &w, &l, &p, &d](heap: &!h Heap, arch: &a [byte], os: &o [byte], entrypoint: &e [byte], cmd: &c [byte], env: &v [byte], user: &u [byte], workdir: &w [byte], labels: &l [byte], ports: &p [byte], diff_id: &d [byte]) -> [heap] (buffer.Buffer, int) {
+    var code = 0;
+    if !arch_ok(arch) {
+        code = refused_arch();
+    } else if !os_ok(os) {
+        code = refused_os();
+    } else if lines_ok(entrypoint, 0) != 0 || lines_ok(cmd, 0) != 0 {
+        code = refused_text();
+    } else if lines_ok(env, 1) != 0 {
+        code = refused_env();
+    } else if lines_ok(labels, 1) != 0 || keys_unique(labels, 1) != 0 {
+        code = refused_label();
+    } else if lines_ok(ports, 2) != 0 || keys_unique(ports, 2) != 0 {
+        code = refused_port();
+    } else if !plain(user) || !plain(workdir) {
+        code = refused_text();
+    } else if !digest_ok(diff_id) {
+        code = refused_text();
+    }
+    if code != 0 {
+        return (buffer.empty(heap, 1), code);
+    }
+    var w1 = json.writer(heap, 512);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "architecture");
+    w1 = json.put_string(heap, w1, arch);
+    w1 = json.put_key(heap, w1, "os");
+    w1 = json.put_string(heap, w1, os);
+    w1 = json.put_key(heap, w1, "config");
+    w1 = json.begin_object(heap, w1);
+    if len(user) > 0 {
+        w1 = json.put_key(heap, w1, "User");
+        w1 = json.put_string(heap, w1, user);
+    }
+    if len(ports) > 0 {
+        w1 = json.put_key(heap, w1, "ExposedPorts");
+        w1 = put_ports(heap, w1, ports);
+    }
+    if len(env) > 0 {
+        w1 = json.put_key(heap, w1, "Env");
+        w1 = put_array(heap, w1, env);
+    }
+    if len(entrypoint) > 0 {
+        w1 = json.put_key(heap, w1, "Entrypoint");
+        w1 = put_array(heap, w1, entrypoint);
+    }
+    if len(cmd) > 0 {
+        w1 = json.put_key(heap, w1, "Cmd");
+        w1 = put_array(heap, w1, cmd);
+    }
+    if len(workdir) > 0 {
+        w1 = json.put_key(heap, w1, "WorkingDir");
+        w1 = json.put_string(heap, w1, workdir);
+    }
+    if len(labels) > 0 {
+        w1 = json.put_key(heap, w1, "Labels");
+        w1 = put_labels(heap, w1, labels);
+    }
+    w1 = json.end_object(heap, w1);
+    w1 = json.put_key(heap, w1, "rootfs");
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "type");
+    w1 = json.put_string(heap, w1, "layers");
+    w1 = json.put_key(heap, w1, "diff_ids");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.put_string(heap, w1, diff_id);
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    w1 = json.put_key(heap, w1, "history");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "created_by");
+    w1 = json.put_string(heap, w1, "cancho-oci");
+    w1 = json.end_object(heap, w1);
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    return (json.finish(w1), 0);
+}
+
+// The manifest of an image with one layer.
+pub fn manifest_json[&h, &c, &l](heap: &!h Heap, config_digest: &c [byte], config_size: int, layer_digest: &l [byte], layer_size: int) -> [heap] (buffer.Buffer, int) {
+    if !digest_ok(config_digest) || !digest_ok(layer_digest) || config_size < 0 || layer_size < 0 {
+        return (buffer.empty(heap, 1), refused_text());
+    }
+    var w1 = json.writer(heap, 512);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "schemaVersion");
+    w1 = json.put_int(heap, w1, 2);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_manifest());
+    w1 = json.put_key(heap, w1, "config");
+    w1 = put_descriptor(heap, w1, media_config(), config_digest, config_size);
+    w1 = json.put_key(heap, w1, "layers");
+    w1 = json.begin_array(heap, w1);
+    w1 = put_descriptor(heap, w1, media_layer(), layer_digest, layer_size);
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    return (json.finish(w1), 0);
+}
+
+// `index.json` pointing at one manifest. `ref` (may be empty) is the
+// `org.opencontainers.image.ref.name` annotation, the tag `skopeo oci:dir:tag` looks for.
+pub fn index_json[&h, &m, &a, &o, &r](heap: &!h Heap, manifest_digest: &m [byte], manifest_size: int, arch: &a [byte], os: &o [byte], ref: &r [byte]) -> [heap] (buffer.Buffer, int) {
+    var code = 0;
+    if !digest_ok(manifest_digest) || manifest_size < 0 {
+        code = refused_text();
+    } else if !arch_ok(arch) {
+        code = refused_arch();
+    } else if !os_ok(os) {
+        code = refused_os();
+    } else if !plain(ref) {
+        code = refused_ref();
+    }
+    if code != 0 {
+        return (buffer.empty(heap, 1), code);
+    }
+    var w1 = json.writer(heap, 512);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "schemaVersion");
+    w1 = json.put_int(heap, w1, 2);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_index());
+    w1 = json.put_key(heap, w1, "manifests");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_manifest());
+    w1 = json.put_key(heap, w1, "digest");
+    w1 = json.put_string(heap, w1, manifest_digest);
+    w1 = json.put_key(heap, w1, "size");
+    w1 = json.put_int(heap, w1, manifest_size);
+    w1 = json.put_key(heap, w1, "platform");
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "architecture");
+    w1 = json.put_string(heap, w1, arch);
+    w1 = json.put_key(heap, w1, "os");
+    w1 = json.put_string(heap, w1, os);
+    w1 = json.end_object(heap, w1);
+    if len(ref) > 0 {
+        w1 = json.put_key(heap, w1, "annotations");
+        w1 = json.begin_object(heap, w1);
+        w1 = json.put_key(heap, w1, "org.opencontainers.image.ref.name");
+        w1 = json.put_string(heap, w1, ref);
+        w1 = json.end_object(heap, w1);
+    }
+    w1 = json.end_object(heap, w1);
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    return (json.finish(w1), 0);
+}
+
+// Replace `<dir>/<name>` with `bytes`, atomically: write a temporary, sync it, and
+// rename it over the name. For the two files of a layout that are not blobs
+// (`oci-layout`, `index.json`), which are meant to be replaced by a rebuild.
+pub fn write_file[&d, &n, &b](dir: &d Dir, name: &n [byte], bytes: &b [byte]) -> [dir_write] int {
+    let tmp = ".incoming-file";
+    match dir_open_new(dir, tmp) {
+        Opened::Failed(errno) => {
+            dir_remove(dir, tmp);
+            match dir_open_new(dir, tmp) {
+                Opened::Failed(again) => {
+                    return 0 - 1;
+                }
+                Opened::Ok(second) => {
+                    return fill(dir, second, tmp, name, bytes);
+                }
+            }
+        }
+        Opened::Ok(file) => {
+            return fill(dir, file, tmp, name, bytes);
+        }
+    }
+}
+
+fn fill[&d, &t, &n, &b](dir: &d Dir, file: File, tmp: &t [byte], name: &n [byte], bytes: &b [byte]) -> [dir_write] int {
+    var handle = file;
+    var failed = false;
+    var at = 0;
+    while at < len(bytes) && !failed {
+        borrow mut handle as &!f in {
+            match file_write(f, bytes[at..len(bytes)]) {
+                Done::Ok(n) => {
+                    if n <= 0 {
+                        failed = true;
+                    } else {
+                        at = at + n;
+                    }
+                }
+                Done::Failed(e) => {
+                    failed = true;
+                }
+            }
+        }
+    }
+    if !failed {
+        borrow mut handle as &!f in {
+            match file_sync(f) {
+                Done::Ok(n) => {
+                    failed = false;
+                }
+                Done::Failed(e) => {
+                    failed = true;
+                }
+            }
+        }
+    }
+    file_close(handle);
+    if failed {
+        dir_remove(dir, tmp);
+        return 0 - 1;
+    }
+    match dir_rename(dir, tmp, name) {
+        Done::Ok(n) => {
+            dir_sync(dir);
+            return 0;
+        }
+        Done::Failed(e) => {
+            dir_remove(dir, tmp);
+            return 0 - 1;
+        }
+    }
+}

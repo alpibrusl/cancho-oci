@@ -76,50 +76,6 @@ fn cmd_hash[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g 
     return status;
 }
 
-// Stream <srcdir>/<name> into the store in 64 KiB pieces, the way `build` will
-// write a layer it is still producing: the digest is only known at the end.
-fn stream_into[&h, &d, &s, &o](heap: &!h Heap, root: &d Dir, source: &!s File, tmp: &static [byte], raw: &!o [byte]) -> [heap, dir_write, file_write, file_read] int {
-    match store.begin(heap, root, tmp) {
-        store.Began::Failed(errno) => {
-            return store.refused_io();
-        }
-        store.Began::Ok(first) => {
-            var blob = first;
-            let chunk = box_slice(heap, 65536, byte_of(0));
-            var failed = 0;
-            var going = true;
-            while going {
-                borrow mut chunk as &!c in {
-                    let room = contents(c);
-                    match file_read(source, room) {
-                        Read::Got(n) => {
-                            let (next, errno) = store.write(blob, room[0..n]);
-                            blob = next;
-                            if errno != 0 {
-                                failed = errno;
-                                going = false;
-                            }
-                        }
-                        Read::End => {
-                            going = false;
-                        }
-                        Read::Failed(errno) => {
-                            failed = errno;
-                            going = false;
-                        }
-                    }
-                }
-            }
-            unbox_slice(heap, chunk);
-            if failed != 0 {
-                store.abandon(heap, root, blob, tmp);
-                return store.refused_io();
-            }
-            return store.finish(heap, root, blob, tmp, raw);
-        }
-    }
-}
-
 fn cmd_put[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
     var status = 1;
     match open_root(fs, arg(args, 2)) {
@@ -146,7 +102,8 @@ fn cmd_put[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g A
                                     var code = 0;
                                     borrow target as &td in {
                                         borrow mut handle as &!x in {
-                                            code = stream_into(heap, td, x, ".incoming-0", raw);
+                                            let (outcome, size) = store.put_stream(heap, td, x, ".incoming-0", raw);
+                                            code = outcome;
                                         }
                                     }
                                     if code > 0 {

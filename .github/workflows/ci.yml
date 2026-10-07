@@ -80,6 +80,24 @@ jobs:
         working-directory: oci
         run: python3 scripts/store_syscalls.py
 
+      - name: Tools the image gate validates with (OCI JSON schemas via jsonschema, skopeo, crane pinned)
+        run: |
+          pip install jsonschema referencing
+          sudo apt-get install -y -q skopeo
+          go install github.com/google/go-containerregistry/cmd/crane@v0.20.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: The image layout validates against the OCI schemas, matches an independent model byte for byte, is reproducible, and skopeo and crane accept it
+        working-directory: oci
+        run: |
+          skopeo --version && crane version
+          python3 scripts/image_check.py --cases 80 --seed 1
+          python3 scripts/image_check.py --cases 80 --seed 2
+
+      - name: The image module's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/image_mutants.py
+
       - name: G5 -- every binary's authority is within its committed ceiling
         working-directory: oci
         run: python3 scripts/authority_ceiling.py

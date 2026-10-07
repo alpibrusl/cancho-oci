@@ -237,6 +237,55 @@ pub fn put[&h, &d, &n, &b, &o](heap: &!h Heap, root: &d Dir, tmp: &n [byte], byt
     }
 }
 
+// Stream an open file into the store in 64 KiB pieces: begin, write each piece,
+// finish. The digest is only known at the end, so the blob is written under a
+// temporary name and published by `finish`. Answers (outcome, size): `created()`
+// or `existed()` and the byte count, or a negative refusal and 0.
+pub fn put_stream[&h, &d, &s, &n, &o](heap: &!h Heap, root: &d Dir, source: &!s File, tmp: &n [byte], raw: &!o [byte]) -> [heap, dir_write, file_write, file_read] (int, int) {
+    match begin(heap, root, tmp) {
+        Began::Failed(errno) => {
+            return (refused_io(), 0);
+        }
+        Began::Ok(first) => {
+            var blob = first;
+            let chunk = box_slice(heap, 65536, byte_of(0));
+            var failed = 0;
+            var total = 0;
+            var going = true;
+            while going {
+                borrow mut chunk as &!c in {
+                    let room = contents(c);
+                    match file_read(source, room) {
+                        Read::Got(n) => {
+                            let (next, errno) = write(blob, room[0..n]);
+                            blob = next;
+                            total = total + n;
+                            if errno != 0 {
+                                failed = errno;
+                                going = false;
+                            }
+                        }
+                        Read::End => {
+                            going = false;
+                        }
+                        Read::Failed(errno) => {
+                            failed = errno;
+                            going = false;
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, chunk);
+            if failed != 0 {
+                abandon(heap, root, blob, tmp);
+                return (refused_io(), 0);
+            }
+            let outcome = finish(heap, root, blob, tmp, raw);
+            return (outcome, total);
+        }
+    }
+}
+
 // Hash an open file to the end, reading 64 KiB at a time. `raw` receives the
 // digest; the answer is the byte count, or a negative errno.
 pub fn hash_file[&h, &f, &o](heap: &!h Heap, file: &!f File, raw: &!o [byte]) -> [heap, file_read] int {
