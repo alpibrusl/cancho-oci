@@ -6,7 +6,8 @@ scripts/store_diff.py to notice. A survivor is a behaviour nothing tests.
 
 Each mutant is one textual edit of one source file, built into a temporary store-probe. The edit must apply
 exactly once, so the list cannot rot silently when a source changes. A digest mutant is also run against
-tests/digest_test.cho: it is killed if either the store gate or the unit tests fail. Exit 0 only if every
+tests/digest_test.cho: it is killed if either the store gate or the unit tests fail. A store mutant is also
+run through scripts/image_check.py, because a manifest records the sizes the store reports. Exit 0 only if every
 mutant is killed.
 
 Not covered, and said so: a failing fsync or a failing write cannot be provoked from outside, so the
@@ -24,7 +25,8 @@ MUTANTS = [
     ("store", "a stale temporary is not removed", "                dir_remove(root, tmp);\n            }\n        }\n        attempt = attempt + 1;", "            }\n        }\n        attempt = attempt + 1;"),
     ("store", "verify never compares", "} else if !digest.equal(raw, expected) {", "} else if false {"),
     ("store", "a missing blob is not reported", "Opened::Failed(errno) => {\n                    want = refused_missing();", "Opened::Failed(errno) => {\n                    want = 0;"),
-    ("store", "size miscounted", "total = total + n;", "total = total + 1;"),
+    ("store", "hash size miscounted", "crypto.sha256_update(contents(s), room[0..n]);\n                    }\n                    total = total + n;", "crypto.sha256_update(contents(s), room[0..n]);\n                    }\n                    total = total + 1;"),
+    ("store", "streamed size miscounted (it goes into a manifest)", "total = total + n;\n                            if errno != 0 {", "total = total + 1;\n                            if errno != 0 {"),
     ("store", "the last byte of each read is not hashed", "crypto.sha256_update(contents(s), room[0..n]);", "crypto.sha256_update(contents(s), room[0..n - 1]);"),
     ("store", "the write is not hashed", "        borrow mut state as &!s in {\n            crypto.sha256_update(contents(s), bytes);\n        }", "        borrow mut state as &!s in {\n            crypto.sha256_update(contents(s), bytes[0..0]);\n        }"),
     ("digest", "hex written in upper case", "return 'a' + n - 10;", "return 'A' + n - 10;"),
@@ -58,6 +60,16 @@ def main():
                 continue
             r = subprocess.run([sys.executable, str(ROOT / "scripts/store_diff.py"), "--probe", str(probe)], capture_output=True, text=True)
             killed = r.returncode != 0
+            if not killed and which == "store":
+                # The image gate also depends on the store (a manifest records each blob's size), so a store
+                # mutant may be caught there rather than here.
+                img = m / "image-probe"
+                bi = subprocess.run(["cancho", "build", str(paths["digest"]), str(paths["store"]), str(ROOT / "src/image/image.cho"),
+                                     str(ROOT / "tests/probe/image/main.cho"), "--std", "-o", str(img)], capture_output=True, text=True)
+                if bi.returncode == 0:
+                    ri = subprocess.run([sys.executable, str(ROOT / "scripts/image_check.py"), "--cases", "12", "--probe", str(img)],
+                                        capture_output=True, text=True)
+                    killed = ri.returncode != 0
             if not killed and which == "digest":
                 t = subprocess.run(["cancho", "test", str(paths["digest"]), str(ROOT / "tests/digest_test.cho"), "--std"],
                                    capture_output=True, text=True)
