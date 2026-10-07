@@ -1,0 +1,46 @@
+edition 7;
+
+import oci.digest;
+import oci.image;
+import std.test;
+
+// The pure parts of `oci.image`. The JSON builders need a heap, which a
+// `fn test_*` cannot be handed, so they are judged by scripts/image_check.py
+// (schemas, an independent byte-level model, determinism) instead.
+
+fn test_the_platforms_v1_builds_for() -> [] int {
+    test.assert(image.arch_ok("amd64"));
+    test.assert(image.arch_ok("arm64"));
+    test.assert(image.arch_ok("riscv64"));
+    test.assert(!image.arch_ok("arm"));
+    test.assert(!image.arch_ok("x86_64"));
+    test.assert(!image.arch_ok("AMD64"));
+    test.assert(!image.arch_ok(""));
+    test.assert(image.os_ok("linux"));
+    test.assert(!image.os_ok("windows"));
+    test.assert(!image.os_ok("Linux"));
+    return 0;
+}
+
+fn test_the_layout_marker_and_media_types() -> [] int {
+    test.assert(digest.equal(image.layout_text(), "{\"imageLayoutVersion\":\"1.0.0\"}"));
+    test.assert(digest.equal(image.media_manifest(), "application/vnd.oci.image.manifest.v1+json"));
+    test.assert(digest.equal(image.media_config(), "application/vnd.oci.image.config.v1+json"));
+    test.assert(digest.equal(image.media_index(), "application/vnd.oci.image.index.v1+json"));
+    test.assert(digest.equal(image.media_layer(), "application/vnd.oci.image.layer.v1.tar"));
+    return 0;
+}
+
+fn test_every_rule_has_a_tag() -> [] int {
+    test.assert(digest.equal(image.rule_name(image.refused_arch()), "image-arch"));
+    test.assert(digest.equal(image.rule_name(image.refused_os()), "image-os"));
+    test.assert(digest.equal(image.rule_name(image.refused_text()), "image-text"));
+    test.assert(digest.equal(image.rule_name(image.refused_env()), "image-env"));
+    test.assert(digest.equal(image.rule_name(image.refused_label()), "image-label"));
+    test.assert(digest.equal(image.rule_name(image.refused_port()), "image-port"));
+    test.assert(digest.equal(image.rule_name(image.refused_ref()), "image-ref"));
+    test.assert(digest.equal(image.rule_name(0), "ok"));
+    // A digest refusal passes through under its own tag.
+    test.assert(digest.equal(image.rule_name(digest.refused_hex()), "digest-hex"));
+    return 0;
+}

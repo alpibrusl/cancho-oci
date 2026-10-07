@@ -62,6 +62,7 @@ Out, each with a decision record in #18: a container runtime, a Dockerfile inter
 | HTTP request and response, TLS, X.509 | packages | `packages/http-request`, `packages/tls`, `packages/x509` |
 | **tar** | **does not exist** | searched `std/`, `packages/`: no match |
 | **DEFLATE / gzip** | **does not exist** | searched `std/`, `packages/`, `docs/`: only an incidental mention in `docs/wasm.md` |
+| Create a directory | **does not exist** (no `mkdir` among the `dir_*` or `fs_*` builtins; the layout skeleton is the caller's) | `docs/directory-handles.md`, the builtin list in `examples/selfhost/tables.cho` |
 | Read a file's mode / ELF header | **not checked** | an ELF parser is plain byte code; the file-mode read is a question for #3 |
 
 A file written through `fs_write` gets mode `0644` (`docs/filesystem.md`), which does not matter here: modes in a layer are **decided by the builder**, not read from disk (5.3).
@@ -123,6 +124,28 @@ What building it found:
 
 Not tested, and said so: a failing `fsync` or a failing `write` cannot be provoked from outside, so those branches need fault injection; the syscall order is observed on Linux only.
 
+**Built and measured (task #5, `src/image/image.cho`).** `oci.image` writes the config, manifest, index and `oci-layout` as pure functions of their arguments: a fixed key order (the order of the calls), no whitespace, integers only, no `created` field. Lists reach it as one text, one item per line; a control character, an empty item, a bad `NAME=value`, a bad port, a repeated label name or port, an architecture other than `amd64`/`arm64`/`riscv64` and an OS other than `linux` are each refused with a rule tag. The gate (`scripts/image_check.py`, 1,417 checks over 80 random layouts, two seeds in CI):
+
+- every document validates against the **official OCI image-spec v1.1.0 JSON Schemas**, vendored under `schemas/` (Apache-2.0);
+- the chain is consistent: index to manifest to config and layer, each digest and size equal to the blob's own sha256 and length, `diff_ids` equal to the digest of the layer, and the store holds exactly those three blobs;
+- the bytes equal what Python's `json.dumps(model, separators=(",", ":"), ensure_ascii=False)` writes for an independently built model, including Unicode and quote and backslash escaping;
+- building twice in different directories gives identical files, and rebuilding in place replaces `index.json` atomically and changes nothing;
+- `skopeo inspect` and `skopeo copy` (which re-verifies every digest) accept it, and `crane push` sends it to an in-memory registry (`crane registry serve`) where `crane validate --remote` accepts it and the registry's manifest digest equals the one we computed (CI; neither tool is installed on the Mac this was written on, so their first run is the Linux CI);
+- 20 of 20 mutants killed (`scripts/image_mutants.py`).
+
+What building it found:
+
+1. **A real bug, caught by the byte-level model and by nothing else.** Two identical ports produced `{"1/udp":{},"1/udp":{}}`, a JSON object with a duplicate key. The schema validator accepted it (a parsed object silently drops the repeat) but readers disagree about such JSON. A repeated port or label name is now refused (`image-port`, `image-label`).
+2. **cancho has no `mkdir`.** The `dir_*` builtins open, create files, rename, remove and sync, but nothing creates a directory, so `<image>/blobs/sha256` must exist before the tool runs (`refused: layout-skeleton` otherwise). `build` (#7) will need either that precondition, documented, or an upstream `dir_mkdir`. This is a gap to fix in cancho, not to work around with foreign code, which would make the authority report unbounded.
+3. **cancho binaries are dynamic by default** (linked to libc only); a static one builds with a linker wrapper that adds `-static` (1.2 MB, "not a dynamic executable", per cancho's `docs/package-system.md`). The end-to-end gate of #7 builds `cancho-hooks` that way, because a `scratch` image has no libc.
+4. **Owning a `File` discharges `file_write`** (and `dir_*` writes need `dir_write`): the compiler refused my first row for `write_file` as "declared but never performed". Rows are exact in both directions.
+5. **`write_file` does not mint a heap**: the helper took a `Heap` it never used, which the compiler also refused; removing it made the function's authority smaller, not larger.
+
+6. **`crane` cannot validate an uncompressed layer.** `crane validate --remote` opens each layer and assumes gzip, so our uncompressed `application/vnd.oci.image.layer.v1.tar` (which the spec allows and `skopeo` accepts) fails with `validating layers: gzip: invalid header`, while `--fast` (manifest, config and digest chain) passes and the registry reports our manifest digest unchanged. It is a limitation of that tool, but the most widely used one: **gzip is therefore not optional for v1** (#6), and design 5.6's "likely in v1" is now "in v1". The gate accepts exactly that message and no other, so it flips on its own when #6 lands.
+7. **`crane validate --path` does not exist** (my memory of its flags was wrong; its docs say `--remote` and `--tarball`). `crane push PATH IMAGE` is what reads an OCI layout directory, so the check became a push to an in-memory registry followed by a remote validation: a stronger test than the one I first wrote, and a rehearsal of #9's round trip.
+
+Not done, and said so: one layer only; no `created` time, no `author`, no `architecture` variants (design 5.4); the `docker load` and `podman` checks are task #7's, where a runnable binary exists.
+
 ### 5.4 The static-binary check, and architecture
 
 `build` reads the input binary's **ELF header** and program headers (plain byte parsing, no foreign code) and refuses a dynamic binary: a `PT_INTERP` or a `DT_NEEDED` entry means it would need libraries a `scratch` image does not have, and the refusal names them. `e_machine` gives the architecture (`x86-64` is `amd64`, `AArch64` is `arm64`, `RISC-V` is `riscv64`), so a binary that does not match `--platform` is refused. The builder is **architecture-independent**: it can package any ELF it can read, not only what cancho compiles to. cancho's compiler reaches `aarch64`, `riscv64` and `x64` (`docs/backend-limits.md` §1.3); a 32-bit ARM binary from another toolchain needs a variant (`v6`/`v7`) that is not in `e_machine`, so v1 refuses it unless `--variant` is given. Edge and IoT gateways are mostly `arm64` or `riscv64`, so multi-architecture (#8) is first-class, not an afterthought.
@@ -140,7 +163,7 @@ A non-root user needs a numeric `User` in the config (`65532`, say); an `/etc/pa
 
 ### 5.6 Compression
 
-`std` has no DEFLATE. Uncompressed layers are valid OCI (`application/vnd.oci.image.layer.v1.tar`), so **M1 ships uncompressed** and everything else (G1, G2, signatures, push) can be built and measured without a compressor. A DEFLATE encoder is a separate, gated task (#6): stored blocks first (trivially correct, no size gain, needed for the gzip framing), then fixed Huffman, then dynamic only if measured size justifies it, always deterministic (no timestamp in the gzip header, fixed OS byte). Size matters for the intended edge targets, where bandwidth is the constraint, so #6 is **likely in v1, not optional**, but it must not block the core. Its gate states the loss against `gzip -9` and `zopfli` plainly; a first encoder will lose.
+`std` has no DEFLATE. Uncompressed layers are valid OCI (`application/vnd.oci.image.layer.v1.tar`), so **M1 ships uncompressed** and everything else (G1, G2, signatures, push) can be built and measured without a compressor. A DEFLATE encoder is a separate, gated task (#6): stored blocks first (trivially correct, no size gain, needed for the gzip framing), then fixed Huffman, then dynamic only if measured size justifies it, always deterministic (no timestamp in the gzip header, fixed OS byte). Size matters for the intended edge targets, where bandwidth is the constraint, and `crane` rejects uncompressed layers in a full validation (5.3, task #5), so #6 is **in v1, not optional**, but it must not block the core. Its gate states the loss against `gzip -9` and `zopfli` plainly; a first encoder will lose.
 
 ### 5.7 Registry client (from memory of the Distribution spec 1.1, re-read in #9)
 

@@ -1,0 +1,7 @@
+These JSON Schemas are copied unchanged from the Open Container Initiative image-spec,
+tag v1.1.0 (commit e7f7c0ca69b21688c3cea7c87a04e4503e6099e2), directory `schema/`:
+https://github.com/opencontainers/image-spec
+
+They are licensed under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0). They are used only as the test oracle
+of scripts/image_check.py; nothing in the compiled programs depends on them.

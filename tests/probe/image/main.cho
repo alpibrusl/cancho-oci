@@ -1,0 +1,230 @@
+edition 7;
+
+import std.buffer;
+import std.io;
+import oci.digest;
+import oci.image;
+import oci.store;
+
+// image-probe: the test harness for `oci.image` (#5). It assembles an OCI image
+// layout the way `build` (#7) will, from a layer that already exists:
+//
+//     image-probe <image-dir> <layer-dir> <layer-name> <arch> <os> <ref>
+//                 <entrypoint> <cmd> <env> <user> <workdir> <labels> <ports>
+//
+// The last seven are the config's fields, one item per line (empty = absent).
+// `<image-dir>` must already hold `blobs/sha256/`: cancho has no `mkdir` yet
+// (docs/design.md 5.3), so the skeleton is made by the caller. Prints the
+// manifest digest. A refusal is `refused: <rule tag>` on stderr and exit 1.
+//
+// argv: 1 image-dir, 2 layer-dir, 3 layer-name, 4 arch, 5 os, 6 ref,
+//       7 entrypoint, 8 cmd, 9 env, 10 user, 11 workdir, 12 labels, 13 ports.
+
+fn rule_of(code: int) -> [] &static [byte] {
+    if code <= 0 - 200 {
+        return image.rule_name(code);
+    }
+    return store.rule_name(code);
+}
+
+fn refuse[&i](io: &!i Io, code: int) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, rule_of(code));
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// Put `bytes` in the store; its "sha256:<hex>" text goes to `text` (71 bytes).
+fn keep[&h, &d, &b, &t](heap: &!h Heap, blobs: &d Dir, bytes: &b [byte], text: &!t [byte]) -> [heap, dir_write, file_write] int {
+    var code = 0;
+    region a {
+        let raw = alloc_slice[a](32, byte_of(0));
+        code = store.put(heap, blobs, ".incoming-0", bytes, raw);
+        if code > 0 {
+            digest.text_into(raw, text);
+            code = 0;
+        }
+    }
+    return code;
+}
+
+fn assemble[&h, &d, &b, &l, &g](heap: &!h Heap, image_dir: &d Dir, blobs: &b Dir, layer: &!l File, args: &g Args) -> [heap, args, dir_write, file_write, file_read] int {
+    let layer_text = box_slice(heap, 71, byte_of(0));
+    let config_text = box_slice(heap, 71, byte_of(0));
+    let manifest_text = box_slice(heap, 71, byte_of(0));
+    var code = 0;
+    var layer_size = 0;
+    var config_size = 0;
+    var manifest_size = 0;
+
+    borrow mut layer_text as &!lw in {
+        region a {
+            let raw = alloc_slice[a](32, byte_of(0));
+            let (outcome, size) = store.put_stream(heap, blobs, layer, ".incoming-1", raw);
+            if outcome > 0 {
+                digest.text_into(raw, contents(lw));
+                layer_size = size;
+            } else {
+                code = outcome;
+            }
+        }
+    }
+
+    if code == 0 {
+        borrow layer_text as &lr in {
+            let (config, c1) = image.config_json(heap, arg(args, 4), arg(args, 5), arg(args, 7), arg(args, 8), arg(args, 9), arg(args, 10), arg(args, 11), arg(args, 12), arg(args, 13), contents(lr));
+            code = c1;
+            if code == 0 {
+                borrow config as &cb in {
+                    config_size = buffer.size(cb);
+                    borrow mut config_text as &!cw in {
+                        code = keep(heap, blobs, buffer.bytes(cb), contents(cw));
+                    }
+                }
+            }
+            buffer.drop(heap, config);
+        }
+    }
+
+    if code == 0 {
+        borrow layer_text as &lr in {
+            borrow config_text as &cr in {
+                let (manifest, c2) = image.manifest_json(heap, contents(cr), config_size, contents(lr), layer_size);
+                code = c2;
+                if code == 0 {
+                    borrow manifest as &mb in {
+                        manifest_size = buffer.size(mb);
+                        borrow mut manifest_text as &!mw in {
+                            code = keep(heap, blobs, buffer.bytes(mb), contents(mw));
+                        }
+                    }
+                }
+                buffer.drop(heap, manifest);
+            }
+        }
+    }
+
+    if code == 0 {
+        borrow manifest_text as &mr in {
+            let (index, c3) = image.index_json(heap, contents(mr), manifest_size, arg(args, 4), arg(args, 5), arg(args, 6));
+            code = c3;
+            if code == 0 {
+                borrow index as &xb in {
+                    if image.write_file(image_dir, "index.json", buffer.bytes(xb)) != 0 {
+                        code = store.refused_io();
+                    }
+                }
+                if code == 0 && image.write_file(image_dir, "oci-layout", image.layout_text()) != 0 {
+                    code = store.refused_io();
+                }
+            }
+            buffer.drop(heap, index);
+        }
+    }
+    unbox_slice(heap, layer_text);
+    unbox_slice(heap, config_text);
+    unbox_slice(heap, manifest_text);
+    return code;
+}
+
+fn with_layer[&h, &f, &i, &g, &d, &b](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args, image_dir: &d Dir, blobs: &b Dir) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var status = 1;
+    match open_dir(fs, arg(args, 2)) {
+        DirOpened::Failed(errno) => {
+            io.error_all(io, "refused: dir-open\n");
+        }
+        DirOpened::Ok(layer_root) => {
+            var root = layer_root;
+            borrow root as &lr in {
+                match dir_open_read(lr, arg(args, 3)) {
+                    Opened::Failed(errno) => {
+                        status = refuse(io, store.refused_missing());
+                    }
+                    Opened::Ok(file) => {
+                        var layer = file;
+                        var code = 0;
+                        borrow mut layer as &!lf in {
+                            code = assemble(heap, image_dir, blobs, lf, args);
+                        }
+                        file_close(layer);
+                        if code == 0 {
+                            io.write_all(io, "ok\n");
+                            status = 0;
+                        } else {
+                            status = refuse(io, code);
+                        }
+                    }
+                }
+            }
+            dir_close(root);
+        }
+    }
+    return status;
+}
+
+fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    var status = 1;
+    match open_dir(fs, arg(args, 1)) {
+        DirOpened::Failed(errno) => {
+            io.error_all(io, "refused: dir-open\n");
+        }
+        DirOpened::Ok(top) => {
+            var image_dir = top;
+            borrow image_dir as &id in {
+                match dir_enter(id, "blobs") {
+                    DirOpened::Failed(errno) => {
+                        io.error_all(io, "refused: layout-skeleton (create <image-dir>/blobs/sha256 first)\n");
+                    }
+                    DirOpened::Ok(blobs_dir) => {
+                        var blobs = blobs_dir;
+                        borrow blobs as &bd in {
+                            match dir_enter(bd, "sha256") {
+                                DirOpened::Failed(errno) => {
+                                    io.error_all(io, "refused: layout-skeleton (create <image-dir>/blobs/sha256 first)\n");
+                                }
+                                DirOpened::Ok(sha_dir) => {
+                                    var sha = sha_dir;
+                                    borrow sha as &sd in {
+                                        status = with_layer(heap, fs, io, args, id, sd);
+                                    }
+                                    dir_close(sha);
+                                }
+                            }
+                        }
+                        dir_close(blobs);
+                    }
+                }
+            }
+            dir_close(image_dir);
+        }
+    }
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow fs as &f in {
+                borrow mut io as &!i in {
+                    if arg_count(g) != 14 {
+                        io.error_all(i, "usage: image-probe <image-dir> <layer-dir> <layer-name> <arch> <os> <ref> <entrypoint> <cmd> <env> <user> <workdir> <labels> <ports>\n");
+                    } else {
+                        status = run(h, f, i, g);
+                    }
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(fs);
+    release(io);
+    return status;
+}
