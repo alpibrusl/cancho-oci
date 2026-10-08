@@ -1,0 +1,358 @@
+edition 7;
+
+import std.buffer;
+import std.ed25519;
+import std.io;
+import std.json;
+import oci.digest;
+import oci.image;
+import oci.layout;
+import oci.sign;
+
+// oci-sign: sign an image's manifest digest with Ed25519, and check such a signature with no network at all (design 5.8,
+// task #12). Three modes:
+//
+//     oci-sign pubkey --seed-file <file>
+//     oci-sign sign   --seed-file <file> (--image <layout> | --digest sha256:<hex>) --out-dir <dir>
+//     oci-sign verify --pub-file <file>  (--image <layout> | --digest sha256:<hex>) --sig <file>
+//
+// A seed file holds 64 lower-case hex characters (32 random bytes: `openssl rand -hex 32`), a public key file 64 hex
+// characters (what `pubkey` prints). `--image` takes the digest from the layout's one `index.json` entry. `sign` writes
+// `<out-dir>/sha256-<hex>.sig.json` and prints what it signed; `verify` prints `verified <digest> by <key id>`.
+// A refusal is `refused: <rule tag>` on stderr and exit status 1; nothing is written on a refusal.
+
+fn sg_flag() -> [] int {
+    return 0 - 1001;
+}
+
+fn sg_missing() -> [] int {
+    return 0 - 1002;
+}
+
+fn sg_mode() -> [] int {
+    return 0 - 1003;
+}
+
+fn sg_key() -> [] int {
+    return 0 - 1004;
+}
+
+fn sg_image() -> [] int {
+    return 0 - 1005;
+}
+
+fn sg_io() -> [] int {
+    return 0 - 1006;
+}
+
+fn sg_sigfile() -> [] int {
+    return 0 - 1007;
+}
+
+fn rule_of(code: int) -> [] &static [byte] {
+    if code == sg_flag() {
+        return "sign-flag";
+    }
+    if code == sg_missing() {
+        return "sign-missing";
+    }
+    if code == sg_mode() {
+        return "sign-mode";
+    }
+    if code == sg_key() {
+        return "sign-key-file";
+    }
+    if code == sg_image() {
+        return "sign-image";
+    }
+    if code == sg_io() {
+        return "sign-io";
+    }
+    if code == sg_sigfile() {
+        return "sign-signature-file";
+    }
+    if code <= 0 - 600 && code > 0 - 700 {
+        return layout.rule_name(code);
+    }
+    return sign.rule_name(code);
+}
+
+fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, rule_of(code));
+    if len(culprit) > 0 {
+        io.error_all(io, " (");
+        io.error_all(io, culprit);
+        io.error_all(io, ")");
+    }
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// A key file: `2 * len(raw)` lower-case hex characters, then optionally line ends. 0, or `sg_key`.
+fn read_key[&f, &p, &o](fs: &f Fs(""), path: &p [byte], raw: &!o [byte]) -> [fs_read("")] int {
+    var code = sg_key();
+    region a {
+        let text = alloc_slice[a](130, byte_of(0));
+        let n = fs_read(fs, path, text);
+        if n > 0 {
+            var end = n;
+            while end > 0 && (int_of(text[end - 1]) == '\n' || int_of(text[end - 1]) == '\r') {
+                end = end - 1;
+            }
+            if end == 2 * len(raw) && sign.raw_of_hex(text[0..end], raw) == 0 {
+                code = 0;
+            }
+        }
+        var k = 0;
+        while k < len(text) {
+            text[k] = byte_of(0);
+            k = k + 1;
+        }
+    }
+    return code;
+}
+
+// The manifest digest named by a layout's one `index.json` entry, into `out` (71 bytes).
+fn layout_digest[&h, &f, &p, &o](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], out: &!o [byte]) -> [heap, fs_read(""), dir_read, file_read] int {
+    var code = sg_image();
+    match open_dir(fs, path) {
+        DirOpened::Failed(errno) => {
+            code = sg_image();
+        }
+        DirOpened::Ok(top) => {
+            var dir = top;
+            borrow dir as &dr in {
+                let (doc, c0) = layout.read_file(heap, dr, "index.json", layout.max_document());
+                code = c0;
+                if code == 0 {
+                    borrow doc as &db in {
+                        let src = buffer.bytes(db);
+                        region a {
+                            let tape = alloc_slice[a](layout.tape_ints(src), 0);
+                            if json.parse(src, tape) < 0 {
+                                code = layout.refused_json();
+                            } else {
+                                let manifests = json.get(src, tape, 0, "manifests");
+                                if manifests < 0 || !json.is_array(tape, manifests) || json.count(tape, manifests) != 1 {
+                                    code = sg_image();
+                                } else {
+                                    let text = layout.text_of(src, tape, json.at(tape, manifests, 0), "digest");
+                                    if len(text) != 71 || !sign.digest_ok(text) {
+                                        code = sg_image();
+                                    } else {
+                                        var k = 0;
+                                        while k < 71 {
+                                            out[k] = text[k];
+                                            k = k + 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                buffer.drop(heap, doc);
+            }
+            dir_close(dir);
+        }
+    }
+    return code;
+}
+
+fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, io_write, err_write] int {
+    if arg_count(args) < 2 {
+        return refuse(io, sg_mode(), "pubkey, sign or verify");
+    }
+    let mode = arg(args, 1);
+    if !(digest.equal(mode, "pubkey") || digest.equal(mode, "sign") || digest.equal(mode, "verify")) {
+        return refuse(io, sg_mode(), mode);
+    }
+    var seed_file = "";
+    var pub_file = "";
+    var image_path = "";
+    var digest_text = "";
+    var out_dir = "";
+    var sig_file = "";
+    var bad = "";
+    var at = 2;
+    while at < arg_count(args) && len(bad) == 0 {
+        let flag = arg(args, at);
+        if at + 1 >= arg_count(args) {
+            bad = flag;
+        } else {
+            let value = arg(args, at + 1);
+            if digest.equal(flag, "--seed-file") {
+                seed_file = value;
+            } else if digest.equal(flag, "--pub-file") {
+                pub_file = value;
+            } else if digest.equal(flag, "--image") {
+                image_path = value;
+            } else if digest.equal(flag, "--digest") {
+                digest_text = value;
+            } else if digest.equal(flag, "--out-dir") {
+                out_dir = value;
+            } else if digest.equal(flag, "--sig") {
+                sig_file = value;
+            } else {
+                bad = flag;
+            }
+            at = at + 2;
+        }
+    }
+    if len(bad) > 0 {
+        return refuse(io, sg_flag(), bad);
+    }
+    var status = 1;
+    region w {
+        let seed = alloc_slice[w](32, byte_of(0));
+        let pk = alloc_slice[w](32, byte_of(0));
+        let subject = alloc_slice[w](71, byte_of(0));
+        let hexbuf = alloc_slice[w](64, byte_of(0));
+        if digest.equal(mode, "pubkey") {
+            if len(seed_file) == 0 {
+                status = refuse(io, sg_missing(), "--seed-file");
+            } else if read_key(fs, seed_file, seed) != 0 {
+                status = refuse(io, sg_key(), seed_file);
+            } else {
+                ed25519.public_key_from_seed(seed, pk);
+                sign.hex_of_raw(pk, hexbuf);
+                io.write_all(io, hexbuf);
+                io.write_all(io, "\n");
+                status = 0;
+            }
+        } else {
+            // the subject digest, from the command line or the layout
+            var have = 0;
+            var code = 0;
+            if len(digest_text) > 0 && len(image_path) > 0 {
+                code = sg_flag();
+            } else if len(digest_text) > 0 {
+                if len(digest_text) != 71 {
+                    code = sign.refused_digest_text();
+                } else {
+                    var k = 0;
+                    while k < 71 {
+                        subject[k] = digest_text[k];
+                        k = k + 1;
+                    }
+                    have = 1;
+                }
+            } else if len(image_path) > 0 {
+                code = layout_digest(heap, fs, image_path, subject);
+                if code == 0 {
+                    have = 1;
+                }
+            } else {
+                code = sg_missing();
+            }
+            if code != 0 {
+                var culprit = "--image or --digest";
+                if code == sg_flag() {
+                    culprit = "--image and --digest are alternatives";
+                } else if code == sign.refused_digest_text() {
+                    culprit = digest_text;
+                } else if code != sg_missing() {
+                    culprit = image_path;
+                }
+                status = refuse(io, code, culprit);
+            } else if digest.equal(mode, "sign") {
+                if len(seed_file) == 0 || len(out_dir) == 0 {
+                    status = refuse(io, sg_missing(), "--seed-file and --out-dir");
+                } else if read_key(fs, seed_file, seed) != 0 {
+                    status = refuse(io, sg_key(), seed_file);
+                } else {
+                    let (doc, c) = sign.sign_document(heap, subject, seed);
+                    if c != 0 {
+                        status = refuse(io, c, subject);
+                    } else {
+                        match open_dir(fs, out_dir) {
+                            DirOpened::Failed(errno) => {
+                                status = refuse(io, sg_io(), out_dir);
+                            }
+                            DirOpened::Ok(top) => {
+                                var dir = top;
+                                var name = buffer.empty(heap, 96);
+                                name = buffer.append(heap, name, "sha256-");
+                                name = buffer.append(heap, name, subject[7..71]);
+                                name = buffer.append(heap, name, ".sig.json");
+                                borrow dir as &dr in {
+                                    borrow doc as &db in {
+                                        borrow name as &nb in {
+                                            if image.write_file(dr, buffer.bytes(nb), buffer.bytes(db)) != 0 {
+                                                status = refuse(io, sg_io(), out_dir);
+                                            } else {
+                                                io.write_all(io, "signed ");
+                                                io.write_all(io, subject);
+                                                io.write_all(io, " as ");
+                                                io.write_all(io, buffer.bytes(nb));
+                                                io.write_all(io, "\n");
+                                                status = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                                buffer.drop(heap, name);
+                                dir_close(dir);
+                            }
+                        }
+                    }
+                    buffer.drop(heap, doc);
+                }
+            } else if len(pub_file) == 0 || len(sig_file) == 0 {
+                status = refuse(io, sg_missing(), "--pub-file and --sig");
+            } else if read_key(fs, pub_file, pk) != 0 {
+                status = refuse(io, sg_key(), pub_file);
+            } else {
+                let doc = alloc_slice[w](sign.max_document() + 1, byte_of(0));
+                let n = fs_read(fs, sig_file, doc);
+                if n <= 0 || n > sign.max_document() {
+                    status = refuse(io, sg_sigfile(), sig_file);
+                } else {
+                    let c = sign.check_document(doc[0..n], subject, pk);
+                    if c != 0 {
+                        status = refuse(io, c, sig_file);
+                    } else {
+                        sign.keyid_into(pk, hexbuf);
+                        io.write_all(io, "verified ");
+                        io.write_all(io, subject);
+                        io.write_all(io, " by ");
+                        io.write_all(io, hexbuf);
+                        io.write_all(io, "\n");
+                        status = 0;
+                    }
+                }
+            }
+        }
+        var z = 0;
+        while z < 32 {
+            seed[z] = byte_of(0);
+            z = z + 1;
+        }
+    }
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow fs as &f in {
+                borrow mut io as &!i in {
+                    status = run(h, f, i, g);
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(fs);
+    release(io);
+    return status;
+}
