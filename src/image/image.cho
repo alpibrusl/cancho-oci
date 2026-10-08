@@ -118,6 +118,15 @@ pub fn static_media[&m](media: &m [byte]) -> [] &static [byte] {
     return media_manifest();
 }
 
+// The empty descriptor an artifact manifest uses for its config (OCI image-spec 1.1): the two bytes `{}`.
+pub fn media_empty() -> [] &static [byte] {
+    return "application/vnd.oci.empty.v1+json";
+}
+
+pub fn empty_digest() -> [] &static [byte] {
+    return "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+}
+
 pub fn media_config() -> [] &static [byte] {
     return "application/vnd.oci.image.config.v1+json";
 }
@@ -320,6 +329,53 @@ fn put_descriptor[&h, &m, &d](heap: &!h Heap, w: json.Writer, media: &m [byte], 
     out = json.put_key(heap, out, "size");
     out = json.put_int(heap, out, size);
     return json.end_object(heap, out);
+}
+
+// Is `text` a media type this tool writes into an artifact: `type/subtype`, printable ASCII, no space, at most 127 bytes?
+pub fn artifact_type_ok[&t](text: &t [byte]) -> [] bool {
+    if len(text) < 3 || len(text) > 127 {
+        return false;
+    }
+    var slashes = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c <= 32 || c >= 127 || c == '"' || c == '\\' {
+            return false;
+        }
+        if c == '/' {
+            slashes = slashes + 1;
+        }
+        k = k + 1;
+    }
+    return slashes == 1 && int_of(text[0]) != '/' && int_of(text[len(text) - 1]) != '/';
+}
+
+// An artifact manifest (OCI image-spec 1.1): `blob` of type `artifact_type` attached to the manifest `subject`, so a
+// registry can list it among the subject's referrers. The config is the empty descriptor. The caller checks that the subject is
+// a manifest or an index (`is_manifest`, `is_index`).
+pub fn artifact_manifest_json[&h, &t, &b, &m, &s](heap: &!h Heap, artifact_type: &t [byte], blob_digest: &b [byte], blob_size: int, subject_media: &m [byte], subject_digest: &s [byte], subject_size: int) -> [heap] (buffer.Buffer, int) {
+    if !artifact_type_ok(artifact_type) || !digest_ok(blob_digest) || !digest_ok(subject_digest) || blob_size < 0 || subject_size < 0 {
+        return (buffer.empty(heap, 1), refused_text());
+    }
+    var w1 = json.writer(heap, 640);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "schemaVersion");
+    w1 = json.put_int(heap, w1, 2);
+    w1 = json.put_key(heap, w1, "mediaType");
+    w1 = json.put_string(heap, w1, media_manifest());
+    w1 = json.put_key(heap, w1, "artifactType");
+    w1 = json.put_string(heap, w1, artifact_type);
+    w1 = json.put_key(heap, w1, "config");
+    w1 = put_descriptor(heap, w1, media_empty(), empty_digest(), 2);
+    w1 = json.put_key(heap, w1, "layers");
+    w1 = json.begin_array(heap, w1);
+    w1 = put_descriptor(heap, w1, artifact_type, blob_digest, blob_size);
+    w1 = json.end_array(heap, w1);
+    w1 = json.put_key(heap, w1, "subject");
+    w1 = put_descriptor(heap, w1, subject_media, subject_digest, subject_size);
+    w1 = json.end_object(heap, w1);
+    return (json.finish(w1), 0);
 }
 
 // The image config for one layer whose uncompressed digest is `diff_id`.

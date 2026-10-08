@@ -148,6 +148,14 @@ jobs:
         working-directory: oci
         run: python3 scripts/sbom_mutants.py --jobs 4
 
+      - name: oci-ref -- signatures and SBOMs attached to an image, listed and fetched, with and without the referrers API
+        working-directory: oci
+        run: python3 scripts/ref_check.py
+
+      - name: oci-ref's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/ref_mutants.py --jobs 4
+
       - name: G1 across machines -- every digest equals the committed golden file (also checked on macOS/arm64 in the other job)
         working-directory: oci
         run: python3 scripts/golden_check.py

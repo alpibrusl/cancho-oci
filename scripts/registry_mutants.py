@@ -31,7 +31,7 @@ MUTANTS = [
     ("registry", "a HEAD reply read for a body", "var going = has_body;", "var going = true;"),
     ("registry", "a 405 on HEAD taken as an error", "} else if s == 404 || s == 405 {", "} else if s == 404 {"),
     ("registry", "an upload Location on another host followed", "            if !same {\n                code = refused_redirect();", "            if false {\n                code = refused_redirect();"),
-    ("registry", "the digest of an uploaded blob not checked", "                            let shown = reply_digest(rr);\n                            if len(shown) > 0 && !digest.equal(shown, digest_text) {\n                                answer = refused_digest();", "                            let shown = reply_digest(rr);\n                            if false {\n                                answer = refused_digest();"),
+    ("registry", "the digest of an uploaded blob not checked", "        if len(shown) > 0 && !digest.equal(shown, digest_text) {\n            return refused_digest();\n        }\n        return 0;", "        if false {\n            return refused_digest();\n        }\n        return 0;"),
     ("registry", "the digest of a pushed manifest not checked", "                    let shown = reply_digest(rr);\n                    if len(shown) > 0 && !digest.equal(shown, digest_text) {\n                        answer = refused_digest();", "                    let shown = reply_digest(rr);\n                    if false {\n                        answer = refused_digest();"),
     ("registry", "a bearer challenge read as a plain 401", '&& digest.equal(buffer.bytes(reply.challenge)[0..6], "Bearer") {', "&& false {"),
     ("registry", "a repeated separator in a name accepted", "if sep && prev_sep {", "if false {"),

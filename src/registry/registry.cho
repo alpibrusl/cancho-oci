@@ -137,6 +137,9 @@ pub fn rule_name(code: int) -> [] &static [byte] {
     if code == refused_realm() {
         return "registry-token-realm";
     }
+    if code == refused_referrers() {
+        return "registry-referrers-unreadable";
+    }
     return http.rule_name(code);
 }
 
@@ -626,9 +629,9 @@ pub fn upload_target[&h, &l, &t, &d](heap: &!h Heap, location: &l [byte], host: 
     return (path, 0);
 }
 
-// Upload the blob in `file` (exactly `size` bytes, named `digest_text`): POST for a session,
-// then one PUT of the whole body to the session's `Location`. 0, or a refusal.
-pub fn blob_upload[&h, &n, &t, &a, &r, &d, &f, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, file: &!f File) -> [heap, net_out(""), conn_read, conn_write, file_read] int {
+// Open an upload session: POST, and the path (with the digest appended) its `Location` names, which must stay on this host.
+// The path and 0, or an empty buffer and a refusal.
+fn upload_session[&h, &n, &t, &a, &r, &d, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte]) -> [heap, net_out(""), conn_read, conn_write] (buffer.Buffer, int) {
     var answer = 0;
     var opened = api_path(heap, repo, "blobs", "uploads/");
     var location = buffer.empty(heap, 1);
@@ -648,40 +651,71 @@ pub fn blob_upload[&h, &n, &t, &a, &r, &d, &f, &tl](heap: &!h Heap, net: &n Net(
         drop_reply(heap, reply);
     }
     buffer.drop(heap, opened);
+    var target = buffer.empty(heap, 1);
     if answer == 0 {
-        var target = buffer.empty(heap, 1);
-        var c = 0;
         borrow location as &lb in {
             let (t2, c2) = upload_target(heap, buffer.bytes(lb), host, port, digest_text);
             buffer.drop(heap, target);
             target = t2;
-            c = c2;
+            answer = c2;
         }
-        if c != 0 {
-            answer = c;
-        } else {
-            borrow target as &tb in {
-                let (reply, code) = round_trip_file(heap, net, eng, now_ms, host, port, auth, "PUT", buffer.bytes(tb), "application/octet-stream", file, size);
-                if code != 0 {
-                    answer = code;
-                } else {
-                    borrow reply as &rr in {
-                        if reply_status(rr) == 201 || reply_status(rr) == 200 {
-                            let shown = reply_digest(rr);
-                            if len(shown) > 0 && !digest.equal(shown, digest_text) {
-                                answer = refused_digest();
-                            }
-                        } else {
-                            answer = refusal_of(rr);
-                        }
-                    }
-                }
-                drop_reply(heap, reply);
-            }
-        }
-        buffer.drop(heap, target);
     }
     buffer.drop(heap, location);
+    return (target, answer);
+}
+
+// What a finished PUT of a blob must have answered: 201 or 200, and a reported digest, if any, that is ours.
+fn upload_done[&r, &d](reply: &r Reply, digest_text: &d [byte]) -> [] int {
+    if reply_status(reply) == 201 || reply_status(reply) == 200 {
+        let shown = reply_digest(reply);
+        if len(shown) > 0 && !digest.equal(shown, digest_text) {
+            return refused_digest();
+        }
+        return 0;
+    }
+    return refusal_of(reply);
+}
+
+// Upload the blob in `file` (exactly `size` bytes, named `digest_text`): a session, then one PUT of the whole body to
+// the session's `Location`. 0, or a refusal.
+pub fn blob_upload[&h, &n, &t, &a, &r, &d, &f, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, file: &!f File) -> [heap, net_out(""), conn_read, conn_write, file_read] int {
+    let (target, answer0) = upload_session(heap, net, eng, now_ms, host, port, auth, repo, digest_text);
+    var answer = answer0;
+    if answer == 0 {
+        borrow target as &tb in {
+            let (reply, code) = round_trip_file(heap, net, eng, now_ms, host, port, auth, "PUT", buffer.bytes(tb), "application/octet-stream", file, size);
+            if code != 0 {
+                answer = code;
+            } else {
+                borrow reply as &rr in {
+                    answer = upload_done(rr, digest_text);
+                }
+            }
+            drop_reply(heap, reply);
+        }
+    }
+    buffer.drop(heap, target);
+    return answer;
+}
+
+// The same for a blob held in memory.
+pub fn blob_upload_bytes[&h, &n, &t, &a, &r, &d, &b, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], bytes: &b [byte]) -> [heap, net_out(""), conn_read, conn_write] int {
+    let (target, answer0) = upload_session(heap, net, eng, now_ms, host, port, auth, repo, digest_text);
+    var answer = answer0;
+    if answer == 0 {
+        borrow target as &tb in {
+            let (reply, code) = round_trip(heap, net, eng, now_ms, host, port, auth, "PUT", buffer.bytes(tb), "application/octet-stream", bytes);
+            if code != 0 {
+                answer = code;
+            } else {
+                borrow reply as &rr in {
+                    answer = upload_done(rr, digest_text);
+                }
+            }
+            drop_reply(heap, reply);
+        }
+    }
+    buffer.drop(heap, target);
     return answer;
 }
 
@@ -1332,4 +1366,210 @@ pub fn negotiate[&h, &n, &t, &a, &r, &tl](heap: &!h Heap, net: &n Net(""), eng: 
     buffer.drop(heap, realm_text);
     buffer.drop(heap, service_text);
     return (line, code);
+}
+
+// ---- referrers (OCI Distribution 1.1)
+
+// The list of manifests that name `subject` as their subject, as an image index document: from the referrers API
+// (`GET /v2/<name>/referrers/<digest>`, `artifactType` as a filter when `filter` is not empty), or, for a registry
+// that has none (it answers 404), from the fallback tag `sha256-<hex>` (an index this tool and others keep). A registry
+// that has neither is an empty list. The index is not filtered by the fallback: filter the descriptors you read.
+// The document and 0, or an empty buffer and a refusal.
+pub fn referrers_fetch[&h, &n, &t, &a, &r, &s, &f, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], filter: &f [byte]) -> [heap, net_out(""), conn_read, conn_write] (buffer.Buffer, int, bool) {
+    var out = buffer.empty(heap, 1);
+    var code = 0;
+    if len(subject) != 71 || !digest.equal(subject[0..7], "sha256:") {
+        return (out, refused_digest(), false);
+    }
+    var path = api_path(heap, repo, "referrers", subject);
+    if len(filter) > 0 {
+        path = buffer.append(heap, path, "?artifactType=");
+        path = query_value(heap, path, filter);
+    }
+    var found = false;
+    var extra = buffer.append(heap, buffer.empty(heap, 256), auth);
+    extra = buffer.append(heap, extra, "Accept: application/vnd.oci.image.index.v1+json\r\n");
+    borrow extra as &eb in {
+        borrow path as &pb in {
+            let (reply, c) = round_trip_get(heap, net, eng, now_ms, host, port, buffer.bytes(eb), buffer.bytes(pb), 1048576);
+            code = c;
+            if c == 0 {
+                borrow reply as &rr in {
+                    let s2 = reply_status(rr);
+                    if s2 == 200 {
+                        buffer.drop(heap, out);
+                        out = buffer.append(heap, buffer.empty(heap, len(reply_body(rr)) + 1), reply_body(rr));
+                        found = true;
+                    } else if s2 != 404 {
+                        code = refusal_of(rr);
+                    }
+                }
+            }
+            drop_reply(heap, reply);
+        }
+    }
+    buffer.drop(heap, extra);
+    buffer.drop(heap, path);
+    if code == 0 && !found {
+        // the fallback tag: sha256-<hex>
+        var tag = buffer.append(heap, buffer.empty(heap, 80), "sha256-");
+        tag = buffer.append(heap, tag, subject[7..71]);
+        region w {
+            let shown = alloc_slice[w](71, byte_of(0));
+            borrow tag as &tb in {
+                let (doc, c2) = manifest_fetch(heap, net, eng, now_ms, host, port, auth, repo, buffer.bytes(tb), shown);
+                if c2 == 0 {
+                    buffer.drop(heap, out);
+                    out = doc;
+                } else {
+                    buffer.drop(heap, doc);
+                    if c2 != refused_not_found() {
+                        code = c2;
+                    }
+                }
+            }
+        }
+        buffer.drop(heap, tag);
+        var nothing = false;
+        borrow out as &ob0 in {
+            nothing = len(buffer.bytes(ob0)) <= 1;
+        }
+        if code == 0 && nothing {
+            buffer.drop(heap, out);
+            out = buffer.append(heap, buffer.empty(heap, 96), "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[]}");
+        }
+    }
+    if code != 0 {
+        buffer.drop(heap, out);
+        return (buffer.empty(heap, 1), code, found);
+    }
+    return (out, 0, found);
+}
+
+pub fn refused_referrers() -> [] int {
+    return 0 - 917;
+}
+
+// Make `manifest` (an artifact whose subject is `subject`) findable among the subject's referrers. A registry that
+// implements the referrers API lists it by itself once the manifest is pushed; for one that does not, the fallback tag
+// `sha256-<hex>` holds an index of them, and this adds the artifact to it (read, add, write: two writers at once can lose
+// one of the entries; the spec says so too). Entries already there are copied with their `mediaType`, `digest`, `size` and
+// `artifactType`; an entry with anything else on it (annotations) is not rewritten, because that would drop the rest: it is
+// refused (`registry-referrers-unreadable`). 0, or a refusal.
+pub fn referrers_register[&h, &n, &t, &a, &r, &s, &m, &d, &y, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], manifest_digest: &m [byte], manifest_size: int, artifact_type: &y [byte]) -> [heap, net_out(""), conn_read, conn_write] int {
+    let (listed, c0, from_api) = referrers_fetch(heap, net, eng, now_ms, host, port, auth, repo, subject, "");
+    var code = c0;
+    if code == 0 && from_api {
+        // the registry keeps the list; it must be there
+        var there = false;
+        borrow listed as &lb in {
+            region a {
+                let doc = buffer.bytes(lb);
+                let tape = alloc_slice[a](layout.tape_ints(doc), 0);
+                if json.parse(doc, tape) >= 0 {
+                    let list = json.get(doc, tape, 0, "manifests");
+                    var k = 0;
+                    while list >= 0 && json.is_array(tape, list) && k < json.count(tape, list) {
+                        if digest.equal(layout.text_of(doc, tape, json.at(tape, list, k), "digest"), manifest_digest) {
+                            there = true;
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+        if !there {
+            code = refused_referrers();
+        }
+    } else if code == 0 {
+        var w1 = json.writer(heap, 512);
+        w1 = json.begin_object(heap, w1);
+        w1 = json.put_key(heap, w1, "schemaVersion");
+        w1 = json.put_int(heap, w1, 2);
+        w1 = json.put_key(heap, w1, "mediaType");
+        w1 = json.put_string(heap, w1, "application/vnd.oci.image.index.v1+json");
+        w1 = json.put_key(heap, w1, "manifests");
+        w1 = json.begin_array(heap, w1);
+        var present = false;
+        borrow listed as &lb2 in {
+            region a2 {
+                let doc = buffer.bytes(lb2);
+                let tape = alloc_slice[a2](layout.tape_ints(doc), 0);
+                if json.parse(doc, tape) < 0 {
+                    code = refused_referrers();
+                } else {
+                    let list = json.get(doc, tape, 0, "manifests");
+                    if list < 0 || !json.is_array(tape, list) {
+                        code = refused_referrers();
+                    }
+                    var k = 0;
+                    while code == 0 && k < json.count(tape, list) {
+                        let entry = json.at(tape, list, k);
+                        let em = layout.text_of(doc, tape, entry, "mediaType");
+                        let ed = layout.text_of(doc, tape, entry, "digest");
+                        let es = layout.number_of(doc, tape, entry, "size");
+                        let et = layout.text_of(doc, tape, entry, "artifactType");
+                        var members = 3;
+                        if len(et) > 0 {
+                            members = 4;
+                        }
+                        if len(em) == 0 || len(ed) != 71 || es < 0 || json.count(tape, entry) != members {
+                            code = refused_referrers();
+                        } else {
+                            if digest.equal(ed, manifest_digest) {
+                                present = true;
+                            }
+                            w1 = json.begin_object(heap, w1);
+                            w1 = json.put_key(heap, w1, "mediaType");
+                            w1 = json.put_string(heap, w1, em);
+                            w1 = json.put_key(heap, w1, "digest");
+                            w1 = json.put_string(heap, w1, ed);
+                            w1 = json.put_key(heap, w1, "size");
+                            w1 = json.put_int(heap, w1, es);
+                            if len(et) > 0 {
+                                w1 = json.put_key(heap, w1, "artifactType");
+                                w1 = json.put_string(heap, w1, et);
+                            }
+                            w1 = json.end_object(heap, w1);
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+        if code == 0 && !present {
+            w1 = json.begin_object(heap, w1);
+            w1 = json.put_key(heap, w1, "mediaType");
+            w1 = json.put_string(heap, w1, "application/vnd.oci.image.manifest.v1+json");
+            w1 = json.put_key(heap, w1, "digest");
+            w1 = json.put_string(heap, w1, manifest_digest);
+            w1 = json.put_key(heap, w1, "size");
+            w1 = json.put_int(heap, w1, manifest_size);
+            w1 = json.put_key(heap, w1, "artifactType");
+            w1 = json.put_string(heap, w1, artifact_type);
+            w1 = json.end_object(heap, w1);
+        }
+        w1 = json.end_array(heap, w1);
+        w1 = json.end_object(heap, w1);
+        let index = json.finish(w1);
+        if code == 0 {
+            var tag = buffer.append(heap, buffer.empty(heap, 80), "sha256-");
+            tag = buffer.append(heap, tag, subject[7..71]);
+            borrow tag as &tb in {
+                borrow index as &ib in {
+                    region a3 {
+                        let sum = alloc_slice[a3](32, byte_of(0));
+                        digest.of_bytes(buffer.bytes(ib), sum);
+                        let text = alloc_slice[a3](71, byte_of(0));
+                        digest.text_into(sum, text);
+                        code = manifest_put(heap, net, eng, now_ms, host, port, auth, repo, buffer.bytes(tb), "application/vnd.oci.image.index.v1+json", buffer.bytes(ib), text);
+                    }
+                }
+            }
+            buffer.drop(heap, tag);
+        }
+        buffer.drop(heap, index);
+    }
+    buffer.drop(heap, listed);
+    return code;
 }

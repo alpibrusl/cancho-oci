@@ -1,0 +1,601 @@
+edition 7;
+
+import std.buffer;
+import std.crypto;
+import std.io;
+import std.json;
+import oci.digest;
+import oci.http;
+import oci.image;
+import oci.layout;
+import oci.registry;
+import oci.secure;
+import oci.sign;
+import oci.store;
+import tls;
+
+// oci-ref: attach a file to an image in a registry as an OCI artifact, list what is attached, and fetch it (design 5.8,
+// task #12). The signature `oci-sign` writes and the SBOM `oci-sbom` writes are attached this way, so a registry holds them
+// beside the image they are about (OCI image-spec 1.1: a manifest with a `subject`, found through the referrers API, or the
+// fallback tag `sha256-<hex>` for a registry that has none).
+//
+//     oci-ref attach --registry <host[:port]> --repo <name> --subject sha256:<hex> --type <media type> --file <path>
+//     oci-ref list   --registry <host[:port]> --repo <name> --subject sha256:<hex> [--type <media type>]
+//     oci-ref fetch  --registry <host[:port]> --repo <name> --subject sha256:<hex> --type <media type> --out <layout-dir>
+//
+// All take --plain-http, --trust-file and --basic-file as oci-push does. `attach` uploads the file and the empty config,
+// pushes the artifact manifest by its digest and makes it findable; it prints the artifact's digest. `list` prints
+// `<manifest digest> <artifact type> <size>` for each. `fetch` stores the attached file of each matching artifact in
+// `<layout-dir>/blobs/sha256/<hex>` (the directory must have that skeleton), digest checked, and prints
+// `<manifest digest> <file digest>`. A refusal is `refused: <rule tag>` on stderr and exit status 1.
+
+fn rf_flag() -> [] int {
+    return 0 - 1201;
+}
+
+fn rf_missing() -> [] int {
+    return 0 - 1202;
+}
+
+fn rf_mode() -> [] int {
+    return 0 - 1203;
+}
+
+fn rf_registry() -> [] int {
+    return 0 - 1204;
+}
+
+fn rf_creds_http() -> [] int {
+    return 0 - 1205;
+}
+
+fn rf_file() -> [] int {
+    return 0 - 1206;
+}
+
+fn rf_type() -> [] int {
+    return 0 - 1207;
+}
+
+fn rf_subject() -> [] int {
+    return 0 - 1208;
+}
+
+fn rf_dir() -> [] int {
+    return 0 - 1209;
+}
+
+fn rf_document() -> [] int {
+    return 0 - 1210;
+}
+
+fn rule_of(code: int) -> [] &static [byte] {
+    if code == rf_flag() {
+        return "ref-flag";
+    }
+    if code == rf_missing() {
+        return "ref-missing";
+    }
+    if code == rf_mode() {
+        return "ref-mode";
+    }
+    if code == rf_registry() {
+        return "ref-registry";
+    }
+    if code == rf_creds_http() {
+        return "ref-credentials-over-plain-http";
+    }
+    if code == rf_file() {
+        return "ref-file";
+    }
+    if code == rf_type() {
+        return "ref-type";
+    }
+    if code == rf_subject() {
+        return "ref-subject";
+    }
+    if code == rf_dir() {
+        return "ref-layout-skeleton";
+    }
+    if code == rf_document() {
+        return "ref-document";
+    }
+    if code == secure.refused_roots() || code == secure.refused_entropy() {
+        return secure.rule_name(code);
+    }
+    if code < 0 && code > 0 - 100 {
+        return http.rule_name(code);
+    }
+    if code <= 0 - 600 && code > 0 - 700 {
+        return layout.rule_name(code);
+    }
+    if code <= 0 - 800 && code > 0 - 1000 {
+        return registry.rule_name(code);
+    }
+    if code <= 0 - 1010 && code > 0 - 1020 {
+        return sign.rule_name(code);
+    }
+    return store.rule_name(code);
+}
+
+fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, rule_of(code));
+    if len(culprit) > 0 && len(culprit) < 200 {
+        io.error_all(io, " (");
+        io.error_all(io, culprit);
+        io.error_all(io, ")");
+    }
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// The biggest file attached: a signature is under 1 KiB, an SBOM a few hundred KiB.
+fn max_file() -> [] int {
+    return 8388608;
+}
+
+// Attach `bytes` of type `atype` to `subject`: the file, the empty config, the artifact manifest, and the listing.
+fn attach[&h, &n, &t, &a, &r, &s, &y, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], bytes: &b [byte], io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, io_write] int {
+    var code = 0;
+    region w {
+        let shown = alloc_slice[w](71, byte_of(0));
+        let (doc, c0) = registry.manifest_fetch(heap, net, eng, now_ms, host, port, auth, repo, subject, shown);
+        code = c0;
+        if code == 0 {
+            borrow doc as &db in {
+                let body = buffer.bytes(db);
+                region v {
+                    let tape = alloc_slice[v](layout.tape_ints(body), 0);
+                    if json.parse(body, tape) < 0 {
+                        code = layout.refused_json();
+                    } else {
+                        let media = layout.text_of(body, tape, 0, "mediaType");
+                        if !(image.is_manifest(media) || image.is_index(media)) {
+                            code = registry.refused_media();
+                        } else {
+                            let raw = alloc_slice[v](32, byte_of(0));
+                            digest.of_bytes(bytes, raw);
+                            let blob_text = alloc_slice[v](71, byte_of(0));
+                            digest.text_into(raw, blob_text);
+                            code = registry.blob_upload_bytes(heap, net, eng, now_ms, host, port, auth, repo, blob_text, bytes);
+                            if code == 0 {
+                                code = registry.blob_upload_bytes(heap, net, eng, now_ms, host, port, auth, repo, image.empty_digest(), "{}");
+                            }
+                            if code == 0 {
+                                let (art, c1) = image.artifact_manifest_json(heap, atype, blob_text, len(bytes), media, subject, len(body));
+                                code = c1;
+                                if code == 0 {
+                                    borrow art as &ab in {
+                                        let ab_bytes = buffer.bytes(ab);
+                                        let sum = alloc_slice[v](32, byte_of(0));
+                                        digest.of_bytes(ab_bytes, sum);
+                                        let art_text = alloc_slice[v](71, byte_of(0));
+                                        digest.text_into(sum, art_text);
+                                        code = registry.manifest_put(heap, net, eng, now_ms, host, port, auth, repo, art_text, image.media_manifest(), ab_bytes, art_text);
+                                        if code == 0 {
+                                            code = registry.referrers_register(heap, net, eng, now_ms, host, port, auth, repo, subject, art_text, len(ab_bytes), atype);
+                                        }
+                                        if code == 0 {
+                                            io.write_all(io, "attached ");
+                                            io.write_all(io, art_text);
+                                            io.write_all(io, " to ");
+                                            io.write_all(io, subject);
+                                            io.write_all(io, " as ");
+                                            io.write_all(io, atype);
+                                            io.write_all(io, "\n");
+                                        }
+                                    }
+                                }
+                                buffer.drop(heap, art);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        buffer.drop(heap, doc);
+    }
+    return code;
+}
+
+// List the referrers of `subject` of type `atype` (any when empty).
+fn list_only[&h, &n, &t, &a, &r, &s, &y, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, io_write] int {
+    let (listed, c0, unused_api) = registry.referrers_fetch(heap, net, eng, now_ms, host, port, auth, repo, subject, atype);
+    var code = c0;
+    if code == 0 {
+        borrow listed as &lb in {
+            let doc = buffer.bytes(lb);
+            region a2 {
+                let tape = alloc_slice[a2](layout.tape_ints(doc), 0);
+                if json.parse(doc, tape) < 0 {
+                    code = layout.refused_json();
+                } else {
+                    let entries = json.get(doc, tape, 0, "manifests");
+                    if entries < 0 || !json.is_array(tape, entries) {
+                        code = rf_document();
+                    }
+                    var k = 0;
+                    while code == 0 && k < json.count(tape, entries) {
+                        let entry = json.at(tape, entries, k);
+                        let ed = layout.text_of(doc, tape, entry, "digest");
+                        let et = layout.text_of(doc, tape, entry, "artifactType");
+                        let es = layout.number_of(doc, tape, entry, "size");
+                        if len(ed) != 71 || es < 0 {
+                            code = rf_document();
+                        } else if len(atype) == 0 || digest.equal(et, atype) {
+                            io.write_all(io, ed);
+                            io.write_all(io, " ");
+                            io.write_all(io, et);
+                            io.write_all(io, " ");
+                            io.print_nat(io, es);
+                            io.write_all(io, "\n");
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, listed);
+    return code;
+}
+
+// Fetch the attached file of each referrer of `subject` of type `atype` into the blob store `blobs`.
+fn fetch_all[&h, &n, &t, &a, &r, &s, &y, &i, &tl, &d](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_write, file_write, io_write] int {
+    let (listed, c0, unused_api) = registry.referrers_fetch(heap, net, eng, now_ms, host, port, auth, repo, subject, atype);
+    var code = c0;
+    if code == 0 {
+        borrow listed as &lb in {
+            let doc = buffer.bytes(lb);
+            region a2 {
+                let tape = alloc_slice[a2](layout.tape_ints(doc), 0);
+                if json.parse(doc, tape) < 0 {
+                    code = layout.refused_json();
+                } else {
+                    let entries = json.get(doc, tape, 0, "manifests");
+                    if entries < 0 || !json.is_array(tape, entries) {
+                        code = rf_document();
+                    }
+                    var k = 0;
+                    while code == 0 && k < json.count(tape, entries) {
+                        let entry = json.at(tape, entries, k);
+                        let ed = layout.text_of(doc, tape, entry, "digest");
+                        let et = layout.text_of(doc, tape, entry, "artifactType");
+                        let es = layout.number_of(doc, tape, entry, "size");
+                        if len(ed) != 71 || es < 0 {
+                            code = rf_document();
+                        } else if len(atype) == 0 || digest.equal(et, atype) {
+                            code = fetch_one(heap, net, eng, now_ms, host, port, auth, repo, ed, blobs, io);
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, listed);
+    return code;
+}
+
+// The attached file of the artifact manifest `manifest_digest`: its first layer, into the blob store.
+fn fetch_one[&h, &n, &t, &a, &r, &m, &d, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], manifest_digest: &m [byte], blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_write, file_write, io_write] int {
+    var code = 0;
+    region w {
+        let shown = alloc_slice[w](71, byte_of(0));
+        let (doc, c0) = registry.manifest_fetch(heap, net, eng, now_ms, host, port, auth, repo, manifest_digest, shown);
+        code = c0;
+        if code == 0 {
+            borrow doc as &db in {
+                let body = buffer.bytes(db);
+                region v {
+                    let tape = alloc_slice[v](layout.tape_ints(body), 0);
+                    if json.parse(body, tape) < 0 {
+                        code = layout.refused_json();
+                    } else {
+                        let layers = json.get(body, tape, 0, "layers");
+                        if layers < 0 || !json.is_array(tape, layers) || json.count(tape, layers) != 1 {
+                            code = rf_document();
+                        } else {
+                            let node = json.at(tape, layers, 0);
+                            let ld = layout.text_of(body, tape, node, "digest");
+                            let ls = layout.number_of(body, tape, node, "size");
+                            if len(layout.hex_of(ld)) != 64 || ls < 0 || ls > max_file() {
+                                code = rf_document();
+                            } else {
+                                code = registry.blob_fetch(heap, net, eng, now_ms, host, port, auth, repo, ld, ls, blobs, ".incoming-ref");
+                                if code == 0 {
+                                    io.write_all(io, manifest_digest);
+                                    io.write_all(io, " ");
+                                    io.write_all(io, ld);
+                                    io.write_all(io, "\n");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        buffer.drop(heap, doc);
+    }
+    return code;
+}
+
+// Does `<path>/blobs/sha256` exist? Checked before anything is sent.
+fn skeleton_ok[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read(""), dir_read] bool {
+    var good = false;
+    match open_dir(fs, path) {
+        DirOpened::Failed(errno) => {
+            good = false;
+        }
+        DirOpened::Ok(top) => {
+            var image_dir = top;
+            borrow image_dir as &id in {
+                match dir_enter(id, "blobs") {
+                    DirOpened::Failed(errno) => {
+                        good = false;
+                    }
+                    DirOpened::Ok(blobs_dir) => {
+                        var blobs = blobs_dir;
+                        borrow blobs as &bd in {
+                            match dir_enter(bd, "sha256") {
+                                DirOpened::Failed(errno) => {
+                                    good = false;
+                                }
+                                DirOpened::Ok(sha_dir) => {
+                                    good = true;
+                                    dir_close(sha_dir);
+                                }
+                            }
+                        }
+                        dir_close(blobs);
+                    }
+                }
+            }
+            dir_close(image_dir);
+        }
+    }
+    return good;
+}
+
+fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args, clock_ms: int) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, dir_read, dir_write, file_write, io_write, err_write] int {
+    if arg_count(args) < 2 {
+        return refuse(io, rf_mode(), "attach, list or fetch");
+    }
+    let mode = arg(args, 1);
+    if !(digest.equal(mode, "attach") || digest.equal(mode, "list") || digest.equal(mode, "fetch")) {
+        return refuse(io, rf_mode(), mode);
+    }
+    var registry_text = "";
+    var repo = "";
+    var subject = "";
+    var atype = "";
+    var file_path = "";
+    var out_path = "";
+    var basic_file = "";
+    var trust_file = "/etc/ssl/certs/ca-certificates.crt";
+    var plain = false;
+    var bad = "";
+    var at = 2;
+    while at < arg_count(args) && len(bad) == 0 {
+        let flag = arg(args, at);
+        if digest.equal(flag, "--plain-http") {
+            plain = true;
+            at = at + 1;
+        } else if at + 1 >= arg_count(args) {
+            bad = flag;
+        } else {
+            let value = arg(args, at + 1);
+            if digest.equal(flag, "--registry") {
+                registry_text = value;
+            } else if digest.equal(flag, "--repo") {
+                repo = value;
+            } else if digest.equal(flag, "--subject") {
+                subject = value;
+            } else if digest.equal(flag, "--type") {
+                atype = value;
+            } else if digest.equal(flag, "--file") {
+                file_path = value;
+            } else if digest.equal(flag, "--out") {
+                out_path = value;
+            } else if digest.equal(flag, "--basic-file") {
+                basic_file = value;
+            } else if digest.equal(flag, "--trust-file") {
+                trust_file = value;
+            } else {
+                bad = flag;
+            }
+            at = at + 2;
+        }
+    }
+    if len(bad) > 0 {
+        return refuse(io, rf_flag(), bad);
+    }
+    if len(registry_text) == 0 || len(repo) == 0 || len(subject) == 0 {
+        return refuse(io, rf_missing(), "--registry, --repo and --subject");
+    }
+    if digest.equal(mode, "attach") && (len(atype) == 0 || len(file_path) == 0) {
+        return refuse(io, rf_missing(), "--type and --file");
+    }
+    if digest.equal(mode, "fetch") && (len(atype) == 0 || len(out_path) == 0) {
+        return refuse(io, rf_missing(), "--type and --out");
+    }
+    if !registry.name_ok(repo) {
+        return refuse(io, registry.refused_name(), repo);
+    }
+    if len(subject) != 71 || !sign.digest_ok(subject) {
+        return refuse(io, rf_subject(), subject);
+    }
+    if len(atype) > 0 && !image.artifact_type_ok(atype) {
+        return refuse(io, rf_type(), atype);
+    }
+    var host = registry_text;
+    var port = 443;
+    if plain {
+        port = 80;
+    }
+    let colon = index_of_byte(registry_text, byte_of(':'));
+    if colon >= 0 {
+        host = registry_text[0..colon];
+        port = registry.port_of(registry_text[colon + 1..len(registry_text)]);
+    }
+    if len(host) == 0 || port < 0 || index_of_byte(host, byte_of('/')) >= 0 || index_of_byte(host, byte_of('@')) >= 0 {
+        return refuse(io, rf_registry(), registry_text);
+    }
+    if plain && len(basic_file) > 0 && !registry.is_loopback(host) {
+        return refuse(io, rf_creds_http(), host);
+    }
+    if digest.equal(mode, "fetch") && !skeleton_ok(fs, out_path) {
+        return refuse(io, rf_dir(), out_path);
+    }
+    // the file to attach, read before anything is sent
+    let content = box_slice(heap, max_file() + 1, byte_of(0));
+    var length = 0;
+    if digest.equal(mode, "attach") {
+        borrow mut content as &!cw in {
+            length = fs_read(fs, file_path, contents(cw));
+        }
+        if length <= 0 || length > max_file() {
+            unbox_slice(heap, content);
+            return refuse(io, rf_file(), file_path);
+        }
+    }
+    var auth = buffer.empty(heap, 1);
+    if len(basic_file) > 0 {
+        let (creds, c) = registry.read_credentials(heap, fs, basic_file);
+        if c != 0 {
+            buffer.drop(heap, creds);
+            buffer.drop(heap, auth);
+            unbox_slice(heap, content);
+            return refuse(io, c, basic_file);
+        }
+        borrow creds as &cb in {
+            buffer.drop(heap, auth);
+            auth = registry.auth_line(heap, buffer.bytes(cb));
+        }
+        buffer.drop(heap, creds);
+    }
+    var eng = tls.open(heap, 1);
+    var now_ms = 0;
+    var ready = 0;
+    if !plain {
+        tls.close(heap, eng);
+        let (made, c) = secure.engine(heap, fs, trust_file);
+        eng = made;
+        ready = c;
+        now_ms = clock_ms;
+    }
+    var status = 1;
+    if ready != 0 {
+        status = refuse(io, ready, trust_file);
+    } else {
+        var line = buffer.empty(heap, 1);
+        var negotiated = 0;
+        borrow auth as &ab0 in {
+            borrow mut eng as &!ew0 in {
+                let (got, c) = registry.negotiate(heap, net, ew0, now_ms, host, port, !plain, buffer.bytes(ab0), repo, digest.equal(mode, "attach"));
+                buffer.drop(heap, line);
+                line = got;
+                negotiated = c;
+            }
+        }
+        if negotiated != 0 {
+            status = refuse(io, negotiated, host);
+        } else {
+            borrow line as &lb in {
+                borrow mut eng as &!ew in {
+                    if digest.equal(mode, "attach") {
+                        borrow content as &cr in {
+                            let code = attach(heap, net, ew, now_ms, host, port, buffer.bytes(lb), repo, subject, atype, contents(cr)[0..length], io);
+                            if code != 0 {
+                                status = refuse(io, code, subject);
+                            } else {
+                                status = 0;
+                            }
+                        }
+                    } else if digest.equal(mode, "list") {
+                        let code = list_only(heap, net, ew, now_ms, host, port, buffer.bytes(lb), repo, subject, atype, io);
+                        if code != 0 {
+                            status = refuse(io, code, subject);
+                        } else {
+                            status = 0;
+                        }
+                    } else {
+                        match open_dir(fs, out_path) {
+                            DirOpened::Failed(errno) => {
+                                status = refuse(io, rf_dir(), out_path);
+                            }
+                            DirOpened::Ok(top) => {
+                                var image_dir = top;
+                                borrow image_dir as &id in {
+                                    match dir_enter(id, "blobs") {
+                                        DirOpened::Failed(errno) => {
+                                            status = refuse(io, rf_dir(), out_path);
+                                        }
+                                        DirOpened::Ok(blobs_dir) => {
+                                            var blobs = blobs_dir;
+                                            borrow blobs as &bd in {
+                                                match dir_enter(bd, "sha256") {
+                                                    DirOpened::Failed(errno) => {
+                                                        status = refuse(io, rf_dir(), out_path);
+                                                    }
+                                                    DirOpened::Ok(sha_dir) => {
+                                                        var sha = sha_dir;
+                                                        borrow sha as &sd in {
+                                                            let code = fetch_all(heap, net, ew, now_ms, host, port, buffer.bytes(lb), repo, subject, atype, sd, io);
+                                                            if code != 0 {
+                                                                status = refuse(io, code, subject);
+                                                            } else {
+                                                                status = 0;
+                                                            }
+                                                        }
+                                                        dir_close(sha);
+                                                    }
+                                                }
+                                            }
+                                            dir_close(blobs);
+                                        }
+                                    }
+                                }
+                                dir_close(image_dir);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        buffer.drop(heap, line);
+    }
+    tls.close(heap, eng);
+    buffer.drop(heap, auth);
+    unbox_slice(heap, content);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow fs as &f in {
+                borrow net as &n in {
+                    borrow clock as &k in {
+                        borrow mut io as &!i in {
+                            status = run(h, f, n, i, g, clock_unix_ms(k));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(fs);
+    release(net);
+    release(clock);
+    release(io);
+    return status;
+}
