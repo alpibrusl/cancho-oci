@@ -753,6 +753,49 @@ def main():
             redirect_case("https redirect to another name with credentials", "blob-redirect-other", pki["good"], True, auth="alice:s3cret", creds=rc / "alice")
             redirect_case("https redirect down to http", "blob-redirect-downgrade", pki["good"], False, "registry-redirect-foreign-host")
 
+        # ---------------------------------------------------------------- 3e. Docker schema 2 images (what `docker build` pushes and ghcr.io serves)
+        import urllib.request
+        dm, dl = "application/vnd.docker.distribution.manifest.v2+json", "application/vnd.docker.distribution.manifest.list.v2+json"
+        mock = Mock()
+        try:
+            def put(path, data, ctype):
+                urllib.request.urlopen(urllib.request.Request(f"http://{mock.addr}{path}", data=data, method="PUT", headers={"Content-Type": ctype})).read()
+            def blob(data):
+                d = "sha256:" + sha(data)
+                r = urllib.request.Request(f"http://{mock.addr}/v2/dk/app/blobs/uploads/?digest={d}", data=data, method="POST")
+                urllib.request.urlopen(r).read()
+                return d
+            cfg = b'{"architecture":"amd64","os":"linux"}'
+            lay = b"docker layer"
+            cd_, ld_ = blob(cfg), blob(lay)
+            man = IC.compact({"schemaVersion": 2, "mediaType": dm, "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": len(cfg), "digest": cd_},
+                              "layers": [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "size": len(lay), "digest": ld_}]})
+            md = "sha256:" + sha(man)
+            lst = IC.compact({"schemaVersion": 2, "mediaType": dl, "manifests": [{"mediaType": dm, "digest": md, "size": len(man), "platform": {"architecture": "amd64", "os": "linux"}}]})
+            ld = "sha256:" + sha(lst)
+            put(f"/v2/dk/app/manifests/{md}", man, dm)
+            put("/v2/dk/app/manifests/latest", lst, dl)
+            # the list, whole
+            dest = t / "docker-list"
+            skeleton(dest)
+            code, out, err = pull(mock.addr, "dk/app", "latest", dest)
+            if ok(code == 0 and last(out) == ld, f"a Docker manifest list: {code} {err!r} {out!r}"):
+                ok((dest / "index.json").read_bytes() == model_entry(dl, ld, len(lst), "latest"), "a Docker manifest list: the layout's index.json is not the model")
+                ok(set(blobs_of(dest)) == {sha(x) for x in (lst, man, cfg, lay)} and blobs_of(dest)[sha(man)] == man, "a Docker manifest list: the blobs are not the four documents")
+            # one platform of it
+            dest = t / "docker-platform"
+            skeleton(dest)
+            code, out, err = pull(mock.addr, "dk/app", "latest", dest, ["--platform", "linux/amd64"])
+            if ok(code == 0 and last(out) == md, f"a Docker manifest by platform: {code} {err!r}"):
+                ok((dest / "index.json").read_bytes() == model_entry(dm, md, len(man), "latest"), "a Docker manifest by platform: the layout's index.json is not the model")
+            # a single Docker manifest by digest
+            dest = t / "docker-single"
+            skeleton(dest)
+            code, out, err = pull(mock.addr, "dk/app", md, dest)
+            ok(code == 0 and last(out) == md and (dest / "index.json").read_bytes() == model_entry(dm, md, len(man), ""), f"a single Docker manifest: {code} {err!r}")
+        finally:
+            mock.stop()
+
         # ---------------------------------------------------------------- 4. the real thing, when it is there
         def against(addr, label):
             """Our push read back by crane, crane's push pulled by us, on a real registry at `addr`."""
