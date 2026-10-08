@@ -29,7 +29,7 @@ MUTANTS = [
     ("sign", "a malformed digest accepted for verifying", "    if !digest_ok(subject) {\n        return refused_digest_text();\n    }\n    var code = 0;", "    var code = 0;"),
     ("sign", "a malformed digest accepted for signing", "    if !digest_ok(subject) || len(seed) != 32 {", "    if len(seed) != 32 {"),
     ("sign", "the key id taken from something else", "        crypto.sha256(pub_key, raw);", "        crypto.sha256(pub_key[0..31], raw);"),
-    ("signcli", "an image with two entries accepted", "|| json.count(tape, manifests) != 1 {", "|| json.count(tape, manifests) < 1 {"),
+    ("layout", "an image with two entries accepted", "|| json.count(tape, manifests) != 1 {", "|| json.count(tape, manifests) < 1 {"),
     ("signcli", "both --image and --digest accepted", "if len(digest_text) > 0 && len(image_path) > 0 {\n                code = sg_flag();", "if false {\n                code = sg_flag();"),
     ("signcli", "a seed file of the wrong length accepted", "if end == 2 * len(raw) && sign.raw_of_hex(text[0..end], raw) == 0 {", "if sign.raw_of_hex(text[0..end], raw) == 0 || end > 2 * len(raw) {"),
     ("signcli", "a signature file past the cap accepted", "if n <= 0 || n > sign.max_document() {", "if n <= 0 {"),
