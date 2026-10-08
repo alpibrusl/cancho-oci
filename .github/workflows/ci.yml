@@ -140,6 +140,14 @@ jobs:
         working-directory: oci
         run: python3 scripts/sign_mutants.py --jobs 4
 
+      - name: oci-sbom -- a CycloneDX 1.5 document that validates against the official schema and equals an independent model byte for byte
+        working-directory: oci
+        run: python3 scripts/sbom_check.py
+
+      - name: oci-sbom's mutants are all killed
+        working-directory: oci
+        run: python3 scripts/sbom_mutants.py --jobs 4
+
       - name: G1 across machines -- every digest equals the committed golden file (also checked on macOS/arm64 in the other job)
         working-directory: oci
         run: python3 scripts/golden_check.py

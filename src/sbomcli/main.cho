@@ -1,0 +1,545 @@
+edition 7;
+
+import std.buffer;
+import std.crypto;
+import std.io;
+import std.json;
+import oci.digest;
+import oci.image;
+import oci.layout;
+import oci.sbom;
+import oci.sign;
+
+// oci-sbom: a CycloneDX 1.5 bill of materials for an image built by `oci-build` (design 5.8, task #12).
+//
+//     oci-sbom --name <name> [--version <v>] (--image <layout> | --image-digest sha256:<hex>)
+//              --root <dir> [--bin <path-in-image>:<file-in-root> ...] [--file <path-in-image>:<file-in-root> ...]
+//              [--authority <path-in-image>=<report.json> ...] [--dep <name>=<url>@<40-hex-commit> ...]
+//              --out-dir <dir>
+//
+// Each `--bin` and `--file` is hashed (SHA-256) from `--root`, the same way `oci-build --root` finds it. An `--authority`
+// report (`cancho authority --output json <sources>`) is attached to the program of that path as properties. Components
+// come in command-line order. Writes `<out-dir>/sha256-<image hex>.sbom.cdx.json` and prints its digest. No timestamp, no
+// serial number: the same inputs give the same bytes. A refusal is `refused: <rule tag>` on stderr and exit status 1.
+
+fn sb_flag() -> [] int {
+    return 0 - 1110;
+}
+
+fn sb_missing() -> [] int {
+    return 0 - 1111;
+}
+
+fn sb_image() -> [] int {
+    return 0 - 1112;
+}
+
+fn sb_io() -> [] int {
+    return 0 - 1113;
+}
+
+fn sb_authority_for_nothing() -> [] int {
+    return 0 - 1114;
+}
+
+fn rule_of(code: int) -> [] &static [byte] {
+    if code == sb_flag() {
+        return "sbom-flag";
+    }
+    if code == sb_missing() {
+        return "sbom-missing";
+    }
+    if code == sb_image() {
+        return "sbom-image";
+    }
+    if code == sb_io() {
+        return "sbom-io";
+    }
+    if code == sb_authority_for_nothing() {
+        return "sbom-authority-without-component";
+    }
+    if code <= 0 - 600 && code > 0 - 700 {
+        return layout.rule_name(code);
+    }
+    if code <= 0 - 1100 && code > 0 - 1110 {
+        return sbom.rule_name(code);
+    }
+    return sign.rule_name(code);
+}
+
+fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int {
+    io.error_all(io, "refused: ");
+    io.error_all(io, rule_of(code));
+    if len(culprit) > 0 && len(culprit) < 200 {
+        io.error_all(io, " (");
+        io.error_all(io, culprit);
+        io.error_all(io, ")");
+    }
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// `a<sep>b` into its two halves at the first `sep`: the index, or -1.
+fn split_at[&t](text: &t [byte], sep: int) -> [] int {
+    var k = 0;
+    while k < len(text) {
+        if int_of(text[k]) == sep {
+            return k;
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+fn is_flag[&t](flag: &t [byte]) -> [] bool {
+    return digest.equal(flag, "--bin") || digest.equal(flag, "--file") || digest.equal(flag, "--authority") || digest.equal(flag, "--dep") || digest.equal(flag, "--name") || digest.equal(flag, "--version") || digest.equal(flag, "--image") || digest.equal(flag, "--image-digest") || digest.equal(flag, "--root") || digest.equal(flag, "--out-dir");
+}
+
+// The report file for the component at `image_path`, from the `--authority` flags: the file name, or empty.
+fn report_for[&g, &p](args: &g Args, image_path: &p [byte]) -> [args] &static [byte] {
+    var at = 1;
+    while at + 1 < arg_count(args) {
+        if digest.equal(arg(args, at), "--authority") {
+            let spec = arg(args, at + 1);
+            let eq = split_at(spec, '=');
+            if eq > 0 && digest.equal(spec[0..eq], image_path) {
+                return spec[eq + 1..len(spec)];
+            }
+        }
+        at = at + 2;
+    }
+    return "";
+}
+
+fn hex_ok[&t](text: &t [byte], n: int) -> [] bool {
+    if len(text) != n {
+        return false;
+    }
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// One component: a program (`--bin`) or a file (`--file`) of the image, hashed from `root`, with the authority report of
+// the program when `report_path` names one. Answers the writer and 0, or a refusal.
+fn emit_component[&h, &f, &r, &c, &q, &p, &n](heap: &!h Heap, fs: &f Fs(""), w: json.Writer, root: &r Dir, chunk: &!c [byte], report: &!q [byte], is_bin: bool, in_image: &p [byte], rel: &n [byte], report_path: &static [byte]) -> [heap, fs_read(""), dir_read, file_read] (json.Writer, int) {
+    var w1 = w;
+    var code = 0;
+    region a {
+        let hex = alloc_slice[a](64, byte_of(0));
+        let (c0, size) = sbom.hash_file(root, rel, hex, chunk);
+        code = c0;
+        if code == 0 {
+            w1 = json.begin_object(heap, w1);
+            w1 = json.put_key(heap, w1, "type");
+            if is_bin {
+                w1 = json.put_string(heap, w1, "application");
+            } else {
+                w1 = json.put_string(heap, w1, "file");
+            }
+            w1 = json.put_key(heap, w1, "bom-ref");
+            var ref = buffer.empty(heap, 64);
+            ref = buffer.append(heap, ref, "file:");
+            ref = buffer.append(heap, ref, in_image);
+            borrow ref as &rb in {
+                w1 = json.put_string(heap, w1, buffer.bytes(rb));
+            }
+            buffer.drop(heap, ref);
+            w1 = json.put_key(heap, w1, "name");
+            w1 = json.put_string(heap, w1, in_image);
+            w1 = sbom.put_hash(heap, w1, hex);
+            w1 = json.put_key(heap, w1, "properties");
+            w1 = json.begin_array(heap, w1);
+            w1 = json.begin_object(heap, w1);
+            w1 = json.put_key(heap, w1, "name");
+            w1 = json.put_string(heap, w1, "oci:size");
+            w1 = json.put_key(heap, w1, "value");
+            var sz = buffer.empty(heap, 24);
+            sz = buffer.push_nat(heap, sz, size);
+            borrow sz as &zb in {
+                w1 = json.put_string(heap, w1, buffer.bytes(zb));
+            }
+            buffer.drop(heap, sz);
+            w1 = json.end_object(heap, w1);
+            if len(report_path) > 0 {
+                let n = fs_read(fs, report_path, report);
+                if n <= 0 || n > sbom.max_report() {
+                    code = sbom.refused_report();
+                } else {
+                    let (w2, c2) = sbom.put_authority(heap, w1, report[0..n]);
+                    w1 = w2;
+                    code = c2;
+                }
+            }
+            w1 = json.end_array(heap, w1);
+            w1 = json.end_object(heap, w1);
+        }
+    }
+    return (w1, code);
+}
+
+// One pinned library: `name=url@commit`, as a `library` component with the repository and the commit.
+fn emit_dep[&h, &s](heap: &!h Heap, w: json.Writer, spec: &s [byte]) -> [heap] (json.Writer, int) {
+    var w1 = w;
+    let eq = split_at(spec, '=');
+    let at = split_at(spec, '@');
+    if eq < 1 || at < eq + 2 || at + 1 >= len(spec) {
+        return (w1, sbom.refused_spec());
+    }
+    let dep_name = spec[0..eq];
+    let url = spec[eq + 1..at];
+    let rev = spec[at + 1..len(spec)];
+    if !sbom.plain(dep_name) || !sbom.plain(url) || !hex_ok(rev, 40) {
+        return (w1, sbom.refused_spec());
+    }
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "type");
+    w1 = json.put_string(heap, w1, "library");
+    w1 = json.put_key(heap, w1, "bom-ref");
+    var ref = buffer.empty(heap, 64);
+    ref = buffer.append(heap, ref, "dep:");
+    ref = buffer.append(heap, ref, dep_name);
+    borrow ref as &rb in {
+        w1 = json.put_string(heap, w1, buffer.bytes(rb));
+    }
+    buffer.drop(heap, ref);
+    w1 = json.put_key(heap, w1, "name");
+    w1 = json.put_string(heap, w1, dep_name);
+    w1 = json.put_key(heap, w1, "version");
+    w1 = json.put_string(heap, w1, rev);
+    w1 = json.put_key(heap, w1, "externalReferences");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "type");
+    w1 = json.put_string(heap, w1, "vcs");
+    w1 = json.put_key(heap, w1, "url");
+    w1 = json.put_string(heap, w1, url);
+    w1 = json.end_object(heap, w1);
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    return (w1, 0);
+}
+
+// The `dependencies` member: the image depends on every component, by reference.
+fn emit_dependencies[&h, &g](heap: &!h Heap, w: json.Writer, args: &g Args) -> [heap, args] json.Writer {
+    var w1 = json.put_key(heap, w, "dependencies");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "ref");
+    w1 = json.put_string(heap, w1, "image");
+    w1 = json.put_key(heap, w1, "dependsOn");
+    w1 = json.begin_array(heap, w1);
+    var s = 1;
+    while s + 1 < arg_count(args) {
+        let flag = arg(args, s);
+        let spec = arg(args, s + 1);
+        if digest.equal(flag, "--bin") || digest.equal(flag, "--file") {
+            let colon = split_at(spec, ':');
+            var ref = buffer.empty(heap, 64);
+            ref = buffer.append(heap, ref, "file:");
+            ref = buffer.append(heap, ref, spec[0..colon]);
+            borrow ref as &rb in {
+                w1 = json.put_string(heap, w1, buffer.bytes(rb));
+            }
+            buffer.drop(heap, ref);
+        } else if digest.equal(flag, "--dep") {
+            let eq = split_at(spec, '=');
+            var ref = buffer.empty(heap, 64);
+            ref = buffer.append(heap, ref, "dep:");
+            ref = buffer.append(heap, ref, spec[0..eq]);
+            borrow ref as &rb in {
+                w1 = json.put_string(heap, w1, buffer.bytes(rb));
+            }
+            buffer.drop(heap, ref);
+        }
+        s = s + 2;
+    }
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    return json.end_array(heap, w1);
+}
+
+// The head of the document and the image component.
+fn emit_head[&h, &n, &v, &s](heap: &!h Heap, name: &n [byte], version: &v [byte], subject: &s [byte]) -> [heap] json.Writer {
+    var w1 = json.writer(heap, 4096);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "bomFormat");
+    w1 = json.put_string(heap, w1, "CycloneDX");
+    w1 = json.put_key(heap, w1, "specVersion");
+    w1 = json.put_string(heap, w1, "1.5");
+    w1 = json.put_key(heap, w1, "version");
+    w1 = json.put_int(heap, w1, 1);
+    w1 = json.put_key(heap, w1, "metadata");
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "component");
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "type");
+    w1 = json.put_string(heap, w1, "container");
+    w1 = json.put_key(heap, w1, "bom-ref");
+    w1 = json.put_string(heap, w1, "image");
+    w1 = json.put_key(heap, w1, "name");
+    w1 = json.put_string(heap, w1, name);
+    if len(version) > 0 {
+        w1 = json.put_key(heap, w1, "version");
+        w1 = json.put_string(heap, w1, version);
+    }
+    w1 = sbom.put_hash(heap, w1, subject[7..71]);
+    w1 = json.put_key(heap, w1, "properties");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "name");
+    w1 = json.put_string(heap, w1, "oci:manifest-digest");
+    w1 = json.put_key(heap, w1, "value");
+    w1 = json.put_string(heap, w1, subject);
+    w1 = json.end_object(heap, w1);
+    w1 = json.end_array(heap, w1);
+    w1 = json.end_object(heap, w1);
+    w1 = json.end_object(heap, w1);
+    w1 = json.put_key(heap, w1, "components");
+    return json.begin_array(heap, w1);
+}
+
+// The whole document, from the flags. The buffer and 0, or an empty buffer and a refusal.
+fn build_document[&h, &f, &g, &r, &s, &n, &v](heap: &!h Heap, fs: &f Fs(""), args: &g Args, root: &r Dir, subject: &s [byte], name: &n [byte], version: &v [byte]) -> [heap, args, fs_read(""), dir_read, file_read] (buffer.Buffer, int) {
+    let chunk = box_slice(heap, 65536, byte_of(0));
+    let report = box_slice(heap, sbom.max_report() + 1, byte_of(0));
+    var w1 = emit_head(heap, name, version, subject);
+    var code = 0;
+    var s2 = 1;
+    while code == 0 && s2 + 1 < arg_count(args) {
+        let flag = arg(args, s2);
+        let spec = arg(args, s2 + 1);
+        if digest.equal(flag, "--bin") || digest.equal(flag, "--file") {
+            let colon = split_at(spec, ':');
+            if colon < 1 || colon + 1 >= len(spec) || !sbom.plain(spec[0..colon]) || !sbom.plain(spec[colon + 1..len(spec)]) {
+                code = sbom.refused_spec();
+            } else {
+                borrow mut chunk as &!cw in {
+                    borrow mut report as &!rw in {
+                        let (w2, c2) = emit_component(heap, fs, w1, root, contents(cw), contents(rw), digest.equal(flag, "--bin"), spec[0..colon], spec[colon + 1..len(spec)], report_for(args, spec[0..colon]));
+                        w1 = w2;
+                        code = c2;
+                    }
+                }
+            }
+        } else if digest.equal(flag, "--dep") {
+            let (w2, c2) = emit_dep(heap, w1, spec);
+            w1 = w2;
+            code = c2;
+        }
+        s2 = s2 + 2;
+    }
+    unbox_slice(heap, chunk);
+    unbox_slice(heap, report);
+    w1 = json.end_array(heap, w1);
+    if code == 0 {
+        w1 = emit_dependencies(heap, w1, args);
+    }
+    w1 = json.end_object(heap, w1);
+    let doc = json.finish(w1);
+    if code != 0 {
+        buffer.drop(heap, doc);
+        return (buffer.empty(heap, 1), code);
+    }
+    return (doc, 0);
+}
+
+fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), dir_read, dir_write, file_read, io_write, err_write] int {
+    var name = "";
+    var version = "";
+    var image_path = "";
+    var image_digest = "";
+    var root_path = "";
+    var out_dir = "";
+    var bad = "";
+    var at = 1;
+    while at < arg_count(args) && len(bad) == 0 {
+        let flag = arg(args, at);
+        if !is_flag(flag) || at + 1 >= arg_count(args) {
+            bad = flag;
+        } else {
+            let value = arg(args, at + 1);
+            if digest.equal(flag, "--name") {
+                name = value;
+            } else if digest.equal(flag, "--version") {
+                version = value;
+            } else if digest.equal(flag, "--image") {
+                image_path = value;
+            } else if digest.equal(flag, "--image-digest") {
+                image_digest = value;
+            } else if digest.equal(flag, "--root") {
+                root_path = value;
+            } else if digest.equal(flag, "--out-dir") {
+                out_dir = value;
+            }
+            at = at + 2;
+        }
+    }
+    if len(bad) > 0 {
+        return refuse(io, sb_flag(), bad);
+    }
+    if len(name) == 0 || len(root_path) == 0 || len(out_dir) == 0 || len(image_path) == 0 && len(image_digest) == 0 {
+        return refuse(io, sb_missing(), "--name, --root, --out-dir and --image or --image-digest");
+    }
+    if len(image_path) > 0 && len(image_digest) > 0 {
+        return refuse(io, sb_flag(), "--image and --image-digest are alternatives");
+    }
+    if !sbom.plain(name) || len(version) > 0 && !sbom.plain(version) {
+        return refuse(io, sbom.refused_spec(), name);
+    }
+    var status = 1;
+    region w {
+        let subject = alloc_slice[w](71, byte_of(0));
+        var code = 0;
+        if len(image_digest) > 0 {
+            if len(image_digest) != 71 || !sign.digest_ok(image_digest) {
+                code = sign.refused_digest_text();
+            } else {
+                var k = 0;
+                while k < 71 {
+                    subject[k] = image_digest[k];
+                    k = k + 1;
+                }
+            }
+        } else {
+            match open_dir(fs, image_path) {
+                DirOpened::Failed(errno) => {
+                    code = sb_image();
+                }
+                DirOpened::Ok(top) => {
+                    var dir = top;
+                    borrow dir as &dr in {
+                        code = layout.entry_digest(heap, dr, subject);
+                        if code == layout.refused_shape() {
+                            code = sb_image();
+                        }
+                    }
+                    dir_close(dir);
+                }
+            }
+        }
+        if code != 0 {
+            status = refuse(io, code, image_path);
+        } else {
+            var orphan = "";
+            var pass = 1;
+            while pass + 1 < arg_count(args) && len(orphan) == 0 {
+                if digest.equal(arg(args, pass), "--authority") {
+                    let spec = arg(args, pass + 1);
+                    let eq = split_at(spec, '=');
+                    var found = false;
+                    var s = 1;
+                    while s + 1 < arg_count(args) {
+                        if digest.equal(arg(args, s), "--bin") || digest.equal(arg(args, s), "--file") {
+                            let comp = arg(args, s + 1);
+                            let colon = split_at(comp, ':');
+                            if eq > 0 && colon > 0 && digest.equal(comp[0..colon], spec[0..eq]) {
+                                found = true;
+                            }
+                        }
+                        s = s + 2;
+                    }
+                    if eq < 1 || eq + 1 >= len(spec) || !found {
+                        orphan = spec;
+                    }
+                }
+                pass = pass + 2;
+            }
+            if len(orphan) > 0 {
+                status = refuse(io, sb_authority_for_nothing(), orphan);
+            } else {
+                match open_dir(fs, root_path) {
+                    DirOpened::Failed(errno) => {
+                        status = refuse(io, sb_io(), root_path);
+                    }
+                    DirOpened::Ok(top_root) => {
+                        var root = top_root;
+                        borrow root as &rr in {
+                            let (doc, c) = build_document(heap, fs, args, rr, subject, name, version);
+                            if c != 0 {
+                                status = refuse(io, c, "");
+                            } else {
+                                borrow doc as &db in {
+                                    status = write_out(heap, fs, io, out_dir, subject, buffer.bytes(db));
+                                }
+                            }
+                            buffer.drop(heap, doc);
+                        }
+                        dir_close(root);
+                    }
+                }
+            }
+        }
+    }
+    return status;
+}
+
+// Write the document to `<out-dir>/sha256-<image hex>.sbom.cdx.json` and print its digest.
+fn write_out[&h, &f, &i, &s, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, out_dir: &static [byte], subject: &s [byte], doc: &d [byte]) -> [heap, fs_read(""), dir_write, io_write, err_write] int {
+    var status = 1;
+    match open_dir(fs, out_dir) {
+        DirOpened::Failed(errno) => {
+            status = refuse(io, sb_io(), out_dir);
+        }
+        DirOpened::Ok(top) => {
+            var dir = top;
+            var name = buffer.empty(heap, 96);
+            name = buffer.append(heap, name, "sha256-");
+            name = buffer.append(heap, name, subject[7..71]);
+            name = buffer.append(heap, name, ".sbom.cdx.json");
+            borrow dir as &dr in {
+                borrow name as &nb in {
+                    if image.write_file(dr, buffer.bytes(nb), doc) != 0 {
+                        status = refuse(io, sb_io(), out_dir);
+                    } else {
+                        region a {
+                            let raw = alloc_slice[a](32, byte_of(0));
+                            crypto.sha256(doc, raw);
+                            let text = alloc_slice[a](71, byte_of(0));
+                            digest.text_into(raw, text);
+                            io.write_all(io, "sbom ");
+                            io.write_all(io, text);
+                            io.write_all(io, " ");
+                            io.write_all(io, buffer.bytes(nb));
+                            io.write_all(io, "\n");
+                        }
+                        status = 0;
+                    }
+                }
+            }
+            buffer.drop(heap, name);
+            dir_close(dir);
+        }
+    }
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow fs as &f in {
+                borrow mut io as &!i in {
+                    status = run(h, f, i, g);
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(fs);
+    release(io);
+    return status;
+}

@@ -202,3 +202,40 @@ pub fn hex_of[&t](text: &t [byte]) -> [] &t [byte] {
     }
     return text[7..len(text)];
 }
+
+// The manifest digest named by the one entry of a layout's `index.json`, into `out` (71 bytes). 0, a refusal of
+// the document (`refused_json`, `refused_too_large`), or `refused_shape` when it does not have exactly one entry
+// with a well-formed digest.
+pub fn entry_digest[&h, &d, &o](heap: &!h Heap, dir: &d Dir, out: &!o [byte]) -> [heap, dir_read, file_read] int {
+    let (doc, c0) = read_file(heap, dir, "index.json", max_document());
+    var code = c0;
+    if code == 0 {
+        borrow doc as &db in {
+            let src = buffer.bytes(db);
+            region a {
+                let tape = alloc_slice[a](tape_ints(src), 0);
+                if json.parse(src, tape) < 0 {
+                    code = refused_json();
+                } else {
+                    let manifests = json.get(src, tape, 0, "manifests");
+                    if manifests < 0 || !json.is_array(tape, manifests) || json.count(tape, manifests) != 1 {
+                        code = refused_shape();
+                    } else {
+                        let text = text_of(src, tape, json.at(tape, manifests, 0), "digest");
+                        if len(hex_of(text)) != 64 || len(text) != 71 {
+                            code = refused_shape();
+                        } else {
+                            var k = 0;
+                            while k < 71 {
+                                out[k] = text[k];
+                                k = k + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, doc);
+    return code;
+}

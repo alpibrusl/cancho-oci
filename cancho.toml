@@ -70,6 +70,13 @@ sources = ["src/digest", "src/store", "src/image", "src/layout", "src/sign", "sr
 std = true
 out = "build/oci-sign"
 
+# A CycloneDX bill of materials for an image: hashes of what went in, authority reports, pinned libraries (#12). Files only.
+[[bin]]
+name = "oci-sbom"
+sources = ["src/digest", "src/store", "src/image", "src/layout", "src/place", "src/sign", "src/sbom", "src/sbomcli"]
+std = true
+out = "build/oci-sbom"
+
 # The test harness for the upload-target rule of oci.registry (#9), held to its own ceiling (no network at all).
 [[bin]]
 name = "target-probe"
