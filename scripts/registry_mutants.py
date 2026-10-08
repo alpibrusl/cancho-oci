@@ -70,6 +70,9 @@ MUTANTS = [
     ("registry", "redirects followed without a small limit", "                    if hops > 3 {", "                    if hops > 30 {"),
     ("registry", "a redirect host name not checked", "                    if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.') {", "                    if false {"),
     ("registry", "a redirect location with a control character accepted", "        if c < 33 || c > 126 {\n            code = refused_redirect();", "        if false {\n            code = refused_redirect();"),
+    ("image", "a Docker manifest not recognised as a manifest", "    return digest.equal(media, media_manifest()) || digest.equal(media, media_docker_manifest());", "    return digest.equal(media, media_manifest());"),
+    ("image", "a Docker list not recognised as an index", "    return digest.equal(media, media_index()) || digest.equal(media, media_docker_list());", "    return digest.equal(media, media_index());"),
+    ("image", "a Docker manifest recorded as an OCI one", "    if digest.equal(media, media_docker_manifest()) {\n        return media_docker_manifest();", "    if digest.equal(media, media_docker_manifest()) {\n        return media_manifest();"),
 ]
 
 

@@ -160,7 +160,7 @@ fn take_image[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net("
         let tape = alloc_slice[a2](layout.tape_ints(doc), 0);
         if json.parse(doc, tape) < 0 {
             code = layout.refused_json();
-        } else if !digest.equal(layout.text_of(doc, tape, 0, "mediaType"), image.media_manifest()) {
+        } else if !image.is_manifest(layout.text_of(doc, tape, 0, "mediaType")) {
             code = registry.refused_media();
         } else {
             let cfg = json.get(doc, tape, 0, "config");
@@ -232,7 +232,8 @@ fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap
                         code = layout.refused_json();
                     } else {
                         let media = layout.text_of(body, tape, 0, "mediaType");
-                        if digest.equal(media, image.media_manifest()) {
+                        if image.is_manifest(media) {
+                            top_media = image.static_media(media);
                             if len(platform) > 0 {
                                 code = pull_platform();
                             } else {
@@ -244,7 +245,7 @@ fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap
                                     k = k + 1;
                                 }
                             }
-                        } else if digest.equal(media, image.media_index()) {
+                        } else if image.is_index(media) {
                             let kids = json.get(body, tape, 0, "manifests");
                             if kids < 0 || !json.is_array(tape, kids) || json.count(tape, kids) < 1 {
                                 code = pull_document();
@@ -265,6 +266,7 @@ fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap
                                             if len(platform) > 0 && code == 0 {
                                                 // a single platform: the layout's entry is that image, not the index
                                                 top_size = len(buffer.bytes(kb));
+                                                top_media = image.static_media(layout.text_of(body, tape, kid, "mediaType"));
                                                 var k = 0;
                                                 while k < 71 {
                                                     top_text[k] = kid_shown[k];
@@ -283,7 +285,7 @@ fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap
                             if code == 0 && len(platform) == 0 {
                                 code = keep_document(heap, blobs, body);
                                 top_size = len(body);
-                                top_media = image.media_index();
+                                top_media = image.static_media(media);
                                 var k = 0;
                                 while k < 71 {
                                     top_text[k] = shown[k];

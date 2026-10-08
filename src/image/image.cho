@@ -84,6 +84,40 @@ pub fn media_manifest() -> [] &static [byte] {
     return "application/vnd.oci.image.manifest.v1+json";
 }
 
+// The Docker schema 2 types, which registries still serve for images made by `docker build`. They are read
+// (pulled and kept as they are, byte for byte), never written.
+pub fn media_docker_manifest() -> [] &static [byte] {
+    return "application/vnd.docker.distribution.manifest.v2+json";
+}
+
+pub fn media_docker_list() -> [] &static [byte] {
+    return "application/vnd.docker.distribution.manifest.list.v2+json";
+}
+
+// Is `media` a single image manifest, OCI or Docker?
+pub fn is_manifest[&m](media: &m [byte]) -> [] bool {
+    return digest.equal(media, media_manifest()) || digest.equal(media, media_docker_manifest());
+}
+
+// Is `media` an index of manifests, OCI or Docker?
+pub fn is_index[&m](media: &m [byte]) -> [] bool {
+    return digest.equal(media, media_index()) || digest.equal(media, media_docker_list());
+}
+
+// The static spelling of a manifest or index type (a view into a document must not outlive the document).
+pub fn static_media[&m](media: &m [byte]) -> [] &static [byte] {
+    if digest.equal(media, media_docker_manifest()) {
+        return media_docker_manifest();
+    }
+    if digest.equal(media, media_docker_list()) {
+        return media_docker_list();
+    }
+    if digest.equal(media, media_index()) {
+        return media_index();
+    }
+    return media_manifest();
+}
+
 pub fn media_config() -> [] &static [byte] {
     return "application/vnd.oci.image.config.v1+json";
 }
@@ -527,7 +561,7 @@ pub fn layout_index_json[&h, &m, &r](heap: &!h Heap, index_digest: &m [byte], in
 // image index), with the tag, if any, as the `ref.name` annotation. For a pulled image.
 pub fn layout_entry_json[&h, &m, &d, &r](heap: &!h Heap, media: &m [byte], entry_digest: &d [byte], entry_size: int, ref: &r [byte]) -> [heap] (buffer.Buffer, int) {
     var code = 0;
-    if !digest_ok(entry_digest) || entry_size < 0 || !(digest.equal(media, media_manifest()) || digest.equal(media, media_index())) {
+    if !digest_ok(entry_digest) || entry_size < 0 || !(is_manifest(media) || is_index(media)) {
         code = refused_text();
     } else if !plain(ref) {
         code = refused_ref();
