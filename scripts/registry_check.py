@@ -41,6 +41,7 @@ BUILD = str(ROOT / "build" / "oci-build")
 INDEX = str(ROOT / "build" / "oci-index")
 PUSH = str(ROOT / "build" / "oci-push")
 PULL = str(ROOT / "build" / "oci-pull")
+TARGET = str(ROOT / "build" / "target-probe")
 ARCHES = ["amd64", "arm64", "riscv64"]
 bad = 0
 checks = 0
@@ -71,20 +72,30 @@ def run(cmd, **kw):
 
 
 class Mock:
-    def __init__(self, faults=(), auth=None):
+    def __init__(self, faults=(), auth=None, bearer=False, tls=None):
         cmd = [sys.executable, str(ROOT / "scripts" / "mock_registry.py")]
         for f in faults:
             cmd += ["--fault", f]
         if auth:
             cmd += ["--auth", auth]
+        if bearer:
+            cmd += ["--bearer"]
+        self.scheme = "http"
+        if tls:
+            cmd += ["--tls-cert", tls + ".pem", "--tls-key", tls + ".key"]
+            self.scheme = "https"
         self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.port = int(self.p.stdout.readline().split()[1])
         self.addr = f"127.0.0.1:{self.port}"
 
     def state(self):
-        import urllib.request
-        with urllib.request.urlopen(f"http://{self.addr}/_state") as r:
+        import urllib.request, ssl
+        ctx = ssl._create_unverified_context() if self.scheme == "https" else None
+        with urllib.request.urlopen(f"{self.scheme}://{self.addr}/_state", context=ctx) as r:
             return json.loads(r.read())
+
+    def log(self):
+        return self.state()["log"]
 
     def stop(self):
         self.p.terminate()
@@ -103,7 +114,7 @@ def blobs_of(d):
     return {p.name: p.read_bytes() for p in (Path(d) / "blobs" / "sha256").iterdir()}
 
 
-def make_image(w, archs, compress="gzip", ref="v1", multi=None):
+def make_image(w, archs, compress="gzip", ref="v1", multi=None, big=0):
     """An image layout with one image per architecture; a multi-platform index over them when `multi` is set."""
     root, image = w / "root", w / "image"
     root.mkdir(parents=True)
@@ -111,10 +122,12 @@ def make_image(w, archs, compress="gzip", ref="v1", multi=None):
     for a in ARCHES:
         (root / f"app-{a}").write_bytes(ELF.elf(a))
     (root / "data").write_bytes(("registry payload " * 5000).encode() + os.urandom(3000))
+    if big:
+        (root / "big").write_bytes(os.urandom(big))
     digests = {}
     for a in archs:
         code, out, err = run([BUILD, "--root", root, "--out", image, "--platform", f"linux/{a}", "--bin", f"app-{a}:app", "--file", "data:srv/data",
-                              "--compress", compress, "--ref", ref])
+                              *(["--file", "big:srv/big"] if big else []), "--compress", compress, "--ref", ref])
         assert code == 0, err
         digests[a] = out
     if multi:
@@ -127,12 +140,43 @@ def make_image(w, archs, compress="gzip", ref="v1", multi=None):
     return image, digests, digests[archs[0]]
 
 
-def push(image, addr, repo, tag="v1", extra=()):
-    return run([PUSH, "--image", image, "--registry", addr, "--repo", repo, "--tag", tag, "--plain-http", *extra])
+def push(image, addr, repo, tag="v1", extra=(), plain=True):
+    return run([PUSH, "--image", image, "--registry", addr, "--repo", repo, "--tag", tag, *(["--plain-http"] if plain else []), *extra])
 
 
-def pull(addr, repo, ref, out, extra=()):
-    return run([PULL, "--registry", addr, "--repo", repo, "--ref", ref, "--out", out, "--plain-http", *extra])
+def pull(addr, repo, ref, out, extra=(), plain=True):
+    return run([PULL, "--registry", addr, "--repo", repo, "--ref", ref, "--out", out, *(["--plain-http"] if plain else []), *extra])
+
+
+def make_pki(d):
+    """A test CA and leaf certificates it signs (valid for 127.0.0.1 and localhost; one expired; one for another name),
+    and a second, unrelated CA. Returns {} when there is no openssl to make them."""
+    if not shutil.which("openssl"):
+        return {}
+    d = Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+
+    def sh(*a):
+        subprocess.run([str(x) for x in a], check=True, capture_output=True, cwd=d)
+
+    for ca in ("ca", "other"):
+        sh("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", f"{ca}.key", "-out", f"{ca}.pem",
+           "-days", "30", "-subj", f"/CN=oci test {ca}", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    (d / "index.txt").write_text("")
+    (d / "serial.txt").write_text("1000\n")
+    (d / "ca.cnf").write_text("[ca]\ndefault_ca=CA_default\n[CA_default]\ndir=.\ndatabase=index.txt\nnew_certs_dir=.\nserial=serial.txt\ndefault_md=sha256\npolicy=pol\nunique_subject=no\n[pol]\ncommonName=supplied\n")
+
+    def leaf(name, san, start=None, end=None):
+        (d / f"{name}.ext").write_text(f"subjectAltName={san}\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n")
+        sh("openssl", "req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", f"{name}.key", "-out", f"{name}.csr", "-subj", f"/CN={name}")
+        args = ["openssl", "ca", "-config", "ca.cnf", "-batch", "-notext", "-in", f"{name}.csr", "-out", f"{name}.pem", "-cert", "ca.pem", "-keyfile", "ca.key", "-extfile", f"{name}.ext"]
+        args += ["-startdate", start or "20240101000000Z", "-enddate", end or "20990101000000Z"]
+        sh(*args)
+
+    leaf("good", "DNS:localhost,IP:127.0.0.1")
+    leaf("expired", "DNS:localhost,IP:127.0.0.1", "20200101000000Z", "20200102000000Z")
+    leaf("wrongname", "DNS:registry.invalid")
+    return {"ca": str(d / "ca.pem"), "other": str(d / "other.pem"), "good": str(d / "good"), "expired": str(d / "expired"), "wrongname": str(d / "wrongname")}
 
 
 def registry_blobs(image, digests):
@@ -172,13 +216,14 @@ def layout_ok(d, top, name, tag=None):
 
 
 def main():
-    global PUSH, PULL
+    global PUSH, PULL, TARGET
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--target", default=TARGET)
     ap.add_argument("--push", default=PUSH)
     ap.add_argument("--pull", default=PULL)
     a = ap.parse_args()
-    PUSH, PULL = a.push, a.pull
+    PUSH, PULL, TARGET = a.push, a.pull, a.target
     rng = random.Random(a.seed)
 
     with tempfile.TemporaryDirectory() as t:
@@ -267,7 +312,7 @@ def main():
         push_with(["many-headers"], 1, "http-head-too-large", "many small headers past the cap")
         push_with(["bad-status"], 1, "http-malformed", "a status code that does not exist (999)")
         push_with(["wrong-blob-digest"], 1, "registry-digest-mismatch", "a wrong digest reported for a blob")
-        push_with(["bearer-challenge"], 1, "registry-auth-bearer", "a bearer-token challenge", auth="alice:s3cret", expect_blobs=0)
+        push_with(["bearer-challenge"], 1, "registry-token-realm", "a bearer-token challenge naming another host", auth="alice:s3cret", expect_blobs=0)
         # authentication
         push_with([], 1, "registry-unauthorized", "no credentials for a registry that wants them", auth="alice:s3cret", expect_blobs=0)
         cred_dir = t / "creds"
@@ -355,6 +400,58 @@ def main():
         code, out, err = pull("127.0.0.1:1", "f/app", "v1", t / "x-closed")
         ok(code == 1, "a pull into a missing directory was not refused")
 
+        # ---------------------------------------------------------------- 3a. documents of every size
+        # A JSON tape is 3 ints a byte at worst and a region is one 64 KiB chunk: a manifest of a few KB used to trap the
+        # program (found while testing tokens). Manifests with many layers now go through, and one with too many nodes is
+        # refused as JSON, not a crash.
+        def fat_layout(d, layers, tag="v1"):
+            skeleton(d)
+            blobs = Path(d) / "blobs" / "sha256"
+            def put(data):
+                (blobs / sha(data)).write_bytes(data)
+                return "sha256:" + sha(data)
+            cfg = IC.compact({"architecture": "amd64", "os": "linux", "config": {}, "rootfs": {"type": "layers", "diff_ids": []}})
+            cfg_d = put(cfg)
+            layer_ds = [put(f"layer {i}".encode()) for i in range(layers)]
+            man = IC.compact({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                              "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg_d, "size": len(cfg)},
+                              "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": ld, "size": len(f"layer {i}")} for i, ld in enumerate(layer_ds)]})
+            top_d = put(man)
+            (Path(d) / "index.json").write_bytes(model_entry("application/vnd.oci.image.manifest.v1+json", top_d, len(man), tag))
+            (Path(d) / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}')
+            return top_d, len(man)
+
+        for layers in (3, 40, 200):
+            d = t / f"fat{layers}"
+            top_d, size = fat_layout(d, layers)
+            mock = Mock()
+            try:
+                code, out, err = push(d, mock.addr, "fat/app")
+                if ok(code == 0, f"a manifest of {layers} layers ({size} bytes): push refused: {code} {err!r}"):
+                    dest = t / f"fat{layers}-pulled"
+                    skeleton(dest)
+                    code, out, err = pull(mock.addr, "fat/app", "v1", dest)
+                    ok(code == 0 and last(out) == top_d and blobs_of(dest) == blobs_of(d), f"a manifest of {layers} layers ({size} bytes): pull: {code} {err!r}")
+            finally:
+                mock.stop()
+        d = t / "fat2000"
+        top_d, size = fat_layout(d, 2000)
+        mock = Mock()
+        try:
+            code, out, err = push(d, mock.addr, "fat/app")
+            ok(code == 1 and "layout-json" in err and not mock.state()["blobs"], f"a manifest of 2000 layers ({size} bytes) should be refused as too big to read, with nothing sent: {code} {err!r}")
+            # a registry holding one: pulling it is refused the same way and writes nothing
+            import urllib.request
+            man = (d / "blobs" / "sha256" / top_d.split(":")[1]).read_bytes()
+            req = urllib.request.Request(f"http://{mock.addr}/v2/fat/app/manifests/v1", data=man, method="PUT", headers={"Content-Type": "application/vnd.oci.image.manifest.v1+json"})
+            urllib.request.urlopen(req).read()
+            dest = t / "fat2000-pulled"
+            skeleton(dest)
+            code, out, err = pull(mock.addr, "fat/app", "v1", dest)
+            ok(code == 1 and "layout-json" in err and not blobs_of(dest) and not (dest / "index.json").exists(), f"pulling a manifest of 2000 layers: {code} {err!r}")
+        finally:
+            mock.stop()
+
         # ---------------------------------------------------------------- 3. validation
         good_args = ["--image", image, "--registry", "127.0.0.1:1", "--repo", "f/app", "--plain-http"]
 
@@ -365,7 +462,7 @@ def main():
         # a bad tag is refused before the layout is looked at (the missing image directory would be reported otherwise)
         refuse_push("a bad tag, before the layout is touched", ["--image", t / "nope", "--registry", "127.0.0.1:1", "--repo", "f/app", "--plain-http", "--tag", "-bad"], "push-tag")
         refuse_push("a bad repository name, before the layout is touched", ["--image", t / "nope", "--registry", "127.0.0.1:1", "--repo", "UPPER", "--plain-http"], "registry-name")
-        refuse_push("no --plain-http", ["--image", image, "--registry", "127.0.0.1:1", "--repo", "f/app"], "push-plain-http-required")
+        refuse_push("https with a roots file that is not there", ["--image", image, "--registry", "127.0.0.1:1", "--repo", "f/app", "--trust-file", t / "no-such-roots.pem"], "tls-roots")
         refuse_push("an unknown flag", [*good_args, "--frobnicate", "x"], "push-flag", "--frobnicate")
         refuse_push("a flag without a value", [*good_args, "--tag"], "push-flag", "--tag")
         refuse_push("no --image", ["--registry", "127.0.0.1:1", "--repo", "f/app", "--plain-http"], "push-missing")
@@ -410,7 +507,7 @@ def main():
         pd = t / "pdir"
         skeleton(pd)
         base = ["--registry", "127.0.0.1:1", "--repo", "f/app", "--ref", "v1", "--out", pd]
-        refuse_pull("no --plain-http", base, "pull-plain-http-required")
+        refuse_pull("https with a roots file that is not there", [*base, "--trust-file", t / "no-such-roots.pem"], "tls-roots")
         refuse_pull("an unknown flag", [*base, "--plain-http", "--x", "y"], "pull-flag")
         refuse_pull("a bad ref", ["--registry", "127.0.0.1:1", "--repo", "f/app", "--ref", "-bad", "--out", pd, "--plain-http"], "pull-ref")
         refuse_pull("a bad platform", [*base, "--plain-http", "--platform", "arm64"], "pull-platform")
@@ -422,6 +519,239 @@ def main():
         refuse_pull("a missing out", ["--registry", "127.0.0.1:1", "--repo", "f/app", "--ref", "v1", "--plain-http"], "pull-missing")
         (t / "bare2").mkdir()
         refuse_pull("a missing skeleton", ["--registry", "127.0.0.1:1", "--repo", "f/app", "--ref", "v1", "--out", t / "bare2", "--plain-http"], "pull-layout-skeleton")
+
+        # ---------------------------------------------------------------- 3c. where an upload may go
+        # (registry.upload_target, through target-probe: the rule that keeps credentials and bodies on the host asked for)
+        up = "/v2/x/blobs/uploads/u"
+        for location, host, port, want in [
+            (up, "reg.example", 5000, up + "?digest=sha256:abc"),
+            (up + "?_state=s", "reg.example", 5000, up + "?_state=s&digest=sha256:abc"),
+            ("//other.example" + up, "reg.example", 5000, "//other.example" + up + "?digest=sha256:abc"),     # a path on this host, whatever it looks like
+            ("http://reg.example:5000" + up, "reg.example", 5000, up + "?digest=sha256:abc"),
+            ("https://reg.example" + up, "reg.example", 443, up + "?digest=sha256:abc"),
+            ("https://reg.example:443" + up, "reg.example", 443, up + "?digest=sha256:abc"),
+            ("http://reg.example" + up, "reg.example", 80, up + "?digest=sha256:abc"),
+            ("https://reg.example" + up, "reg.example", 5000, "registry-redirect-foreign-host"),       # no port is 443 only for https on 443
+            ("http://reg.example" + up, "reg.example", 443, "registry-redirect-foreign-host"),
+            ("https://reg.example" + up, "reg.example", 80, "registry-redirect-foreign-host"),
+            ("ftp://reg.example" + up, "reg.example", 80, "registry-redirect-foreign-host"),
+            ("https://reg.example:444" + up, "reg.example", 443, "registry-redirect-foreign-host"),
+            ("https://other.example" + up, "reg.example", 443, "registry-redirect-foreign-host"),
+            ("https://reg.example.evil" + up, "reg.example", 443, "registry-redirect-foreign-host"),
+            ("https://reg.example@other.example" + up, "reg.example", 443, "registry-redirect-foreign-host"),
+            ("https://reg.example:443@other.example" + up, "reg.example", 443, "registry-redirect-foreign-host"),
+            ("https://evil.example:443" + up, "reg.example", 443, "registry-redirect-foreign-host"),
+            ("reg.example:5000" + up, "reg.example", 5000, "registry-location"),
+            ("https://reg.example", "reg.example", 443, "registry-location"),
+            ("", "reg.example", 443, "registry-location"),
+            ("v2/x", "reg.example", 443, "registry-location"),
+        ]:
+            code, out, err = run([TARGET, location, host, port])
+            if want.startswith("registry-"):
+                ok(code == 1 and want in err, f"upload target {location!r} for {host}:{port}: expected {want}, got {code} {out!r} {err!r}")
+            else:
+                ok(code == 0 and out == want, f"upload target {location!r} for {host}:{port}: expected {want!r}, got {code} {out!r} {err!r}")
+
+        # ---------------------------------------------------------------- 3b. https and tokens
+        pki = make_pki(t / "pki")
+        if not pki:
+            notes.append("openssl NOT installed: the https checks were not run")
+        else:
+            w = t / "tls"
+            image, digests, top = make_image(w, ["amd64"], "gzip")
+            nreg = len(registry_blobs(image, list(digests.values())))
+            roots = ["--trust-file", pki["ca"]]
+
+            def secure_round(label, mock, host, extra_push=(), extra_pull=(), expect_push=0, expect_pull=0, push_tag=None, pull_tag=None, blobs=None):
+                """Push `image` and pull it back over https (or plain, for a plain mock); check the outcome and what the registry holds."""
+                plain = mock.scheme == "http"
+                addr = f"{host}:{mock.port}"
+                code, out, err = push(image, addr, "tls/app", extra=[*([] if plain else roots), *extra_push], plain=plain)
+                if expect_push == 0:
+                    if not ok(code == 0 and "pushed as v1" in out, f"{label}: push refused: {code} {err!r} {out!r}"):
+                        return
+                    ok(len(mock.state()["blobs"]) == nreg, f"{label}: the registry holds {len(mock.state()['blobs'])} blobs, expected {nreg}")
+                    dest = w / f"pulled-{label.replace(' ', '-')}"
+                    skeleton(dest)
+                    code, out, err = pull(addr, "tls/app", "v1", dest, extra=[*([] if plain else roots), *extra_pull], plain=plain)
+                    if ok(code == 0 and last(out) == top, f"{label}: pull refused: {code} {err!r}"):
+                        got = layout_ok(dest, top, label, "v1")
+                        ok(got == blobs_of(image), f"{label}: the pulled blobs differ from the pushed ones")
+                else:
+                    ok(code == 1 and push_tag in err, f"{label}: push: expected {push_tag}, got {code} {err!r}")
+                    if blobs is not None:
+                        ok(len(mock.state()["blobs"]) == blobs, f"{label}: the registry holds {len(mock.state()['blobs'])} blobs, expected {blobs}")
+
+            for host in ("127.0.0.1", "localhost"):
+                mock = Mock(tls=pki["good"])
+                try:
+                    secure_round(f"https {host}", mock, host)
+                finally:
+                    mock.stop()
+            # a roots file with no certificate in it is refused, not trusted
+            (t / "garbage.pem").write_text("-----BEGIN NOTHING-----\nAAAA\n-----END NOTHING-----\n")
+            code, out, err = push(image, "127.0.0.1:1", "tls/app", extra=["--trust-file", t / "garbage.pem"], plain=False)
+            ok(code == 1 and "tls-roots" in err, f"a roots file with no certificate: {code} {err!r}")
+            # a layer of 2.5 MB over https: many records, the engine takes ciphertext only as it has room for the plaintext
+            wbig = t / "tls-big"
+            big_image, big_digests, big_top = make_image(wbig, ["amd64"], "gzip", big=2_500_000)
+            mock = Mock(bearer=True, tls=pki["good"])
+            try:
+                code, out, err = push(big_image, mock.addr, "tls/big", extra=roots, plain=False)
+                if ok(code == 0, f"a 2.5 MB layer over https: push refused: {err!r}"):
+                    dest = wbig / "pulled"
+                    skeleton(dest)
+                    code, out, err = pull(mock.addr, "tls/big", "v1", dest, extra=roots, plain=False)
+                    ok(code == 0 and last(out) == big_top and blobs_of(dest) == blobs_of(big_image), f"a 2.5 MB layer over https: pull: {code} {err!r}")
+            finally:
+                mock.stop()
+            # https with credentials; with the wrong ones
+            cd = t / "tls-creds"
+            cd.mkdir()
+            (cd / "good").write_text("alice:s3cret\n")
+            (cd / "wrong").write_text("alice:nope\n")
+            mock = Mock(auth="alice:s3cret", tls=pki["good"])
+            try:
+                secure_round("https with credentials", mock, "127.0.0.1", ["--basic-file", cd / "good"], ["--basic-file", cd / "good"])
+            finally:
+                mock.stop()
+            mock = Mock(auth="alice:s3cret", tls=pki["good"])
+            try:
+                secure_round("https with the wrong credentials", mock, "127.0.0.1", ["--basic-file", cd / "wrong"], expect_push=1, push_tag="registry-unauthorized", blobs=0)
+            finally:
+                mock.stop()
+            # what a client must not accept: each refused before a single request reaches the registry
+            for label, cert, trust, tag in [("a certificate from an unknown authority", "good", pki["other"], "x509-unknown-issuer"),
+                                            ("an expired certificate", "expired", pki["ca"], "x509-expired"),
+                                            ("a certificate for another name", "wrongname", pki["ca"], "x509-name-mismatch")]:
+                mock = Mock(tls=pki[cert])
+                try:
+                    code, out, err = push(image, mock.addr, "tls/app", extra=["--trust-file", trust], plain=False)
+                    ok(code == 1 and tag in err, f"{label}: expected {tag}, got {code} {err!r}")
+                    code2, out2, err2 = pull(mock.addr, "tls/app", "v1", w / "never", extra=["--trust-file", trust], plain=False)
+                    ok(code2 == 1, f"{label}: pull should be refused: {code2} {err2!r}")
+                    st = mock.state()
+                    ok(not st["blobs"] and st["served"] == 0 and not [l for l in st["log"] if "GET" in l or "PUT" in l or "POST" in l or "HEAD" in l], f"{label}: a request reached the registry: {st['log']}")
+                finally:
+                    mock.stop()
+            # https to a registry that speaks plain HTTP, and plain HTTP to one that speaks https
+            mock = Mock()
+            try:
+                code, out, err = push(image, mock.addr, "tls/app", extra=roots, plain=False)
+                ok(code == 1 and "http-" not in err.split("refused:")[-1][:6] and not mock.state()["blobs"], f"https to a plain registry: {code} {err!r}")
+            finally:
+                mock.stop()
+            mock = Mock(tls=pki["good"])
+            try:
+                code, out, err = push(image, mock.addr, "tls/app")
+                ok(code == 1 and not mock.state()["blobs"], f"plain HTTP to an https registry: {code} {err!r}")
+            finally:
+                mock.stop()
+            # credentials are fine over https to any host (the rule is about plain HTTP); a non-loopback host that is not there
+            code, out, err = run([PUSH, "--image", image, "--registry", "registry.invalid:443", "--repo", "tls/app", "--basic-file", cd / "good", *roots])
+            ok(code == 1 and "push-credentials-over-plain-http" not in err and "http-dial" in err, f"credentials over https to another host: {code} {err!r}")
+            skeleton(t / "tls-nowhere")
+            code, out, err = run([PULL, "--registry", "registry.invalid:443", "--repo", "tls/app", "--ref", "v1", "--out", t / "tls-nowhere", "--basic-file", cd / "good", *roots])
+            ok(code == 1 and "pull-credentials-over-plain-http" not in err and "http-dial" in err, f"pull: credentials over https to another host: {code} {err!r}")
+            # a server that ends a body by closing, over https, without a close_notify: the body may be cut short, so it is refused;
+            # the same server over plain HTTP is a valid until-close body
+            for scheme_label, tls_cert in (("plain", None), ("https", pki["good"])):
+                mock = Mock(["until-close"], tls=tls_cert)
+                try:
+                    plain = tls_cert is None
+                    code, out, err = push(image, mock.addr, "uc/app", extra=[] if plain else roots, plain=plain)
+                    dest = t / f"until-close-{scheme_label}"
+                    skeleton(dest)
+                    code, out, err = pull(mock.addr, "uc/app", "v1", dest, extra=[] if plain else roots, plain=plain)
+                    if plain:
+                        ok(code == 0, f"an until-close body over plain HTTP: {code} {err!r}")
+                    else:
+                        ok(code == 1 and "http-truncated" in err and not blobs_of(dest), f"an until-close body over https with no close_notify: {code} {err!r}")
+                finally:
+                    mock.stop()
+
+            # the Bearer token flow, over https and over plain HTTP to loopback
+            for scheme_label, tls_cert in (("https", pki["good"]), ("plain", None)):
+                mock = Mock(bearer=True, tls=tls_cert)
+                try:
+                    secure_round(f"bearer {scheme_label}", mock, "127.0.0.1")
+                    ok(sum("token" in l for l in mock.state()["log"]) >= 0, "no token log")
+                finally:
+                    mock.stop()
+                mock = Mock(bearer=True, auth="alice:s3cret", tls=tls_cert)
+                try:
+                    secure_round(f"bearer {scheme_label} with credentials", mock, "127.0.0.1", ["--basic-file", cd / "good"], ["--basic-file", cd / "good"]) if scheme_label == "plain" else secure_round(f"bearer {scheme_label} with credentials", mock, "127.0.0.1", ["--basic-file", cd / "good"], ["--basic-file", cd / "good"])
+                finally:
+                    mock.stop()
+                mock = Mock(bearer=True, auth="alice:s3cret", tls=tls_cert)
+                try:
+                    secure_round(f"bearer {scheme_label} without credentials", mock, "127.0.0.1", expect_push=1, push_tag="registry-unauthorized", blobs=0)
+                finally:
+                    mock.stop()
+            for fault, tag, blobs in [("token-foreign-realm", "registry-token-realm", 0), ("token-crlf", "registry-token", 0), ("token-bad-json", "registry-token", 0),
+                                      ("token-denied", "registry-unauthorized", 0), ("token-pull-only", "registry-auth-bearer", 0), ("token-huge", "registry-token", 0)]:
+                mock = Mock([fault], bearer=True, tls=pki["good"])
+                try:
+                    secure_round(f"fault {fault}", mock, "127.0.0.1", expect_push=1, push_tag=tag, blobs=blobs)
+                    st = mock.state()
+                    if fault == "token-foreign-realm":
+                        ok(not [l for l in st["log"] if "token" in l], f"{fault}: a token was asked for from this registry although the realm named another host")
+                finally:
+                    mock.stop()
+            mock = Mock(["token-access-token"], bearer=True, tls=pki["good"])
+            try:
+                secure_round("token under access_token", mock, "127.0.0.1")
+            finally:
+                mock.stop()
+
+        # ---------------------------------------------------------------- 3d. blob redirects
+        # A registry may hand a blob to a CDN with a 307. Followed for a blob GET only, at most 3 times, only to the scheme the
+        # registry itself speaks (plain HTTP only to loopback), never with the credentials, and the bytes are checked as always.
+        pushed = t / "redirect-image"
+        r_image, r_digests, r_top = make_image(pushed, ["amd64"], "gzip")
+        def redirect_case(label, fault, tls_cert, want_ok, tag=None, auth=None, creds=None):
+            mock = Mock([fault], auth=auth, tls=tls_cert)
+            try:
+                plain = tls_cert is None
+                extra = [] if plain else ["--trust-file", pki["ca"]]
+                if creds:
+                    extra += ["--basic-file", creds]
+                code, out, err = push(r_image, mock.addr, "r/app", extra=extra, plain=plain)
+                if not ok(code == 0, f"{label}: push: {code} {err!r}"):
+                    return
+                dest = t / ("redirect-" + label.replace(" ", "-"))
+                skeleton(dest)
+                code, out, err = pull(mock.addr, "r/app", "v1", dest, extra=extra, plain=plain)
+                st = mock.state()
+                if want_ok:
+                    ok(code == 0 and last(out) == r_top and blobs_of(dest) == blobs_of(r_image), f"{label}: pull: {code} {err!r}")
+                else:
+                    ok(code == 1 and tag in err, f"{label}: expected {tag}, got {code} {err!r}")
+                    # whatever had been fetched before the refusal, no half-blob is left behind
+                    ok(not [n for n in os.listdir(dest / "blobs" / "sha256") if n.startswith(".")], f"{label}: a temporary file was left behind")
+                ok(st["leaked"] == 0, f"{label}: credentials reached the redirect target {st['leaked']} times")
+                gets = len([l for l in st["log"] if "GET /v2/r/app/blobs/sha256" in l])
+                ok(gets <= 5, f"{label}: the blob address was asked for {gets} times")
+            finally:
+                mock.stop()
+
+        rc = t / "redirect-creds"
+        rc.mkdir()
+        (rc / "alice").write_text("alice:s3cret\n")
+        for tls_cert, scheme_label in ((None, "plain"), (pki["good"] if pki else None, "https")):
+            if scheme_label == "https" and not pki:
+                continue
+            redirect_case(f"{scheme_label} redirect to this host", "blob-redirect", tls_cert, True)
+            redirect_case(f"{scheme_label} redirect to a path", "blob-redirect-relative", tls_cert, True)
+            redirect_case(f"{scheme_label} redirect with credentials", "blob-redirect", tls_cert, True, auth="alice:s3cret", creds=rc / "alice")
+            redirect_case(f"{scheme_label} redirect forever", "blob-redirect-loop", tls_cert, False, "registry-redirect-foreign-host")
+            redirect_case(f"{scheme_label} redirect with a space in the address", "blob-redirect-space", tls_cert, False, "registry-redirect-foreign-host")
+            redirect_case(f"{scheme_label} redirect with userinfo", "blob-redirect-userinfo", tls_cert, False, "registry-redirect-foreign-host")
+            redirect_case(f"{scheme_label} redirect to a host that is not there", "blob-redirect-foreign", tls_cert, False, "http-dial" if scheme_label == "https" else "registry-redirect-foreign-host")
+        if pki:
+            redirect_case("https redirect to another name", "blob-redirect-other", pki["good"], True)
+            redirect_case("https redirect to another name with credentials", "blob-redirect-other", pki["good"], True, auth="alice:s3cret", creds=rc / "alice")
+            redirect_case("https redirect down to http", "blob-redirect-downgrade", pki["good"], False, "registry-redirect-foreign-host")
 
         # ---------------------------------------------------------------- 4. the real thing, when it is there
         def against(addr, label):

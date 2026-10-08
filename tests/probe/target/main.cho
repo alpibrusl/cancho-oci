@@ -1,0 +1,67 @@
+edition 7;
+
+import std.buffer;
+import std.io;
+import oci.registry;
+
+// target-probe: the test harness for the rules about where an upload may go (`registry.upload_target`).
+//
+//     target-probe <location> <host> <port>
+//
+// Prints the path that would be used, or `refused: <rule tag>` (exit status 1). No network, no files.
+
+fn number[&t](text: &t [byte]) -> [] int {
+    var value = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < '0' || c > '9' {
+            return 0 - 1;
+        }
+        value = value * 10 + (c - '0');
+        i = i + 1;
+    }
+    if len(text) == 0 {
+        return 0 - 1;
+    }
+    return value;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(fs);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    var status = 2;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow mut io as &!i in {
+                if arg_count(g) != 4 {
+                    io.error_all(i, "usage: target-probe <location> <host> <port>\n");
+                } else {
+                    let (path, code) = registry.upload_target(h, arg(g, 1), arg(g, 2), number(arg(g, 3)), "sha256:abc");
+                    if code == 0 {
+                        borrow path as &pb in {
+                            io.write_all(i, buffer.bytes(pb));
+                            io.write_all(i, "\n");
+                        }
+                        status = 0;
+                    } else {
+                        io.error_all(i, "refused: ");
+                        io.error_all(i, registry.rule_name(code));
+                        io.error_all(i, "\n");
+                        status = 1;
+                    }
+                    buffer.drop(h, path);
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(io);
+    return status;
+}

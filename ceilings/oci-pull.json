@@ -2,6 +2,7 @@
   "bounded": true,
   "effects": [
     "args",
+    "clock",
     "conn_read",
     "conn_write",
     "dir_read",
@@ -17,6 +18,10 @@
   "labels": [
     {
       "name": "args",
+      "argument": null
+    },
+    {
+      "name": "clock",
       "argument": null
     },
     {

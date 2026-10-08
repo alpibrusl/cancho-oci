@@ -3,10 +3,14 @@ edition 7;
 import std.buffer;
 import std.io;
 import oci.http;
+import oci.secure;
+import tls;
 
 // http-probe: the test harness for `oci.http` (#9). One request, the response on stdout:
 //
-//     http-probe <host> <port> <METHOD> <path>
+//     http-probe <host> <port> <METHOD> <path> [--tls <roots.pem>]
+//
+// With `--tls` the connection is TLS (cancho's own), trusting the roots in the PEM file.
 //
 // Prints `STATUS <n>`, then `HEAD <name>: <value>` for each of a few headers, then `BODY`,
 // then the body exactly as decoded, piece by piece. A refusal is `refused: <rule tag>` on
@@ -41,7 +45,7 @@ fn show[&i, &e](io: &!i Io, ex: &e http.Exchange, name: &static [byte]) -> [io_w
     return 0;
 }
 
-fn exchange[&h, &n, &i, &g](heap: &!h Heap, net: &n Net(""), io: &!i Io, args: &g Args) -> [heap, args, net_out(""), conn_read, conn_write, io_write, err_write] int {
+fn exchange[&h, &n, &i, &g, &e](heap: &!h Heap, net: &n Net(""), eng: &!e tls.Engine, now_ms: int, io: &!i Io, args: &g Args) -> [heap, args, net_out(""), conn_read, conn_write, io_write, err_write] int {
     let host = arg(args, 1);
     let port = number(arg(args, 2));
     var req = buffer.empty(heap, 256);
@@ -54,7 +58,7 @@ fn exchange[&h, &n, &i, &g](heap: &!h Heap, net: &n Net(""), io: &!i Io, args: &
     req = buffer.push_nat(heap, req, port);
     req = buffer.append(heap, req, "\r\nUser-Agent: http-probe\r\nConnection: close\r\n\r\n");
     var status = 1;
-    match http.begin(heap, net, host, port) {
+    match http.begin(heap, net, host, port, eng, now_ms) {
         http.Started::Failed(code) => {
             io.error_all(io, "refused: ");
             io.error_all(io, http.rule_name(code));
@@ -64,12 +68,12 @@ fn exchange[&h, &n, &i, &g](heap: &!h Heap, net: &n Net(""), io: &!i Io, args: &
             var ex = first;
             var code = 0;
             borrow req as &rb in {
-                let (next, c) = http.send(ex, buffer.bytes(rb));
+                let (next, c) = http.send(ex, eng, buffer.bytes(rb));
                 ex = next;
                 code = c;
             }
             if code == 0 {
-                let (next, c) = http.read_head(ex);
+                let (next, c) = http.read_head(ex, eng);
                 ex = next;
                 code = c;
             }
@@ -89,7 +93,7 @@ fn exchange[&h, &n, &i, &g](heap: &!h Heap, net: &n Net(""), io: &!i Io, args: &
                 var going = true;
                 while going {
                     borrow mut piece as &!pw in {
-                        let (next, n) = http.read_body(ex, contents(pw));
+                        let (next, n) = http.read_body(ex, eng, contents(pw));
                         ex = next;
                         if n > 0 {
                             io.write_all(io, contents(pw)[0..n]);
@@ -103,7 +107,17 @@ fn exchange[&h, &n, &i, &g](heap: &!h Heap, net: &n Net(""), io: &!i Io, args: &
                 }
                 unbox_slice(heap, piece);
             }
-            http.end(heap, ex);
+            borrow ex as &xr in {
+                if http.transport_failure(xr) != 0 {
+                    io.error_all(io, "transport: ");
+                    io.error_all(io, tls.refusal_tag(http.transport_failure(xr)));
+                    io.error_all(io, " (");
+                    io.print_nat(io, 0 - http.transport_failure(xr));
+                    io.error_all(io, ")");
+                    io.error_all(io, "\n");
+                }
+            }
+            http.end(heap, ex, eng);
             if code == 0 {
                 status = 0;
             } else {
@@ -117,22 +131,60 @@ fn exchange[&h, &n, &i, &g](heap: &!h Heap, net: &n Net(""), io: &!i Io, args: &
     return status;
 }
 
+fn is_tls_flag[&t](text: &t [byte]) -> [] bool {
+    let flag = "--tls";
+    if len(text) != len(flag) {
+        return false;
+    }
+    var k = 0;
+    while k < len(flag) {
+        if text[k] != flag[k] {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
     release(ffi);
-    release(fs);
-    release(clock);
     release(signals);
     release(exec);
     var status = 1;
     borrow mut heap as &!h in {
         borrow args as &g in {
             borrow net as &n in {
-                borrow mut io as &!i in {
-                    if arg_count(g) != 5 {
-                        io.error_all(i, "usage: http-probe <host> <port> <METHOD> <path>\n");
-                    } else {
-                        status = exchange(h, n, i, g);
+                borrow fs as &f in {
+                    borrow clock as &k in {
+                        borrow mut io as &!i in {
+                            if arg_count(g) != 5 && arg_count(g) != 7 {
+                                io.error_all(i, "usage: http-probe <host> <port> <METHOD> <path> [--tls <roots.pem>]\n");
+                            } else if arg_count(g) == 7 {
+                                if !is_tls_flag(arg(g, 5)) {
+                                    io.error_all(i, "usage: http-probe <host> <port> <METHOD> <path> [--tls <roots.pem>]\n");
+                                } else {
+                                    let (eng0, ready) = secure.engine(h, f, arg(g, 6));
+                                    var eng = eng0;
+                                    if ready != 0 {
+                                        io.error_all(i, "refused: ");
+                                        io.error_all(i, secure.rule_name(ready));
+                                        io.error_all(i, "\n");
+                                    } else {
+                                        borrow mut eng as &!ew in {
+                                            status = exchange(h, n, ew, clock_unix_ms(k), i, g);
+                                        }
+                                    }
+                                    tls.close(h, eng);
+                                }
+                            } else {
+                                var eng = tls.open(h, 1);
+                                borrow mut eng as &!ew2 in {
+                                    status = exchange(h, n, ew2, 0, i, g);
+                                }
+                                tls.close(h, eng);
+                            }
+                        }
                     }
                 }
             }
@@ -141,6 +193,8 @@ fn main(world: World) -> [] int {
     release(heap);
     release(args);
     release(net);
+    release(fs);
+    release(clock);
     release(io);
     return status;
 }

@@ -225,6 +225,17 @@ def main():
                         rc, text, err = run(["crane", "digest", r, "--insecure"])
                         ok(rc == 0 and text == out, f"case {n}: the registry's digest {text!r} is not the index digest {out!r}")
 
+        # ---- a config of several KB (120 labels): a JSON tape of 3 ints a byte does not fit a 64 KiB region, which used to trap
+        w = t / "fat"
+        root, image, digests = prepare(w, "fat", ["amd64", "arm64"])
+        labels = []
+        for i in range(120):
+            labels += ["--label", f"org.example.label{i:03d}=value-{i:03d}-" + "x" * 20]
+        fat = [build_image(BUILD, root, image, x, "fat", labels) for x in ("amd64", "arm64")]
+        code, out, err = run([INDEX, "--out", image, *manifests_args(fat)])
+        if ok(code == 0 and out.startswith("sha256:"), f"an image config of 120 labels: oci-index refused or crashed: {code} {err!r}"):
+            check_index(image, list(zip(fat, ("amd64", "arm64"))), "", "fat labels")
+
         # ---- refusals, each leaving the layout untouched
         w = t / "refusals"
         root, image, digests = prepare(w, "r", ARCHES)

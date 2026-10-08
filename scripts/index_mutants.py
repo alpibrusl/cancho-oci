@@ -38,6 +38,7 @@ MUTANTS = [
     ("image", "the ref annotation dropped from the layout index", '    if len(ref) > 0 {\n        w1 = json.put_key(heap, w1, "annotations");\n        w1 = json.begin_object(heap, w1);\n        w1 = json.put_key(heap, w1, "org.opencontainers.image.ref.name");\n        w1 = json.put_string(heap, w1, ref);\n        w1 = json.end_object(heap, w1);\n    }\n    w1 = json.end_object(heap, w1);\n    w1 = json.end_array(heap, w1);\n    w1 = json.end_object(heap, w1);\n    return (json.finish(w1), 0);\n}\n\n// `index.json` of a layout with one entry', '    w1 = json.end_object(heap, w1);\n    w1 = json.end_array(heap, w1);\n    w1 = json.end_object(heap, w1);\n    return (json.finish(w1), 0);\n}\n\n// `index.json` of a layout with one entry'),
     ("image", "the platform left out of an index entry", '    w1 = json.put_key(heap, w1, "platform");\n    w1 = json.begin_object(heap, w1);\n    w1 = json.put_key(heap, w1, "architecture");\n    w1 = json.put_string(heap, w1, arch);\n    w1 = json.put_key(heap, w1, "os");\n    w1 = json.put_string(heap, w1, os);\n    w1 = json.end_object(heap, w1);\n    return json.end_object(heap, w1);', '    return json.end_object(heap, w1);'),
     ("store", "a layer size miscounted by verify_sized", "                        size = got;", "                        size = got + 0 * got + 1;"),
+    ("layout", "the JSON tape not capped to a region", "    if all > 7000 {", "    if false {"),
 ]
 
 
