@@ -63,6 +63,13 @@ sources = ["src/http", "src/secure", "tests/probe/http"]
 std = true
 out = "build/http-probe"
 
+# Sign an image's manifest digest with Ed25519 and verify such a signature offline (#12). Files only: no network, no clock.
+[[bin]]
+name = "oci-sign"
+sources = ["src/digest", "src/store", "src/image", "src/layout", "src/sign", "src/signcli"]
+std = true
+out = "build/oci-sign"
+
 # The test harness for the upload-target rule of oci.registry (#9), held to its own ceiling (no network at all).
 [[bin]]
 name = "target-probe"

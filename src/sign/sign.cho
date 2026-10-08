@@ -1,0 +1,228 @@
+edition 7;
+
+module oci.sign;
+
+import std.buffer;
+import std.crypto;
+import std.ed25519;
+import std.json;
+import oci.digest;
+import oci.layout;
+
+// `oci.sign` -- a detached Ed25519 signature over an image's manifest digest (design 5.8, task #12).
+//
+// The signed message is the ASCII text `cancho-oci signature v1\n<digest>\n`, so a signature made for
+// this purpose cannot be replayed as a signature over anything else. The signature file is one small
+// JSON object with a fixed key order and nothing else in it:
+//
+//     {"type":"cancho-oci.signature.v1","digest":"sha256:<hex>","alg":"ed25519","keyid":"<hex>","signature":"<hex>"}
+//
+// `keyid` is the SHA-256 of the 32-byte public key, so a verifier can say which key a file claims
+// without trusting the claim: the key itself comes from the verifier's own file. Ed25519 is
+// deterministic, so the same key and digest give the same bytes. This is not `cosign`'s format
+// and does not interoperate with it. `std.ed25519` does not claim to be constant-time
+// (docs/ed25519.md of cancho): sign on a machine you control, not one that shares a CPU with a stranger.
+
+pub fn refused_format() -> [] int {
+    return 0 - 1010;
+}
+
+pub fn refused_keyid() -> [] int {
+    return 0 - 1011;
+}
+
+pub fn refused_subject() -> [] int {
+    return 0 - 1012;
+}
+
+pub fn refused_signature() -> [] int {
+    return 0 - 1013;
+}
+
+pub fn refused_digest_text() -> [] int {
+    return 0 - 1014;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == refused_format() {
+        return "sign-format";
+    }
+    if code == refused_keyid() {
+        return "sign-keyid";
+    }
+    if code == refused_subject() {
+        return "sign-subject";
+    }
+    if code == refused_signature() {
+        return "sign-bad-signature";
+    }
+    if code == refused_digest_text() {
+        return "sign-digest";
+    }
+    return "unknown";
+}
+
+// A signature file is small; anything bigger is not one.
+pub fn max_document() -> [] int {
+    return 4096;
+}
+
+pub fn type_text() -> [] &static [byte] {
+    return "cancho-oci.signature.v1";
+}
+
+fn hex_digit(n: int) -> [] int {
+    if n < 10 {
+        return 48 + n;
+    }
+    return 87 + n;
+}
+
+// `raw` as lower-case hex into `out` (twice as long).
+pub fn hex_of_raw[&r, &o](raw: &r [byte], out: &!o [byte]) -> [] int {
+    var i = 0;
+    while i < len(raw) {
+        let v = int_of(raw[i]);
+        out[2 * i] = byte_of(hex_digit(v >> 4));
+        out[2 * i + 1] = byte_of(hex_digit(v & 15));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn nibble(c: int) -> [] int {
+    if c >= '0' && c <= '9' {
+        return c - '0';
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10;
+    }
+    return 0 - 1;
+}
+
+// Lower-case hex of exactly `2 * len(raw)` characters into `raw`. 0, or -1.
+pub fn raw_of_hex[&t, &o](hex: &t [byte], raw: &!o [byte]) -> [] int {
+    if len(hex) != 2 * len(raw) {
+        return 0 - 1;
+    }
+    var i = 0;
+    while i < len(raw) {
+        let hi = nibble(int_of(hex[2 * i]));
+        let lo = nibble(int_of(hex[2 * i + 1]));
+        if hi < 0 || lo < 0 {
+            return 0 - 1;
+        }
+        raw[i] = byte_of(hi * 16 + lo);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// `sha256:` and 64 lower-case hex characters.
+pub fn digest_ok[&t](text: &t [byte]) -> [] bool {
+    return len(layout.hex_of(text)) == 64;
+}
+
+// The text that is signed for the digest `subject`, into `out` (which must hold `message_len`). 0.
+pub fn message_len() -> [] int {
+    return 24 + 71 + 1;
+}
+
+pub fn message_into[&t, &o](subject: &t [byte], out: &!o [byte]) -> [] int {
+    let head = "cancho-oci signature v1\n";
+    var n = 0;
+    while n < len(head) {
+        out[n] = head[n];
+        n = n + 1;
+    }
+    var k = 0;
+    while k < len(subject) {
+        out[n] = subject[k];
+        n = n + 1;
+        k = k + 1;
+    }
+    out[n] = byte_of('\n');
+    return 0;
+}
+
+// The key id of a 32-byte public key: the SHA-256 of it, in hex, into `out` (64 bytes).
+pub fn keyid_into[&k, &o](pub_key: &k [byte], out: &!o [byte]) -> [] int {
+    region a {
+        let raw = alloc_slice[a](32, byte_of(0));
+        crypto.sha256(pub_key, raw);
+        hex_of_raw(raw, out);
+    }
+    return 0;
+}
+
+// The signature document for `subject`, signed with the 32-byte `seed`. The document and 0, or an empty buffer
+// and a refusal.
+pub fn sign_document[&h, &t, &s](heap: &!h Heap, subject: &t [byte], seed: &s [byte]) -> [heap] (buffer.Buffer, int) {
+    if !digest_ok(subject) || len(seed) != 32 {
+        return (buffer.empty(heap, 1), refused_digest_text());
+    }
+    var out = buffer.empty(heap, 320);
+    region a {
+        let pk = alloc_slice[a](32, byte_of(0));
+        ed25519.public_key_from_seed(seed, pk);
+        let sig = alloc_slice[a](64, byte_of(0));
+        let msg = alloc_slice[a](message_len(), byte_of(0));
+        message_into(subject, msg);
+        ed25519.sign(seed, msg, sig);
+        let keyid = alloc_slice[a](64, byte_of(0));
+        keyid_into(pk, keyid);
+        let sighex = alloc_slice[a](128, byte_of(0));
+        hex_of_raw(sig, sighex);
+        out = buffer.append(heap, out, "{\"type\":\"");
+        out = buffer.append(heap, out, type_text());
+        out = buffer.append(heap, out, "\",\"digest\":\"");
+        out = buffer.append(heap, out, subject);
+        out = buffer.append(heap, out, "\",\"alg\":\"ed25519\",\"keyid\":\"");
+        out = buffer.append(heap, out, keyid);
+        out = buffer.append(heap, out, "\",\"signature\":\"");
+        out = buffer.append(heap, out, sighex);
+        out = buffer.append(heap, out, "\"}");
+    }
+    return (out, 0);
+}
+
+// Check a signature document: it has exactly the five members, the type and algorithm it must, names the key id of
+// `pub_key`, is about `subject`, and the signature verifies. 0, or a refusal.
+pub fn check_document[&d, &t, &k](doc: &d [byte], subject: &t [byte], pub_key: &k [byte]) -> [] int {
+    if len(doc) == 0 || len(pub_key) != 32 {
+        return refused_format();
+    }
+    if !digest_ok(subject) {
+        return refused_digest_text();
+    }
+    var code = 0;
+    region a {
+        let tape = alloc_slice[a](layout.tape_ints(doc), 0);
+        if json.parse(doc, tape) < 0 || !json.is_object(tape, 0) || json.count(tape, 0) != 5 {
+            code = refused_format();
+        } else if !digest.equal(layout.text_of(doc, tape, 0, "type"), type_text()) || !digest.equal(layout.text_of(doc, tape, 0, "alg"), "ed25519") {
+            code = refused_format();
+        } else {
+            let claimed = layout.text_of(doc, tape, 0, "digest");
+            let keyid = layout.text_of(doc, tape, 0, "keyid");
+            let sighex = layout.text_of(doc, tape, 0, "signature");
+            let want = alloc_slice[a](64, byte_of(0));
+            keyid_into(pub_key, want);
+            let sig = alloc_slice[a](64, byte_of(0));
+            if len(claimed) == 0 || len(keyid) == 0 || raw_of_hex(sighex, sig) != 0 {
+                code = refused_format();
+            } else if !digest.equal(keyid, want) {
+                code = refused_keyid();
+            } else if !digest.equal(claimed, subject) {
+                code = refused_subject();
+            } else {
+                let msg = alloc_slice[a](message_len(), byte_of(0));
+                message_into(subject, msg);
+                if ed25519.verify(pub_key, msg, sig) != 1 {
+                    code = refused_signature();
+                }
+            }
+        }
+    }
+    return code;
+}
