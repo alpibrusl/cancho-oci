@@ -1,0 +1,204 @@
+edition 7;
+
+module oci.sbom;
+
+import std.buffer;
+import std.crypto;
+import std.json;
+import std.io;
+import oci.digest;
+import oci.layout;
+import oci.place;
+import oci.sign;
+
+// `oci.sbom` -- pieces of a CycloneDX 1.5 software bill of materials for an image built by `oci-build` (design 5.8, task #12).
+//
+// What the document says: the image (by its manifest digest), and for each program or file put into it, its path in the image,
+// its SHA-256, and for a cancho program its **authority report** (`cancho authority --output json`): the effects it can have,
+// whether they are bounded, the foreign symbols it reaches. That is what no other image tool can say about a program.
+// And the libraries a project pins, by repository and full commit.
+//
+// What it does not say: it cannot read the image's layers (there is no gzip decoder here), so it records the files it was
+// *given*. Whether those are the image's contents is checked by building again with `oci-build` from the same inputs and
+// comparing digests, which works because builds are reproducible. There is no timestamp and no serial number, so the
+// same inputs give the same bytes.
+
+pub fn refused_report() -> [] int {
+    return 0 - 1100;
+}
+
+pub fn refused_spec() -> [] int {
+    return 0 - 1101;
+}
+
+pub fn refused_file() -> [] int {
+    return 0 - 1102;
+}
+
+pub fn refused_big() -> [] int {
+    return 0 - 1103;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == refused_report() {
+        return "sbom-authority-report";
+    }
+    if code == refused_spec() {
+        return "sbom-spec";
+    }
+    if code == refused_file() {
+        return "sbom-file";
+    }
+    if code == refused_big() {
+        return "sbom-document-too-large";
+    }
+    return "unknown";
+}
+
+// The biggest authority report read: the program's, not a library's.
+pub fn max_report() -> [] int {
+    return 131072;
+}
+
+// A path inside the image or a project name: printable ASCII with no space, quote or backslash, at most 200 bytes.
+pub fn plain[&t](text: &t [byte]) -> [] bool {
+    if len(text) == 0 || len(text) > 200 {
+        return false;
+    }
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c <= 32 || c >= 127 || c == '"' || c == '\\' {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn put_property[&h, &n, &v](heap: &!h Heap, w: json.Writer, name: &n [byte], value: &v [byte]) -> [heap] json.Writer {
+    var w1 = json.begin_object(heap, w);
+    w1 = json.put_key(heap, w1, "name");
+    w1 = json.put_string(heap, w1, name);
+    w1 = json.put_key(heap, w1, "value");
+    w1 = json.put_string(heap, w1, value);
+    return json.end_object(heap, w1);
+}
+
+// The elements of a component's `properties` array from an authority report (the caller opens and closes the array): one for `bounded`, then one per effect label (`name` or
+// `name(argument)`) and one per foreign symbol, in the report's order. Answers the writer and 0, or a refusal.
+pub fn put_authority[&h, &r](heap: &!h Heap, w: json.Writer, report: &r [byte]) -> [heap] (json.Writer, int) {
+    var w1 = w;
+    var code = 0;
+    region a {
+        let tape = alloc_slice[a](layout.tape_ints(report), 0);
+        if json.parse(report, tape) < 0 || !json.is_object(tape, 0) {
+            code = refused_report();
+        } else {
+            let bounded = json.get(report, tape, 0, "bounded");
+            let labels = json.get(report, tape, 0, "labels");
+            let symbols = json.get(report, tape, 0, "foreign_symbols");
+            if bounded < 0 || !json.is_bool(tape, bounded) || labels < 0 || !json.is_array(tape, labels) || symbols < 0 || !json.is_array(tape, symbols) {
+                code = refused_report();
+            } else {
+                var yes = false;
+                if json.kind(tape, bounded) == json.kind_true() {
+                    yes = true;
+                }
+                if yes {
+                    w1 = put_property(heap, w1, "cancho:authority:bounded", "true");
+                } else {
+                    w1 = put_property(heap, w1, "cancho:authority:bounded", "false");
+                }
+                var i = 0;
+                while code == 0 && i < json.count(tape, labels) {
+                    let label = json.at(tape, labels, i);
+                    let name = layout.text_of(report, tape, label, "name");
+                    if len(name) == 0 || !plain(name) {
+                        code = refused_report();
+                    } else {
+                        let arg = layout.text_of(report, tape, label, "argument");
+                        var value = buffer.empty(heap, 64);
+                        value = buffer.append(heap, value, name);
+                        if len(arg) > 0 {
+                            value = buffer.append(heap, value, "(");
+                            value = buffer.append(heap, value, arg);
+                            value = buffer.append(heap, value, ")");
+                        }
+                        borrow value as &vb in {
+                            w1 = put_property(heap, w1, "cancho:authority:effect", buffer.bytes(vb));
+                        }
+                        buffer.drop(heap, value);
+                    }
+                    i = i + 1;
+                }
+                var j = 0;
+                while code == 0 && j < json.count(tape, symbols) {
+                    let sym = json.string_view(report, tape, json.at(tape, symbols, j));
+                    if !plain(sym) {
+                        code = refused_report();
+                    } else {
+                        w1 = put_property(heap, w1, "cancho:authority:foreign-symbol", sym);
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+    }
+    return (w1, code);
+}
+
+// The SHA-256 of the file at `rel` below `root`, in hex into `out` (64 bytes), read through `chunk`. The hex is only
+// meaningful when the code is 0. Answers (code, size).
+pub fn hash_file[&r, &p, &o, &c](root: &r Dir, rel: &p [byte], out: &!o [byte], chunk: &!c [byte]) -> [dir_read, file_read] (int, int) {
+    var code = 0;
+    var total = 0;
+    region a {
+        let state = alloc_slice[a](crypto.sha256_state_len(), 0);
+        crypto.sha256_init(state);
+        match place.open_file(root, rel) {
+            Opened::Failed(errno) => {
+                code = refused_file();
+            }
+            Opened::Ok(file) => {
+                var handle = file;
+                var going = true;
+                while going {
+                    borrow mut handle as &!f in {
+                        match file_read(f, chunk) {
+                            Read::Got(n) => {
+                                crypto.sha256_update(state, chunk[0..n]);
+                                total = total + n;
+                            }
+                            Read::End => {
+                                going = false;
+                            }
+                            Read::Failed(errno) => {
+                                code = refused_file();
+                                going = false;
+                            }
+                        }
+                    }
+                }
+                file_close(handle);
+            }
+        }
+        let raw = alloc_slice[a](32, byte_of(0));
+        crypto.sha256_final(state, raw);
+        sign.hex_of_raw(raw, out);
+    }
+    return (code, total);
+}
+
+// One `hashes` member: SHA-256 of `hex`.
+pub fn put_hash[&h, &x](heap: &!h Heap, w: json.Writer, hex: &x [byte]) -> [heap] json.Writer {
+    var w1 = json.put_key(heap, w, "hashes");
+    w1 = json.begin_array(heap, w1);
+    w1 = json.begin_object(heap, w1);
+    w1 = json.put_key(heap, w1, "alg");
+    w1 = json.put_string(heap, w1, "SHA-256");
+    w1 = json.put_key(heap, w1, "content");
+    w1 = json.put_string(heap, w1, hex);
+    w1 = json.end_object(heap, w1);
+    return json.end_array(heap, w1);
+}

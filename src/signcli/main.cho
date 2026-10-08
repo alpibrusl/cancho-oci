@@ -123,36 +123,10 @@ fn layout_digest[&h, &f, &p, &o](heap: &!h Heap, fs: &f Fs(""), path: &p [byte],
         DirOpened::Ok(top) => {
             var dir = top;
             borrow dir as &dr in {
-                let (doc, c0) = layout.read_file(heap, dr, "index.json", layout.max_document());
-                code = c0;
-                if code == 0 {
-                    borrow doc as &db in {
-                        let src = buffer.bytes(db);
-                        region a {
-                            let tape = alloc_slice[a](layout.tape_ints(src), 0);
-                            if json.parse(src, tape) < 0 {
-                                code = layout.refused_json();
-                            } else {
-                                let manifests = json.get(src, tape, 0, "manifests");
-                                if manifests < 0 || !json.is_array(tape, manifests) || json.count(tape, manifests) != 1 {
-                                    code = sg_image();
-                                } else {
-                                    let text = layout.text_of(src, tape, json.at(tape, manifests, 0), "digest");
-                                    if len(text) != 71 || !sign.digest_ok(text) {
-                                        code = sg_image();
-                                    } else {
-                                        var k = 0;
-                                        while k < 71 {
-                                            out[k] = text[k];
-                                            k = k + 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                code = layout.entry_digest(heap, dr, out);
+                if code == layout.refused_shape() {
+                    code = sg_image();
                 }
-                buffer.drop(heap, doc);
             }
             dir_close(dir);
         }
