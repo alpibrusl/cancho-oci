@@ -45,7 +45,7 @@ fn show[&i, &e](io: &!i Io, ex: &e http.Exchange, name: &static [byte]) -> [io_w
     return 0;
 }
 
-fn exchange[&h, &n, &i, &g, &e](heap: &!h Heap, net: &n Net(""), eng: &!e tls.Engine, now_ms: int, io: &!i Io, args: &g Args) -> [heap, args, net_out(""), conn_read, conn_write, io_write, err_write] int {
+fn exchange[&h, &n, &i, &g, &e](heap: &!h Heap, net: &n Net(""), eng: &!e tls.Engine, now_ms: int, idle_ms: int, io: &!i Io, args: &g Args) -> [heap, args, net_out(""), conn_read, conn_write, poll, io_write, err_write] int {
     let host = arg(args, 1);
     let port = number(arg(args, 2));
     var req = buffer.empty(heap, 256);
@@ -58,7 +58,7 @@ fn exchange[&h, &n, &i, &g, &e](heap: &!h Heap, net: &n Net(""), eng: &!e tls.En
     req = buffer.push_nat(heap, req, port);
     req = buffer.append(heap, req, "\r\nUser-Agent: http-probe\r\nConnection: close\r\n\r\n");
     var status = 1;
-    match http.begin(heap, net, host, port, eng, now_ms) {
+    match http.begin(heap, net, host, port, eng, now_ms, idle_ms) {
         http.Started::Failed(code) => {
             io.error_all(io, "refused: ");
             io.error_all(io, http.rule_name(code));
@@ -131,8 +131,7 @@ fn exchange[&h, &n, &i, &g, &e](heap: &!h Heap, net: &n Net(""), eng: &!e tls.En
     return status;
 }
 
-fn is_tls_flag[&t](text: &t [byte]) -> [] bool {
-    let flag = "--tls";
+fn is_flag[&t, &n](text: &t [byte], flag: &n [byte]) -> [] bool {
     if len(text) != len(flag) {
         return false;
     }
@@ -144,6 +143,11 @@ fn is_tls_flag[&t](text: &t [byte]) -> [] bool {
         k = k + 1;
     }
     return true;
+}
+
+fn usage[&i](io: &!i Io) -> [err_write] int {
+    io.error_all(io, "usage: http-probe <host> <port> <METHOD> <path> [--tls <roots.pem>] [--timeout-s <n>]\n");
+    return 1;
 }
 
 fn main(world: World) -> [] int {
@@ -158,29 +162,44 @@ fn main(world: World) -> [] int {
                 borrow fs as &f in {
                     borrow clock as &k in {
                         borrow mut io as &!i in {
-                            if arg_count(g) != 5 && arg_count(g) != 7 {
-                                io.error_all(i, "usage: http-probe <host> <port> <METHOD> <path> [--tls <roots.pem>]\n");
-                            } else if arg_count(g) == 7 {
-                                if !is_tls_flag(arg(g, 5)) {
-                                    io.error_all(i, "usage: http-probe <host> <port> <METHOD> <path> [--tls <roots.pem>]\n");
-                                } else {
-                                    let (eng0, ready) = secure.engine(h, f, arg(g, 6));
-                                    var eng = eng0;
-                                    if ready != 0 {
-                                        io.error_all(i, "refused: ");
-                                        io.error_all(i, secure.rule_name(ready));
-                                        io.error_all(i, "\n");
-                                    } else {
-                                        borrow mut eng as &!ew in {
-                                            status = exchange(h, n, ew, clock_unix_ms(k), i, g);
-                                        }
+                            var roots = "";
+                            var idle_s = 30;
+                            var at = 5;
+                            var bad = arg_count(g) < 5;
+                            while !bad && at < arg_count(g) {
+                                if at + 1 >= arg_count(g) {
+                                    bad = true;
+                                } else if is_flag(arg(g, at), "--tls") {
+                                    roots = arg(g, at + 1);
+                                } else if is_flag(arg(g, at), "--timeout-s") {
+                                    idle_s = number(arg(g, at + 1));
+                                    if idle_s < 1 {
+                                        bad = true;
                                     }
-                                    tls.close(h, eng);
+                                } else {
+                                    bad = true;
                                 }
+                                at = at + 2;
+                            }
+                            if bad {
+                                status = usage(i);
+                            } else if len(roots) > 0 {
+                                let (eng0, ready) = secure.engine(h, f, roots);
+                                var eng = eng0;
+                                if ready != 0 {
+                                    io.error_all(i, "refused: ");
+                                    io.error_all(i, secure.rule_name(ready));
+                                    io.error_all(i, "\n");
+                                } else {
+                                    borrow mut eng as &!ew in {
+                                        status = exchange(h, n, ew, clock_unix_ms(k), idle_s * 1000, i, g);
+                                    }
+                                }
+                                tls.close(h, eng);
                             } else {
                                 var eng = tls.open(h, 1);
                                 borrow mut eng as &!ew2 in {
-                                    status = exchange(h, n, ew2, 0, i, g);
+                                    status = exchange(h, n, ew2, 0, idle_s * 1000, i, g);
                                 }
                                 tls.close(h, eng);
                             }

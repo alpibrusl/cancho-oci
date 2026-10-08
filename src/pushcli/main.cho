@@ -141,12 +141,12 @@ fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int 
 
 // Make sure the blob `digest_text` (descriptor size `size`) is in the registry: skipped if it
 // is already there, else re-hashed and uploaded. Prints one line. 0 or a refusal.
-fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, dir_read, file_read, io_write] int {
     let hex = layout.hex_of(digest_text);
     if len(hex) == 0 || size < 0 {
         return push_layout();
     }
-    let there = registry.blob_status(heap, net, eng, now_ms, host, port, auth, repo, digest_text);
+    let there = registry.blob_status(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, digest_text);
     if there < 0 {
         return there;
     }
@@ -172,7 +172,7 @@ fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(
         Opened::Ok(file) => {
             var handle = file;
             borrow mut handle as &!f in {
-                code = registry.blob_upload(heap, net, eng, now_ms, host, port, auth, repo, digest_text, size, f);
+                code = registry.blob_upload(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, digest_text, size, f);
             }
             file_close(handle);
         }
@@ -189,7 +189,7 @@ fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(
 
 // Push the config and layers a manifest names (`body`), then the manifest itself at
 // `reference`. 0 or a refusal.
-fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], body: &d [byte], digest_text: &g [byte], blobs: &k Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], body: &d [byte], digest_text: &g [byte], blobs: &k Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, dir_read, file_read, io_write] int {
     var code = 0;
     region a2 {
         let tape = alloc_slice[a2](layout.tape_ints(body), 0);
@@ -201,15 +201,15 @@ fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k, &tl](heap: &!h Heap, ne
             if cfg < 0 || layers < 0 || !json.is_array(tape, layers) {
                 code = push_layout();
             } else {
-                code = ensure_blob(heap, net, eng, now_ms, host, port, auth, repo, layout.text_of(body, tape, cfg, "digest"), layout.number_of(body, tape, cfg, "size"), blobs, io);
+                code = ensure_blob(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, layout.text_of(body, tape, cfg, "digest"), layout.number_of(body, tape, cfg, "size"), blobs, io);
                 var l = 0;
                 while code == 0 && l < json.count(tape, layers) {
                     let node = json.at(tape, layers, l);
-                    code = ensure_blob(heap, net, eng, now_ms, host, port, auth, repo, layout.text_of(body, tape, node, "digest"), layout.number_of(body, tape, node, "size"), blobs, io);
+                    code = ensure_blob(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, layout.text_of(body, tape, node, "digest"), layout.number_of(body, tape, node, "size"), blobs, io);
                     l = l + 1;
                 }
                 if code == 0 {
-                    code = registry.manifest_put(heap, net, eng, now_ms, host, port, auth, repo, reference, layout.text_of(body, tape, 0, "mediaType"), body, digest_text);
+                    code = registry.manifest_put(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, reference, layout.text_of(body, tape, 0, "mediaType"), body, digest_text);
                     if code == 0 {
                         io.write_all(io, "manifest ");
                         io.write_all(io, digest_text);
@@ -225,7 +225,7 @@ fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k, &tl](heap: &!h Heap, ne
 }
 
 // The layout's one entry: push its image, or the images of its index and then the index.
-fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, secure: bool, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte], image_dir: &k Dir, blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, secure: bool, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte], image_dir: &k Dir, blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, dir_read, file_read, io_write] int {
     let (index_doc, c0) = layout.read_file(heap, image_dir, "index.json", layout.max_document());
     var code = c0;
     if code == 0 {
@@ -265,7 +265,7 @@ fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i, &tl](heap: &!h Heap, ne
                             var line = buffer.empty(heap, 1);
                             if code == 0 {
                                 // local checks are done: now find out what the registry wants as Authorization
-                                let (got, cn) = registry.negotiate(heap, net, eng, now_ms, host, port, secure, auth, repo, true);
+                                let (got, cn) = registry.negotiate(heap, net, eng, now_ms, idle_ms, host, port, secure, auth, repo, true);
                                 buffer.drop(heap, line);
                                 line = got;
                                 code = cn;
@@ -275,7 +275,7 @@ fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i, &tl](heap: &!h Heap, ne
                                     borrow body as &bb in {
                                         let doc = buffer.bytes(bb);
                                         if digest.equal(media, image.media_manifest()) {
-                                            code = push_manifest(heap, net, eng, now_ms, host, port, buffer.bytes(lb), repo, reference, doc, top_digest, blobs, io);
+                                            code = push_manifest(heap, net, eng, now_ms, idle_ms, host, port, buffer.bytes(lb), repo, reference, doc, top_digest, blobs, io);
                                         } else if digest.equal(media, image.media_index()) {
                                             region b {
                                                 let t2 = alloc_slice[b](layout.tape_ints(doc), 0);
@@ -298,7 +298,7 @@ fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i, &tl](heap: &!h Heap, ne
                                                             code = c2;
                                                             if code == 0 {
                                                                 borrow kid_body as &kb in {
-                                                                    code = push_manifest(heap, net, eng, now_ms, host, port, buffer.bytes(lb), repo, kid_digest, buffer.bytes(kb), kid_digest, blobs, io);
+                                                                    code = push_manifest(heap, net, eng, now_ms, idle_ms, host, port, buffer.bytes(lb), repo, kid_digest, buffer.bytes(kb), kid_digest, blobs, io);
                                                                 }
                                                             }
                                                             buffer.drop(heap, kid_body);
@@ -306,7 +306,7 @@ fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i, &tl](heap: &!h Heap, ne
                                                         m = m + 1;
                                                     }
                                                     if code == 0 {
-                                                        code = registry.manifest_put(heap, net, eng, now_ms, host, port, buffer.bytes(lb), repo, reference, image.media_index(), doc, top_digest);
+                                                        code = registry.manifest_put(heap, net, eng, now_ms, idle_ms, host, port, buffer.bytes(lb), repo, reference, image.media_index(), doc, top_digest);
                                                         if code == 0 {
                                                             io.write_all(io, "index ");
                                                             io.write_all(io, top_digest);
@@ -335,7 +335,7 @@ fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i, &tl](heap: &!h Heap, ne
     return code;
 }
 
-fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &tl](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, secure: bool, io: &!i Io, image_path: &static [byte], host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte]) -> [heap, fs_read(""), net_out(""), conn_read, conn_write, dir_read, file_read, io_write, err_write] int {
+fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &tl](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, secure: bool, io: &!i Io, image_path: &static [byte], host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte]) -> [heap, fs_read(""), net_out(""), conn_read, conn_write, poll, dir_read, file_read, io_write, err_write] int {
     var status = 1;
     match open_dir(fs, image_path) {
         DirOpened::Failed(errno) => {
@@ -358,7 +358,7 @@ fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &tl](heap: &!h Heap, fs: &f Fs(""),
                                 DirOpened::Ok(sha_dir) => {
                                     var sha = sha_dir;
                                     borrow sha as &sd in {
-                                        let code = push_layout_entry(heap, net, eng, now_ms, secure, host, port, auth, repo, tag, id, sd, io);
+                                        let code = push_layout_entry(heap, net, eng, now_ms, idle_ms, secure, host, port, auth, repo, tag, id, sd, io);
                                         if code == 0 {
                                             io.write_all(io, "ok\n");
                                             status = 0;
@@ -380,7 +380,7 @@ fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &tl](heap: &!h Heap, fs: &f Fs(""),
     return status;
 }
 
-fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args, clock_ms: int) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, dir_read, file_read, io_write, err_write] int {
+fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args, clock_ms: int) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, poll, dir_read, file_read, io_write, err_write] int {
     var image_path = "";
     var registry_text = "";
     var repo = "";
@@ -388,6 +388,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     var basic_file = "";
     var plain = false;
     var trust_file = "/etc/ssl/certs/ca-certificates.crt";
+    var idle_s = 30;
     var bad = "";
     var at = 1;
     while at < arg_count(args) && len(bad) == 0 {
@@ -411,6 +412,8 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
                 basic_file = value;
             } else if digest.equal(flag, "--trust-file") {
                 trust_file = value;
+            } else if digest.equal(flag, "--timeout-s") {
+                idle_s = registry.port_of(value);
             } else {
                 bad = flag;
             }
@@ -419,6 +422,9 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     }
     if len(bad) > 0 {
         return refuse(io, push_flag(), bad);
+    }
+    if idle_s < 1 {
+        return refuse(io, push_flag(), "--timeout-s");
     }
     if len(image_path) == 0 || len(registry_text) == 0 || len(repo) == 0 {
         return refuse(io, push_missing(), "--image, --registry and --repo are required");
@@ -463,6 +469,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     // The engine: for https, the roots from the PEM file and entropy from /dev/urandom; for plain HTTP, one that is never used.
     var eng = tls.open(heap, 1);
     var now_ms = 0;
+    let idle_ms = idle_s * 1000;
     var ready = 0;
     if !plain {
         tls.close(heap, eng);
@@ -479,7 +486,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     var status = 1;
     borrow auth as &ab in {
         borrow mut eng as &!ew in {
-            status = with_dirs(heap, fs, net, ew, now_ms, !plain, io, image_path, host, port, buffer.bytes(ab), repo, tag);
+            status = with_dirs(heap, fs, net, ew, now_ms, idle_ms, !plain, io, image_path, host, port, buffer.bytes(ab), repo, tag);
         }
     }
     tls.close(heap, eng);

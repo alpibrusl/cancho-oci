@@ -130,7 +130,7 @@ fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int 
 }
 
 // Bring one blob into the layout unless an intact copy of the right size is already there.
-fn want_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, dir_write, file_read, file_write, io_write] int {
+fn want_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, dir_read, dir_write, file_read, file_write, io_write] int {
     let hex = layout.hex_of(digest_text);
     if len(hex) == 0 || size < 0 {
         return pull_document();
@@ -142,7 +142,7 @@ fn want_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""
         io.write_all(io, " already here\n");
         return 0;
     }
-    let code = registry.blob_fetch(heap, net, eng, now_ms, host, port, auth, repo, digest_text, size, blobs, ".incoming-pull");
+    let code = registry.blob_fetch(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, digest_text, size, blobs, ".incoming-pull");
     if code == 0 {
         io.write_all(io, "blob ");
         io.write_all(io, digest_text);
@@ -154,7 +154,7 @@ fn want_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""
 }
 
 // A manifest's config and layers, then the manifest document itself.
-fn take_image[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], doc: &d [byte], blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, dir_write, file_read, file_write, io_write] int {
+fn take_image[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], doc: &d [byte], blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, dir_read, dir_write, file_read, file_write, io_write] int {
     var code = 0;
     region a2 {
         let tape = alloc_slice[a2](layout.tape_ints(doc), 0);
@@ -168,11 +168,11 @@ fn take_image[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net("
             if cfg < 0 || layers < 0 || !json.is_array(tape, layers) || json.count(tape, layers) < 1 {
                 code = pull_document();
             } else {
-                code = want_blob(heap, net, eng, now_ms, host, port, auth, repo, layout.text_of(doc, tape, cfg, "digest"), layout.number_of(doc, tape, cfg, "size"), blobs, io);
+                code = want_blob(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, layout.text_of(doc, tape, cfg, "digest"), layout.number_of(doc, tape, cfg, "size"), blobs, io);
                 var l = 0;
                 while code == 0 && l < json.count(tape, layers) {
                     let node = json.at(tape, layers, l);
-                    code = want_blob(heap, net, eng, now_ms, host, port, auth, repo, layout.text_of(doc, tape, node, "digest"), layout.number_of(doc, tape, node, "size"), blobs, io);
+                    code = want_blob(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, layout.text_of(doc, tape, node, "digest"), layout.number_of(doc, tape, node, "size"), blobs, io);
                     l = l + 1;
                 }
                 if code == 0 {
@@ -213,7 +213,7 @@ fn platform_matches[&s, &t, &w](src: &s [byte], tape: &t [int], node: int, want:
     return digest.equal(os, want[0..slash]) && digest.equal(arch, want[slash + 1..len(want)]);
 }
 
-fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], platform: &p [byte], image_dir: &d Dir, blobs: &b Dir, io: &!i Io, tag: &k [byte]) -> [heap, net_out(""), conn_read, conn_write, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], platform: &p [byte], image_dir: &d Dir, blobs: &b Dir, io: &!i Io, tag: &k [byte]) -> [heap, net_out(""), conn_read, conn_write, poll, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
     var status = 1;
     region w {
         let shown = alloc_slice[w](71, byte_of(0));
@@ -221,7 +221,7 @@ fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap
         var code = 0;
         var top_size = 0;
         var top_media = image.media_manifest();
-        let (doc, c0) = registry.manifest_fetch(heap, net, eng, now_ms, host, port, auth, repo, reference, shown);
+        let (doc, c0) = registry.manifest_fetch(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, reference, shown);
         code = c0;
         if code == 0 {
             borrow doc as &db in {
@@ -237,7 +237,7 @@ fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap
                             if len(platform) > 0 {
                                 code = pull_platform();
                             } else {
-                                code = take_image(heap, net, eng, now_ms, host, port, auth, repo, body, blobs, io);
+                                code = take_image(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, body, blobs, io);
                                 top_size = len(body);
                                 var k = 0;
                                 while k < 71 {
@@ -258,11 +258,11 @@ fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap
                                     chosen = chosen + 1;
                                     let kid_digest = layout.text_of(body, tape, kid, "digest");
                                     let kid_shown = alloc_slice[w](71, byte_of(0));
-                                    let (kid_doc, c1) = registry.manifest_fetch(heap, net, eng, now_ms, host, port, auth, repo, kid_digest, kid_shown);
+                                    let (kid_doc, c1) = registry.manifest_fetch(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, kid_digest, kid_shown);
                                     code = c1;
                                     if code == 0 {
                                         borrow kid_doc as &kb in {
-                                            code = take_image(heap, net, eng, now_ms, host, port, auth, repo, buffer.bytes(kb), blobs, io);
+                                            code = take_image(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, buffer.bytes(kb), blobs, io);
                                             if len(platform) > 0 && code == 0 {
                                                 // a single platform: the layout's entry is that image, not the index
                                                 top_size = len(buffer.bytes(kb));
@@ -328,21 +328,21 @@ fn assemble_with[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap
 
 // The pull itself needs an Authorization line the registry accepts; this finds it (a token for Bearer registries, after the
 // layout has been checked and before anything is asked of the registry), then pulls.
-fn assemble[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, secure: bool, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], platform: &p [byte], image_dir: &d Dir, blobs: &b Dir, io: &!i Io, tag: &k [byte]) -> [heap, net_out(""), conn_read, conn_write, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
-    let (line, c) = registry.negotiate(heap, net, eng, now_ms, host, port, secure, auth, repo, false);
+fn assemble[&h, &n, &t, &a, &r, &x, &p, &d, &b, &i, &k, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, secure: bool, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], platform: &p [byte], image_dir: &d Dir, blobs: &b Dir, io: &!i Io, tag: &k [byte]) -> [heap, net_out(""), conn_read, conn_write, poll, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let (line, c) = registry.negotiate(heap, net, eng, now_ms, idle_ms, host, port, secure, auth, repo, false);
     var status = 1;
     if c != 0 {
         status = refuse(io, c, host);
     } else {
         borrow line as &lb in {
-            status = assemble_with(heap, net, eng, now_ms, host, port, buffer.bytes(lb), repo, reference, platform, image_dir, blobs, io, tag);
+            status = assemble_with(heap, net, eng, now_ms, idle_ms, host, port, buffer.bytes(lb), repo, reference, platform, image_dir, blobs, io, tag);
         }
     }
     buffer.drop(heap, line);
     return status;
 }
 
-fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &p, &k, &tl](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, secure: bool, io: &!i Io, out_path: &static [byte], host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], platform: &p [byte], tag: &k [byte]) -> [heap, fs_read(""), net_out(""), conn_read, conn_write, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &p, &k, &tl](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, secure: bool, io: &!i Io, out_path: &static [byte], host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], platform: &p [byte], tag: &k [byte]) -> [heap, fs_read(""), net_out(""), conn_read, conn_write, poll, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
     var status = 1;
     match open_dir(fs, out_path) {
         DirOpened::Failed(errno) => {
@@ -365,7 +365,7 @@ fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &p, &k, &tl](heap: &!h Heap, fs: &f
                                 DirOpened::Ok(sha_dir) => {
                                     var sha = sha_dir;
                                     borrow sha as &sd in {
-                                        status = assemble(heap, net, eng, now_ms, secure, host, port, auth, repo, reference, platform, id, sd, io, tag);
+                                        status = assemble(heap, net, eng, now_ms, idle_ms, secure, host, port, auth, repo, reference, platform, id, sd, io, tag);
                                     }
                                     dir_close(sha);
                                 }
@@ -381,7 +381,7 @@ fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &p, &k, &tl](heap: &!h Heap, fs: &f
     return status;
 }
 
-fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args, clock_ms: int) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args, clock_ms: int) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, poll, dir_read, dir_write, file_read, file_write, io_write, err_write] int {
     var out_path = "";
     var registry_text = "";
     var repo = "";
@@ -390,6 +390,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     var basic_file = "";
     var plain = false;
     var trust_file = "/etc/ssl/certs/ca-certificates.crt";
+    var idle_s = 30;
     var bad = "";
     var at = 1;
     while at < arg_count(args) && len(bad) == 0 {
@@ -415,6 +416,8 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
                 basic_file = value;
             } else if digest.equal(flag, "--trust-file") {
                 trust_file = value;
+            } else if digest.equal(flag, "--timeout-s") {
+                idle_s = registry.port_of(value);
             } else {
                 bad = flag;
             }
@@ -423,6 +426,9 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     }
     if len(bad) > 0 {
         return refuse(io, pull_flag(), bad);
+    }
+    if idle_s < 1 {
+        return refuse(io, pull_flag(), "--timeout-s");
     }
     if len(out_path) == 0 || len(registry_text) == 0 || len(repo) == 0 || len(reference) == 0 {
         return refuse(io, pull_missing(), "--registry, --repo, --ref and --out are required");
@@ -474,6 +480,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     // The engine: for https, the roots from the PEM file and entropy from /dev/urandom; for plain HTTP, one that is never used.
     var eng = tls.open(heap, 1);
     var now_ms = 0;
+    let idle_ms = idle_s * 1000;
     var ready = 0;
     if !plain {
         tls.close(heap, eng);
@@ -490,7 +497,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     var status = 1;
     borrow auth as &ab in {
         borrow mut eng as &!ew in {
-            status = with_dirs(heap, fs, net, ew, now_ms, !plain, io, out_path, host, port, buffer.bytes(ab), repo, reference, platform, tag);
+            status = with_dirs(heap, fs, net, ew, now_ms, idle_ms, !plain, io, out_path, host, port, buffer.bytes(ab), repo, reference, platform, tag);
         }
     }
     tls.close(heap, eng);

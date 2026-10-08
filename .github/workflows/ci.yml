@@ -156,6 +156,18 @@ jobs:
         working-directory: oci
         run: python3 scripts/ref_mutants.py --jobs 4
 
+      - name: Hostile peers -- stalls cost the idle time, trickles are served, garbage is refused, nothing traps
+        working-directory: oci
+        run: python3 scripts/hostile_check.py
+
+      - name: The deadline mutants are all killed
+        working-directory: oci
+        run: python3 scripts/hostile_mutants.py --jobs 2
+
+      - name: Hostile documents -- thousands of mutations of every document a program reads are accepted or refused with a tag
+        working-directory: oci
+        run: python3 scripts/fuzz_check.py --rounds 200
+
       - name: G1 across machines -- every digest equals the committed golden file (also checked on macOS/arm64 in the other job)
         working-directory: oci
         run: python3 scripts/golden_check.py
