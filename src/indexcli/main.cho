@@ -136,7 +136,7 @@ fn examine[&h, &d, &n](heap: &!h Heap, blobs: &d Dir, hex: &n [byte]) -> [heap, 
             let src = buffer.bytes(mb);
             size = len(src);
             region a {
-                let tape = alloc_slice[a](json.tape_len(src), 0);
+                let tape = alloc_slice[a](layout.tape_ints(src), 0);
                 let nodes = json.parse(src, tape);
                 if nodes < 0 {
                     code = layout.refused_json();
@@ -162,7 +162,7 @@ fn examine[&h, &d, &n](heap: &!h Heap, blobs: &d Dir, hex: &n [byte]) -> [heap, 
                                         code = idx_manifest();
                                     } else {
                                         region b {
-                                            let ctape = alloc_slice[b](json.tape_len(csrc), 0);
+                                            let ctape = alloc_slice[b](layout.tape_ints(csrc), 0);
                                             if json.parse(csrc, ctape) < 0 {
                                                 code = layout.refused_json();
                                             } else {

@@ -1,0 +1,28 @@
+{
+  "bounded": true,
+  "effects": [
+    "args",
+    "err_write",
+    "heap",
+    "io_write"
+  ],
+  "labels": [
+    {
+      "name": "args",
+      "argument": null
+    },
+    {
+      "name": "err_write",
+      "argument": null
+    },
+    {
+      "name": "heap",
+      "argument": null
+    },
+    {
+      "name": "io_write",
+      "argument": null
+    }
+  ],
+  "foreign_symbols": []
+}

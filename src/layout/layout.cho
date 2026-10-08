@@ -17,6 +17,18 @@ import std.json;
 // a cap, and parsed with `std.json` into a tape the caller provides. The accessors
 // answer views into the document, so the caller keeps the document alive.
 
+// The ints a JSON tape for `src` may take. `json.tape_len` is what always suffices (3 ints a byte), but a
+// region is one 64 KiB chunk and an allocation past it traps, so a document of more than about 2,700 nodes
+// (100 or more layers, say; 2,300 nodes) would crash the program. The tape is cut to 7,000 ints (54.7 KiB, leaving the rest of the chunk for what shares its region) instead: a
+// bigger document fails `json.parse` as "tape full", which is a refusal, not a trap.
+pub fn tape_ints[&s](src: &s [byte]) -> [] int {
+    let all = json.tape_len(src);
+    if all > 7000 {
+        return 7000;
+    }
+    return all;
+}
+
 pub fn max_document() -> [] int {
     return 1048576;
 }

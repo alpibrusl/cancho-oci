@@ -2,6 +2,13 @@
 name = "cancho-oci"
 cancho = "25448b8f0d1e899dbfa7663aa0e5a521acd2a3dd"   # the compiler these sources were written for
 
+# cancho's own TLS client and the certificate verifier it needs (`packages/tls`, `packages/x509`): the registry
+# client's transport for https (task #9b). Not independently reviewed upstream (cancho #209); see docs/design.md 5.7.
+[dependencies.tls]
+git = "https://github.com/alpibrusl/cancho"
+rev = "25448b8f0d1e899dbfa7663aa0e5a521acd2a3dd"
+path = "packages/tls/.cancho-vcs/tls"
+
 # One program per capability row (docs/design.md 5.5): a program's authority is
 # the union of what its main reaches, so `build` (files, no network) and `push`
 # (one registry) are separate binaries and their reports never mix.
@@ -52,21 +59,28 @@ out = "build/oci-index"
 # The test harness for oci.http (#9), held to its own ceiling.
 [[bin]]
 name = "http-probe"
-sources = ["src/http", "tests/probe/http"]
+sources = ["src/http", "src/secure", "tests/probe/http"]
 std = true
 out = "build/http-probe"
+
+# The test harness for the upload-target rule of oci.registry (#9), held to its own ceiling (no network at all).
+[[bin]]
+name = "target-probe"
+sources = ["src/digest", "src/store", "src/image", "src/layout", "src/http", "src/secure", "src/registry", "tests/probe/target"]
+std = true
+out = "build/target-probe"
 
 # Push an image from a layout to a registry (#9): the only program here with a network row.
 [[bin]]
 name = "oci-push"
-sources = ["src/digest", "src/store", "src/image", "src/layout", "src/http", "src/registry", "src/pushcli"]
+sources = ["src/digest", "src/store", "src/image", "src/layout", "src/http", "src/secure", "src/registry", "src/pushcli"]
 std = true
 out = "build/oci-push"
 
 # Fetch an image from a registry into a layout (#9).
 [[bin]]
 name = "oci-pull"
-sources = ["src/digest", "src/store", "src/image", "src/layout", "src/http", "src/registry", "src/pullcli"]
+sources = ["src/digest", "src/store", "src/image", "src/layout", "src/http", "src/secure", "src/registry", "src/pullcli"]
 std = true
 out = "build/oci-pull"
 

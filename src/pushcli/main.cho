@@ -4,10 +4,13 @@ import std.buffer;
 import std.io;
 import std.json;
 import oci.digest;
+import oci.http;
 import oci.image;
 import oci.layout;
 import oci.registry;
+import oci.secure;
 import oci.store;
+import tls;
 
 // oci-push: send an image from an OCI layout to a registry (design 5.7, task #9).
 //
@@ -98,6 +101,12 @@ fn rule_of(code: int) -> [] &static [byte] {
     if code <= 0 - 600 && code > 0 - 700 {
         return layout.rule_name(code);
     }
+    if code == secure.refused_roots() || code == secure.refused_entropy() {
+        return secure.rule_name(code);
+    }
+    if code < 0 && code > 0 - 100 {
+        return http.rule_name(code);
+    }
     if code <= 0 - 800 && code > 0 - 1000 {
         return registry.rule_name(code);
     }
@@ -132,12 +141,12 @@ fn refuse[&i, &n](io: &!i Io, code: int, culprit: &n [byte]) -> [err_write] int 
 
 // Make sure the blob `digest_text` (descriptor size `size`) is in the registry: skipped if it
 // is already there, else re-hashed and uploaded. Prints one line. 0 or a refusal.
-fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
     let hex = layout.hex_of(digest_text);
     if len(hex) == 0 || size < 0 {
         return push_layout();
     }
-    let there = registry.blob_status(heap, net, host, port, auth, repo, digest_text);
+    let there = registry.blob_status(heap, net, eng, now_ms, host, port, auth, repo, digest_text);
     if there < 0 {
         return there;
     }
@@ -163,7 +172,7 @@ fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i](heap: &!h Heap, net: &n Net(""), 
         Opened::Ok(file) => {
             var handle = file;
             borrow mut handle as &!f in {
-                code = registry.blob_upload(heap, net, host, port, auth, repo, digest_text, size, f);
+                code = registry.blob_upload(heap, net, eng, now_ms, host, port, auth, repo, digest_text, size, f);
             }
             file_close(handle);
         }
@@ -180,10 +189,10 @@ fn ensure_blob[&h, &n, &t, &a, &r, &d, &b, &i](heap: &!h Heap, net: &n Net(""), 
 
 // Push the config and layers a manifest names (`body`), then the manifest itself at
 // `reference`. 0 or a refusal.
-fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], body: &d [byte], digest_text: &g [byte], blobs: &k Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], body: &d [byte], digest_text: &g [byte], blobs: &k Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
     var code = 0;
     region a2 {
-        let tape = alloc_slice[a2](json.tape_len(body), 0);
+        let tape = alloc_slice[a2](layout.tape_ints(body), 0);
         if json.parse(body, tape) < 0 {
             code = layout.refused_json();
         } else {
@@ -192,15 +201,15 @@ fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k](heap: &!h Heap, net: &n
             if cfg < 0 || layers < 0 || !json.is_array(tape, layers) {
                 code = push_layout();
             } else {
-                code = ensure_blob(heap, net, host, port, auth, repo, layout.text_of(body, tape, cfg, "digest"), layout.number_of(body, tape, cfg, "size"), blobs, io);
+                code = ensure_blob(heap, net, eng, now_ms, host, port, auth, repo, layout.text_of(body, tape, cfg, "digest"), layout.number_of(body, tape, cfg, "size"), blobs, io);
                 var l = 0;
                 while code == 0 && l < json.count(tape, layers) {
                     let node = json.at(tape, layers, l);
-                    code = ensure_blob(heap, net, host, port, auth, repo, layout.text_of(body, tape, node, "digest"), layout.number_of(body, tape, node, "size"), blobs, io);
+                    code = ensure_blob(heap, net, eng, now_ms, host, port, auth, repo, layout.text_of(body, tape, node, "digest"), layout.number_of(body, tape, node, "size"), blobs, io);
                     l = l + 1;
                 }
                 if code == 0 {
-                    code = registry.manifest_put(heap, net, host, port, auth, repo, reference, layout.text_of(body, tape, 0, "mediaType"), body, digest_text);
+                    code = registry.manifest_put(heap, net, eng, now_ms, host, port, auth, repo, reference, layout.text_of(body, tape, 0, "mediaType"), body, digest_text);
                     if code == 0 {
                         io.write_all(io, "manifest ");
                         io.write_all(io, digest_text);
@@ -216,14 +225,14 @@ fn push_manifest[&h, &n, &t, &a, &r, &d, &g, &i, &x, &k](heap: &!h Heap, net: &n
 }
 
 // The layout's one entry: push its image, or the images of its index and then the index.
-fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte], image_dir: &k Dir, blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
+fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, secure: bool, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte], image_dir: &k Dir, blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_read, file_read, io_write] int {
     let (index_doc, c0) = layout.read_file(heap, image_dir, "index.json", layout.max_document());
     var code = c0;
     if code == 0 {
         borrow index_doc as &ib in {
             let src = buffer.bytes(ib);
             region a {
-                let tape = alloc_slice[a](json.tape_len(src), 0);
+                let tape = alloc_slice[a](layout.tape_ints(src), 0);
                 if json.parse(src, tape) < 0 {
                     code = layout.refused_json();
                 } else {
@@ -253,57 +262,68 @@ fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i](heap: &!h Heap, net: &n
                         } else {
                             let (body, c1) = layout.read_blob(heap, blobs, top_hex, layout.max_document());
                             code = c1;
+                            var line = buffer.empty(heap, 1);
                             if code == 0 {
-                                borrow body as &bb in {
-                                    let doc = buffer.bytes(bb);
-                                    if digest.equal(media, image.media_manifest()) {
-                                        code = push_manifest(heap, net, host, port, auth, repo, reference, doc, top_digest, blobs, io);
-                                    } else if digest.equal(media, image.media_index()) {
-                                        region b {
-                                            let t2 = alloc_slice[b](json.tape_len(doc), 0);
-                                            if json.parse(doc, t2) < 0 {
-                                                code = layout.refused_json();
-                                            } else {
-                                                let kids = json.get(doc, t2, 0, "manifests");
-                                                if kids < 0 || !json.is_array(t2, kids) || json.count(t2, kids) < 1 {
-                                                    code = push_layout();
-                                                }
-                                                var m = 0;
-                                                while code == 0 && m < json.count(t2, kids) {
-                                                    let kid = json.at(t2, kids, m);
-                                                    let kid_digest = layout.text_of(doc, t2, kid, "digest");
-                                                    let kid_hex = layout.hex_of(kid_digest);
-                                                    if len(kid_hex) == 0 {
+                                // local checks are done: now find out what the registry wants as Authorization
+                                let (got, cn) = registry.negotiate(heap, net, eng, now_ms, host, port, secure, auth, repo, true);
+                                buffer.drop(heap, line);
+                                line = got;
+                                code = cn;
+                            }
+                            if code == 0 {
+                                borrow line as &lb in {
+                                    borrow body as &bb in {
+                                        let doc = buffer.bytes(bb);
+                                        if digest.equal(media, image.media_manifest()) {
+                                            code = push_manifest(heap, net, eng, now_ms, host, port, buffer.bytes(lb), repo, reference, doc, top_digest, blobs, io);
+                                        } else if digest.equal(media, image.media_index()) {
+                                            region b {
+                                                let t2 = alloc_slice[b](layout.tape_ints(doc), 0);
+                                                if json.parse(doc, t2) < 0 {
+                                                    code = layout.refused_json();
+                                                } else {
+                                                    let kids = json.get(doc, t2, 0, "manifests");
+                                                    if kids < 0 || !json.is_array(t2, kids) || json.count(t2, kids) < 1 {
                                                         code = push_layout();
-                                                    } else {
-                                                        let (kid_body, c2) = layout.read_blob(heap, blobs, kid_hex, layout.max_document());
-                                                        code = c2;
-                                                        if code == 0 {
-                                                            borrow kid_body as &kb in {
-                                                                code = push_manifest(heap, net, host, port, auth, repo, kid_digest, buffer.bytes(kb), kid_digest, blobs, io);
-                                                            }
-                                                        }
-                                                        buffer.drop(heap, kid_body);
                                                     }
-                                                    m = m + 1;
-                                                }
-                                                if code == 0 {
-                                                    code = registry.manifest_put(heap, net, host, port, auth, repo, reference, image.media_index(), doc, top_digest);
+                                                    var m = 0;
+                                                    while code == 0 && m < json.count(t2, kids) {
+                                                        let kid = json.at(t2, kids, m);
+                                                        let kid_digest = layout.text_of(doc, t2, kid, "digest");
+                                                        let kid_hex = layout.hex_of(kid_digest);
+                                                        if len(kid_hex) == 0 {
+                                                            code = push_layout();
+                                                        } else {
+                                                            let (kid_body, c2) = layout.read_blob(heap, blobs, kid_hex, layout.max_document());
+                                                            code = c2;
+                                                            if code == 0 {
+                                                                borrow kid_body as &kb in {
+                                                                    code = push_manifest(heap, net, eng, now_ms, host, port, buffer.bytes(lb), repo, kid_digest, buffer.bytes(kb), kid_digest, blobs, io);
+                                                                }
+                                                            }
+                                                            buffer.drop(heap, kid_body);
+                                                        }
+                                                        m = m + 1;
+                                                    }
                                                     if code == 0 {
-                                                        io.write_all(io, "index ");
-                                                        io.write_all(io, top_digest);
-                                                        io.write_all(io, " pushed as ");
-                                                        io.write_all(io, reference);
-                                                        io.write_all(io, "\n");
+                                                        code = registry.manifest_put(heap, net, eng, now_ms, host, port, buffer.bytes(lb), repo, reference, image.media_index(), doc, top_digest);
+                                                        if code == 0 {
+                                                            io.write_all(io, "index ");
+                                                            io.write_all(io, top_digest);
+                                                            io.write_all(io, " pushed as ");
+                                                            io.write_all(io, reference);
+                                                            io.write_all(io, "\n");
+                                                        }
                                                     }
                                                 }
                                             }
+                                        } else {
+                                            code = push_layout();
                                         }
-                                    } else {
-                                        code = push_layout();
                                     }
                                 }
                             }
+                            buffer.drop(heap, line);
                             buffer.drop(heap, body);
                         }
                     }
@@ -315,7 +335,7 @@ fn push_layout_entry[&h, &n, &t, &a, &r, &x, &k, &d, &i](heap: &!h Heap, net: &n
     return code;
 }
 
-fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, image_path: &static [byte], host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte]) -> [heap, fs_read(""), net_out(""), conn_read, conn_write, dir_read, file_read, io_write, err_write] int {
+fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x, &tl](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, secure: bool, io: &!i Io, image_path: &static [byte], host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], tag: &x [byte]) -> [heap, fs_read(""), net_out(""), conn_read, conn_write, dir_read, file_read, io_write, err_write] int {
     var status = 1;
     match open_dir(fs, image_path) {
         DirOpened::Failed(errno) => {
@@ -338,7 +358,7 @@ fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x](heap: &!h Heap, fs: &f Fs(""), net:
                                 DirOpened::Ok(sha_dir) => {
                                     var sha = sha_dir;
                                     borrow sha as &sd in {
-                                        let code = push_layout_entry(heap, net, host, port, auth, repo, tag, id, sd, io);
+                                        let code = push_layout_entry(heap, net, eng, now_ms, secure, host, port, auth, repo, tag, id, sd, io);
                                         if code == 0 {
                                             io.write_all(io, "ok\n");
                                             status = 0;
@@ -360,13 +380,14 @@ fn with_dirs[&h, &f, &n, &i, &t, &a, &r, &x](heap: &!h Heap, fs: &f Fs(""), net:
     return status;
 }
 
-fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, dir_read, file_read, io_write, err_write] int {
+fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args, clock_ms: int) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, dir_read, file_read, io_write, err_write] int {
     var image_path = "";
     var registry_text = "";
     var repo = "";
     var tag = "";
     var basic_file = "";
     var plain = false;
+    var trust_file = "/etc/ssl/certs/ca-certificates.crt";
     var bad = "";
     var at = 1;
     while at < arg_count(args) && len(bad) == 0 {
@@ -388,6 +409,8 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
                 tag = value;
             } else if digest.equal(flag, "--basic-file") {
                 basic_file = value;
+            } else if digest.equal(flag, "--trust-file") {
+                trust_file = value;
             } else {
                 bad = flag;
             }
@@ -400,15 +423,15 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     if len(image_path) == 0 || len(registry_text) == 0 || len(repo) == 0 {
         return refuse(io, push_missing(), "--image, --registry and --repo are required");
     }
-    if !plain {
-        return refuse(io, push_plain(), "TLS is not wired in yet; pass --plain-http to push over plain HTTP");
-    }
     if !registry.name_ok(repo) {
         return refuse(io, registry.refused_name(), repo);
     }
     // host[:port]; the port defaults to 80 for plain HTTP.
     var host = registry_text;
-    var port = 80;
+    var port = 443;
+    if plain {
+        port = 80;
+    }
     let colon = index_of_byte(registry_text, byte_of(':'));
     if colon >= 0 {
         host = registry_text[0..colon];
@@ -420,7 +443,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     if len(tag) > 0 && !registry.reference_ok(tag) {
         return refuse(io, push_tag(), tag);
     }
-    if len(basic_file) > 0 && !registry.is_loopback(host) {
+    if plain && len(basic_file) > 0 && !registry.is_loopback(host) {
         return refuse(io, push_creds_http(), host);
     }
     var auth = buffer.empty(heap, 1);
@@ -437,10 +460,29 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
         }
         buffer.drop(heap, creds);
     }
+    // The engine: for https, the roots from the PEM file and entropy from /dev/urandom; for plain HTTP, one that is never used.
+    var eng = tls.open(heap, 1);
+    var now_ms = 0;
+    var ready = 0;
+    if !plain {
+        tls.close(heap, eng);
+        let (made, c) = secure.engine(heap, fs, trust_file);
+        eng = made;
+        ready = c;
+        now_ms = clock_ms;
+    }
+    if ready != 0 {
+        tls.close(heap, eng);
+        buffer.drop(heap, auth);
+        return refuse(io, ready, trust_file);
+    }
     var status = 1;
     borrow auth as &ab in {
-        status = with_dirs(heap, fs, net, io, image_path, host, port, buffer.bytes(ab), repo, tag);
+        borrow mut eng as &!ew in {
+            status = with_dirs(heap, fs, net, ew, now_ms, !plain, io, image_path, host, port, buffer.bytes(ab), repo, tag);
+        }
     }
+    tls.close(heap, eng);
     buffer.drop(heap, auth);
     return status;
 }
@@ -448,7 +490,6 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
     release(ffi);
-    release(clock);
     release(signals);
     release(exec);
     var status = 1;
@@ -456,8 +497,10 @@ fn main(world: World) -> [] int {
         borrow args as &g in {
             borrow fs as &f in {
                 borrow net as &n in {
-                    borrow mut io as &!i in {
-                        status = run(h, f, n, i, g);
+                    borrow clock as &k in {
+                        borrow mut io as &!i in {
+                            status = run(h, f, n, i, g, clock_unix_ms(k));
+                        }
                     }
                 }
             }
@@ -467,6 +510,7 @@ fn main(world: World) -> [] int {
     release(args);
     release(fs);
     release(net);
+    release(clock);
     release(io);
     return status;
 }

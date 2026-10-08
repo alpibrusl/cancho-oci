@@ -2,11 +2,14 @@ edition 7;
 
 module oci.registry;
 
+import tls;
+
 import oci.digest;
 import oci.http;
 import oci.layout;
 import oci.store;
 import std.buffer;
+import std.json;
 
 // `oci.registry` -- the client half of the OCI Distribution protocol (design 5.7, task #9):
 // is a blob there, upload it, put a manifest. Every response is checked rather than
@@ -15,7 +18,8 @@ import std.buffer;
 // refusal that names the status and the first error code the registry gave.
 //
 // Authentication is HTTP Basic, sent on every request when credentials are given. A
-// bearer-token challenge is refused by name (`registry-auth-bearer`), not guessed at.
+// bearer-token challenge is answered by `negotiate` before anything is sent (token realm on the same
+// host only), and one met later is refused by name (`registry-auth-bearer`), not guessed at.
 //
 // Each call is one or two exchanges on fresh connections (`oci.http` does not keep a
 // connection alive), so there is no connection state to get wrong.
@@ -76,6 +80,14 @@ pub fn refused_creds() -> [] int {
     return 0 - 914;
 }
 
+pub fn refused_token() -> [] int {
+    return 0 - 915;
+}
+
+pub fn refused_realm() -> [] int {
+    return 0 - 916;
+}
+
 pub fn rule_name(code: int) -> [] &static [byte] {
     if code == refused_unauthorized() {
         return "registry-unauthorized";
@@ -118,6 +130,12 @@ pub fn rule_name(code: int) -> [] &static [byte] {
     }
     if code == refused_creds() {
         return "registry-credentials-file";
+    }
+    if code == refused_token() {
+        return "registry-token";
+    }
+    if code == refused_realm() {
+        return "registry-token-realm";
     }
     return http.rule_name(code);
 }
@@ -242,8 +260,11 @@ fn request_head[&h, &m, &p, &t, &a, &c](heap: &!h Heap, method: &m [byte], path:
     b = buffer.append(heap, b, path);
     b = buffer.append(heap, b, " HTTP/1.1\r\nHost: ");
     b = buffer.append(heap, b, host);
-    b = buffer.append(heap, b, ":");
-    b = buffer.push_nat(heap, b, port);
+    // the scheme's own port is left out of Host, as every client does: a signed URL may be signed over the header
+    if port != 443 && port != 80 {
+        b = buffer.append(heap, b, ":");
+        b = buffer.push_nat(heap, b, port);
+    }
     b = buffer.append(heap, b, "\r\nUser-Agent: cancho-oci\r\nAccept: */*\r\n");
     b = buffer.append(heap, b, auth);
     if len(content_type) > 0 {
@@ -261,12 +282,12 @@ fn request_head[&h, &m, &p, &t, &a, &c](heap: &!h Heap, method: &m [byte], path:
 
 // Read the response: head, the headers worth keeping, and the start of the body. Ends the
 // exchange. (Reply, 0) or (an empty reply, a refusal).
-fn read_reply[&h](heap: &!h Heap, ex: http.Exchange, has_body: bool, cap: int) -> [heap, conn_read] (Reply, int) {
+fn read_reply[&h, &tl](heap: &!h Heap, eng: &!tl tls.Engine, ex: http.Exchange, has_body: bool, cap: int) -> [heap, conn_read, conn_write] (Reply, int) {
     var e = ex;
-    let (next, code) = http.read_head(e);
+    let (next, code) = http.read_head(e, eng);
     e = next;
     if code != 0 {
-        http.end(heap, e);
+        http.end(heap, e, eng);
         return (empty_reply(heap), code);
     }
     var reply = empty_reply(heap);
@@ -282,7 +303,7 @@ fn read_reply[&h](heap: &!h Heap, ex: http.Exchange, has_body: bool, cap: int) -
     var going = has_body;
     while going {
         borrow mut piece as &!pw in {
-            let (more, n) = http.read_body(e, contents(pw));
+            let (more, n) = http.read_body(e, eng, contents(pw));
             e = more;
             if n > 0 {
                 let Reply { status, location, content_digest, challenge, body } = reply;
@@ -304,7 +325,7 @@ fn read_reply[&h](heap: &!h Heap, ex: http.Exchange, has_body: bool, cap: int) -
         }
     }
     unbox_slice(heap, piece);
-    http.end(heap, e);
+    http.end(heap, e, eng);
     if failed != 0 && seen != 0 {
         // A truncated *error* body is still an error: keep the status, drop the detail.
         if seen >= 400 {
@@ -318,33 +339,33 @@ fn read_reply[&h](heap: &!h Heap, ex: http.Exchange, has_body: bool, cap: int) -
 
 // A request with an in-memory body (possibly empty). Answers the reply and 0, or an empty
 // reply and an `oci.http` refusal.
-pub fn round_trip[&h, &n, &t, &a, &m, &p, &c, &b](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], method: &m [byte], path: &p [byte], content_type: &c [byte], body: &b [byte]) -> [heap, net_out(""), conn_read, conn_write] (Reply, int) {
+pub fn round_trip[&h, &n, &t, &a, &m, &p, &c, &b, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], method: &m [byte], path: &p [byte], content_type: &c [byte], body: &b [byte]) -> [heap, net_out(""), conn_read, conn_write] (Reply, int) {
     let head = request_head(heap, method, path, host, port, auth, content_type, len(body));
     var result = empty_reply(heap);
     var code = 0;
-    match http.begin(heap, net, host, port) {
+    match http.begin(heap, net, host, port, eng, now_ms) {
         http.Started::Failed(c) => {
             code = c;
         }
         http.Started::Ok(first) => {
             var ex = first;
             borrow head as &hb in {
-                let (next, c1) = http.send(ex, buffer.bytes(hb));
+                let (next, c1) = http.send(ex, eng, buffer.bytes(hb));
                 ex = next;
                 code = c1;
             }
             if code == 0 && len(body) > 0 {
-                let (next, c2) = http.send(ex, body);
+                let (next, c2) = http.send(ex, eng, body);
                 ex = next;
                 code = c2;
             }
             if code == 0 {
                 drop_reply(heap, result);
-                let (reply, c3) = read_reply(heap, ex, !digest.equal(method, "HEAD"), body_cap());
+                let (reply, c3) = read_reply(heap, eng, ex, !digest.equal(method, "HEAD"), body_cap());
                 result = reply;
                 code = c3;
             } else {
-                http.end(heap, ex);
+                http.end(heap, ex, eng);
             }
         }
     }
@@ -355,28 +376,28 @@ pub fn round_trip[&h, &n, &t, &a, &m, &p, &c, &b](heap: &!h Heap, net: &n Net(""
 // GET with a body cap of `cap` bytes (a manifest or an index, which is read whole): the reply, or an
 // empty reply and a refusal. A body larger than the cap is not an error here: the caller sees only the
 // start and its digest will not match, which is the right refusal.
-pub fn round_trip_get[&h, &n, &t, &a, &p, &c](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, extra: &a [byte], path: &p [byte], cap: int) -> [heap, net_out(""), conn_read, conn_write] (Reply, int) {
+pub fn round_trip_get[&h, &n, &t, &a, &p, &c, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, extra: &a [byte], path: &p [byte], cap: int) -> [heap, net_out(""), conn_read, conn_write] (Reply, int) {
     let head = request_head(heap, "GET", path, host, port, extra, "", 0 - 1);
     var result = empty_reply(heap);
     var code = 0;
-    match http.begin(heap, net, host, port) {
+    match http.begin(heap, net, host, port, eng, now_ms) {
         http.Started::Failed(c) => {
             code = c;
         }
         http.Started::Ok(first) => {
             var ex = first;
             borrow head as &hb in {
-                let (next, c1) = http.send(ex, buffer.bytes(hb));
+                let (next, c1) = http.send(ex, eng, buffer.bytes(hb));
                 ex = next;
                 code = c1;
             }
             if code == 0 {
                 drop_reply(heap, result);
-                let (reply, c3) = read_reply(heap, ex, true, cap);
+                let (reply, c3) = read_reply(heap, eng, ex, true, cap);
                 result = reply;
                 code = c3;
             } else {
-                http.end(heap, ex);
+                http.end(heap, ex, eng);
             }
         }
     }
@@ -386,18 +407,18 @@ pub fn round_trip_get[&h, &n, &t, &a, &p, &c](heap: &!h Heap, net: &n Net(""), h
 
 // A request whose body is `size` bytes read from `file` (a blob being uploaded), streamed in
 // 64 KiB pieces: never held whole. The file must hold exactly `size` bytes.
-pub fn round_trip_file[&h, &n, &t, &a, &m, &p, &c, &f](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], method: &m [byte], path: &p [byte], content_type: &c [byte], file: &!f File, size: int) -> [heap, net_out(""), conn_read, conn_write, file_read] (Reply, int) {
+pub fn round_trip_file[&h, &n, &t, &a, &m, &p, &c, &f, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], method: &m [byte], path: &p [byte], content_type: &c [byte], file: &!f File, size: int) -> [heap, net_out(""), conn_read, conn_write, file_read] (Reply, int) {
     let head = request_head(heap, method, path, host, port, auth, content_type, size);
     var result = empty_reply(heap);
     var code = 0;
-    match http.begin(heap, net, host, port) {
+    match http.begin(heap, net, host, port, eng, now_ms) {
         http.Started::Failed(c) => {
             code = c;
         }
         http.Started::Ok(first) => {
             var ex = first;
             borrow head as &hb in {
-                let (next, c1) = http.send(ex, buffer.bytes(hb));
+                let (next, c1) = http.send(ex, eng, buffer.bytes(hb));
                 ex = next;
                 code = c1;
             }
@@ -414,7 +435,7 @@ pub fn round_trip_file[&h, &n, &t, &a, &m, &p, &c, &f](heap: &!h Heap, net: &n N
                                 code = http.refused_send();
                                 going = false;
                             } else {
-                                let (next, c2) = http.send(ex, room[0..got]);
+                                let (next, c2) = http.send(ex, eng, room[0..got]);
                                 ex = next;
                                 if c2 != 0 {
                                     code = c2;
@@ -438,11 +459,11 @@ pub fn round_trip_file[&h, &n, &t, &a, &m, &p, &c, &f](heap: &!h Heap, net: &n N
             }
             if code == 0 {
                 drop_reply(heap, result);
-                let (reply, c3) = read_reply(heap, ex, true, body_cap());
+                let (reply, c3) = read_reply(heap, eng, ex, true, body_cap());
                 result = reply;
                 code = c3;
             } else {
-                http.end(heap, ex);
+                http.end(heap, ex, eng);
             }
         }
     }
@@ -514,11 +535,11 @@ fn api_path[&h, &r, &k, &t](heap: &!h Heap, repo: &r [byte], kind: &k [byte], ta
 // Is the blob there? 0 when it is, 1 when it is not (404, or a registry that does not answer
 // HEAD: the upload will say), or a refusal for anything that is an error in itself
 // (authentication, a server fault).
-pub fn blob_status[&h, &n, &t, &a, &r, &d](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte]) -> [heap, net_out(""), conn_read, conn_write] int {
+pub fn blob_status[&h, &n, &t, &a, &r, &d, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte]) -> [heap, net_out(""), conn_read, conn_write] int {
     let path = api_path(heap, repo, "blobs", digest_text);
     var answer = 1;
     borrow path as &pb in {
-        let (reply, code) = round_trip(heap, net, host, port, auth, "HEAD", buffer.bytes(pb), "", "");
+        let (reply, code) = round_trip(heap, net, eng, now_ms, host, port, auth, "HEAD", buffer.bytes(pb), "", "");
         if code != 0 {
             answer = code;
         } else {
@@ -541,7 +562,7 @@ pub fn blob_status[&h, &n, &t, &a, &r, &d](heap: &!h Heap, net: &n Net(""), host
 
 // The path (and query) an upload's `Location` names, made only from what the registry gave
 // and only if it stays on this host. A path starting with "/" is used as it is; an absolute
-// URL must name this host and port; anything else is a refusal. `digest=<digest>` is
+// URL must name this host and port (the port may be left out when it is the scheme's own); anything else is a refusal. `digest=<digest>` is
 // appended as the spec requires. Answers the path and 0, or an empty buffer and a refusal.
 pub fn upload_target[&h, &l, &t, &d](heap: &!h Heap, location: &l [byte], host: &t [byte], port: int, digest_text: &d [byte]) -> [heap] (buffer.Buffer, int) {
     var path = buffer.empty(heap, 128);
@@ -571,6 +592,14 @@ pub fn upload_target[&h, &l, &t, &d](heap: &!h Heap, location: &l [byte], host: 
                 same = digest.equal(location[colon + 3..end], buffer.bytes(wb));
             }
             buffer.drop(heap, want);
+            // a registry on the scheme's own port may leave the port out (Docker Hub does): `https://host/...` is host:443
+            let scheme = location[0..colon];
+            if port == 443 && digest.equal(scheme, "https") && digest.equal(location[colon + 3..end], host) {
+                same = true;
+            }
+            if port == 80 && digest.equal(scheme, "http") && digest.equal(location[colon + 3..end], host) {
+                same = true;
+            }
             if !same {
                 code = refused_redirect();
             } else if end >= len(location) {
@@ -599,12 +628,12 @@ pub fn upload_target[&h, &l, &t, &d](heap: &!h Heap, location: &l [byte], host: 
 
 // Upload the blob in `file` (exactly `size` bytes, named `digest_text`): POST for a session,
 // then one PUT of the whole body to the session's `Location`. 0, or a refusal.
-pub fn blob_upload[&h, &n, &t, &a, &r, &d, &f](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, file: &!f File) -> [heap, net_out(""), conn_read, conn_write, file_read] int {
+pub fn blob_upload[&h, &n, &t, &a, &r, &d, &f, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, file: &!f File) -> [heap, net_out(""), conn_read, conn_write, file_read] int {
     var answer = 0;
     var opened = api_path(heap, repo, "blobs", "uploads/");
     var location = buffer.empty(heap, 1);
     borrow opened as &ob in {
-        let (reply, code) = round_trip(heap, net, host, port, auth, "POST", buffer.bytes(ob), "", "");
+        let (reply, code) = round_trip(heap, net, eng, now_ms, host, port, auth, "POST", buffer.bytes(ob), "", "");
         if code != 0 {
             answer = code;
         } else {
@@ -632,7 +661,7 @@ pub fn blob_upload[&h, &n, &t, &a, &r, &d, &f](heap: &!h Heap, net: &n Net(""), 
             answer = c;
         } else {
             borrow target as &tb in {
-                let (reply, code) = round_trip_file(heap, net, host, port, auth, "PUT", buffer.bytes(tb), "application/octet-stream", file, size);
+                let (reply, code) = round_trip_file(heap, net, eng, now_ms, host, port, auth, "PUT", buffer.bytes(tb), "application/octet-stream", file, size);
                 if code != 0 {
                     answer = code;
                 } else {
@@ -658,11 +687,11 @@ pub fn blob_upload[&h, &n, &t, &a, &r, &d, &f](heap: &!h Heap, net: &n Net(""), 
 
 // PUT a manifest (or an index) at `reference` (a tag or a digest). The registry must
 // report the digest of what it stored, if it reports one at all, and that must be ours.
-pub fn manifest_put[&h, &n, &t, &a, &r, &x, &m, &b, &d](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], media: &m [byte], body: &b [byte], digest_text: &d [byte]) -> [heap, net_out(""), conn_read, conn_write] int {
+pub fn manifest_put[&h, &n, &t, &a, &r, &x, &m, &b, &d, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], media: &m [byte], body: &b [byte], digest_text: &d [byte]) -> [heap, net_out(""), conn_read, conn_write] int {
     let path = api_path(heap, repo, "manifests", reference);
     var answer = 0;
     borrow path as &pb in {
-        let (reply, code) = round_trip(heap, net, host, port, auth, "PUT", buffer.bytes(pb), media, body);
+        let (reply, code) = round_trip(heap, net, eng, now_ms, host, port, auth, "PUT", buffer.bytes(pb), media, body);
         if code != 0 {
             answer = code;
         } else {
@@ -712,7 +741,7 @@ fn refusal_of_status(s: int, bearer: bool) -> [] int {
 // of the bytes is computed here, and must equal `reference` when that is a digest and the digest the
 // registry reports when it reports one. Answers the bytes and 0, or an empty buffer and a refusal.
 // `shown` receives the digest text of what was fetched (71 bytes).
-pub fn manifest_fetch[&h, &n, &t, &a, &r, &x, &o](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], shown: &!o [byte]) -> [heap, net_out(""), conn_read, conn_write] (buffer.Buffer, int) {
+pub fn manifest_fetch[&h, &n, &t, &a, &r, &x, &o, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], reference: &x [byte], shown: &!o [byte]) -> [heap, net_out(""), conn_read, conn_write] (buffer.Buffer, int) {
     var extra = buffer.append(heap, buffer.empty(heap, 256), auth);
     extra = buffer.append(heap, extra, "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json\r\n");
     let path = api_path(heap, repo, "manifests", reference);
@@ -720,7 +749,7 @@ pub fn manifest_fetch[&h, &n, &t, &a, &r, &x, &o](heap: &!h Heap, net: &n Net(""
     var code = 0;
     borrow extra as &eb in {
         borrow path as &pb in {
-            let (reply, c) = round_trip_get(heap, net, host, port, buffer.bytes(eb), buffer.bytes(pb), 1048576);
+            let (reply, c) = round_trip_get(heap, net, eng, now_ms, host, port, buffer.bytes(eb), buffer.bytes(pb), 1048576);
             code = c;
             if c == 0 {
                 borrow reply as &rr in {
@@ -753,38 +782,114 @@ pub fn manifest_fetch[&h, &n, &t, &a, &r, &x, &o](heap: &!h Heap, net: &n Net(""
     return (out, code);
 }
 
+// The code `blob_get` answers when the registry sent the client elsewhere (the Location is in `moved_to`).
+fn moved_code() -> [] int {
+    return 3;
+}
+
+// Where a blob redirect may go (the blob store of a registry is often a CDN on another host; ghcr.io does this): the
+// request head for it, the host and the port. Only the scheme the registry itself uses is followed (https for https; plain
+// HTTP only to a loopback host), with no userinfo, a plain host name and a plain absolute path. A path on this host keeps the
+// credentials; a URL does not get them: it is a signed address meant to be used by whoever holds it.
+// Answers (head, host, port, code); the head and host are empty on a refusal.
+fn next_hop[&h, &l, &t, &a](heap: &!h Heap, location: &l [byte], host: &t [byte], port: int, secure: bool, auth: &a [byte]) -> [heap] (buffer.Buffer, buffer.Buffer, int, int) {
+    var head = buffer.empty(heap, 1);
+    var next_host = buffer.empty(heap, 1);
+    var next_port = port;
+    var code = 0;
+    var prefix = "http://";
+    if secure {
+        prefix = "https://";
+    }
+    var k = 0;
+    while k < len(location) {
+        let c = int_of(location[k]);
+        if c < 33 || c > 126 {
+            code = refused_redirect();
+        }
+        k = k + 1;
+    }
+    if len(location) == 0 || len(location) > 4000 {
+        code = refused_redirect();
+    }
+    if code == 0 {
+        if int_of(location[0]) == '/' && !(len(location) > 1 && int_of(location[1]) == '/') {
+            next_host = buffer.append(heap, next_host, host);
+            buffer.drop(heap, head);
+            head = request_head(heap, "GET", location, host, port, auth, "", 0 - 1);
+        } else if len(location) > len(prefix) && digest.equal(location[0..len(prefix)], prefix) {
+            let rest = location[len(prefix)..len(location)];
+            var slash = 0;
+            while slash < len(rest) && int_of(rest[slash]) != '/' {
+                slash = slash + 1;
+            }
+            if slash == 0 || slash >= len(rest) {
+                code = refused_redirect();
+            } else {
+                let authority = rest[0..slash];
+                var colon = index_of_byte(authority, byte_of(':'));
+                var name = authority;
+                next_port = 443;
+                if !secure {
+                    next_port = 80;
+                }
+                if colon >= 0 {
+                    name = authority[0..colon];
+                    next_port = port_of(authority[colon + 1..len(authority)]);
+                }
+                var j = 0;
+                while j < len(name) {
+                    let c = int_of(name[j]);
+                    if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.') {
+                        code = refused_redirect();
+                    }
+                    j = j + 1;
+                }
+                if len(name) == 0 || next_port < 1 {
+                    code = refused_redirect();
+                }
+                if code == 0 && !secure && !is_loopback(name) {
+                    code = refused_redirect();
+                }
+                if code == 0 {
+                    next_host = buffer.append(heap, next_host, name);
+                    buffer.drop(heap, head);
+                    head = request_head(heap, "GET", rest[slash..len(rest)], name, next_port, "", "", 0 - 1);
+                }
+            }
+        } else {
+            code = refused_redirect();
+        }
+    }
+    if code != 0 {
+        buffer.drop(heap, head);
+        buffer.drop(heap, next_host);
+        return (buffer.empty(heap, 1), buffer.empty(heap, 1), 0, code);
+    }
+    return (head, next_host, next_port, 0);
+}
+
 // Download the blob `digest_text` into the store under the temporary name `tmp`, a piece at a time,
 // and publish it only if it is `size` bytes (when `size` is not negative) and hashes to its name.
 // The descriptor's size is the bound: a body is refused as soon as it passes it (so at most one piece
 // beyond it is ever read), whatever the registry announces or whether it announces anything.
 // 0, or a refusal; on a refusal nothing is left in the store.
-pub fn blob_fetch[&h, &n, &t, &a, &r, &d, &b, &m](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, tmp: &m [byte]) -> [heap, net_out(""), conn_read, conn_write, dir_write, file_write] int {
-    var expected = 0;
+fn blob_get[&h, &n, &t, &q, &w, &b, &m, &l, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, head: &q [byte], want: &w [byte], size: int, blobs: &b Dir, tmp: &m [byte], moved_to: &!l [byte]) -> [heap, net_out(""), conn_read, conn_write, dir_write, file_write] (int, int) {
     var code = 0;
+    var moved = 0;
     region w {
-        let want = alloc_slice[w](32, byte_of(0));
-        if digest.parse_into(digest_text, want) != 0 {
-            code = refused_digest();
-        } else {
-            let path = api_path(heap, repo, "blobs", digest_text);
-            var head = buffer.empty(heap, 1);
-            borrow path as &pq in {
-                buffer.drop(heap, head);
-                head = request_head(heap, "GET", buffer.bytes(pq), host, port, auth, "", 0 - 1);
-            }
-            match http.begin(heap, net, host, port) {
+        if code == 0 {
+            match http.begin(heap, net, host, port, eng, now_ms) {
                 http.Started::Failed(c) => {
                     code = c;
                 }
                 http.Started::Ok(first) => {
                     var ex = first;
-                    borrow head as &hb in {
-                        let (next, c1) = http.send(ex, buffer.bytes(hb));
-                        ex = next;
-                        code = c1;
-                    }
+                    let (next, c1) = http.send(ex, eng, head);
+                    ex = next;
+                    code = c1;
                     if code == 0 {
-                        let (next, c2) = http.read_head(ex);
+                        let (next, c2) = http.read_head(ex, eng);
                         ex = next;
                         code = c2;
                     }
@@ -793,7 +898,23 @@ pub fn blob_fetch[&h, &n, &t, &a, &r, &d, &b, &m](heap: &!h Heap, net: &n Net(""
                         borrow ex as &er in {
                             statuscode = http.status(er);
                         }
-                        if statuscode != 200 {
+                        if statuscode == 301 || statuscode == 302 || statuscode == 303 || statuscode == 307 || statuscode == 308 {
+                            // where to go next: the caller decides whether that is allowed
+                            borrow ex as &lr in {
+                                let place = http.header(lr, "location");
+                                if len(place) == 0 || len(place) > len(moved_to) {
+                                    code = refused_redirect();
+                                } else {
+                                    var k = 0;
+                                    while k < len(place) {
+                                        moved_to[k] = place[k];
+                                        k = k + 1;
+                                    }
+                                    moved = len(place);
+                                    code = moved_code();
+                                }
+                            }
+                        } else if statuscode != 200 {
                             code = refusal_of_status(statuscode, false);
                         } else {
                             match store.begin(heap, blobs, tmp) {
@@ -807,7 +928,7 @@ pub fn blob_fetch[&h, &n, &t, &a, &r, &d, &b, &m](heap: &!h Heap, net: &n Net(""
                                     var going = true;
                                     while going && code == 0 {
                                         borrow mut piece as &!pw in {
-                                            let (more, n) = http.read_body(ex, contents(pw));
+                                            let (more, n) = http.read_body(ex, eng, contents(pw));
                                             ex = more;
                                             if n > 0 {
                                                 total = total + n;
@@ -848,11 +969,71 @@ pub fn blob_fetch[&h, &n, &t, &a, &r, &d, &b, &m](heap: &!h Heap, net: &n Net(""
                             }
                         }
                     }
-                    http.end(heap, ex);
+                    http.end(heap, ex, eng);
                 }
             }
-            buffer.drop(heap, head);
+        }
+    }
+    return (code, moved);
+}
+
+pub fn blob_fetch[&h, &n, &t, &a, &r, &d, &b, &m, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], digest_text: &d [byte], size: int, blobs: &b Dir, tmp: &m [byte]) -> [heap, net_out(""), conn_read, conn_write, dir_write, file_write] int {
+    var code = 0;
+    region w {
+        let want = alloc_slice[w](32, byte_of(0));
+        if digest.parse_into(digest_text, want) != 0 {
+            code = refused_digest();
+        } else {
+            let path = api_path(heap, repo, "blobs", digest_text);
+            var head = buffer.empty(heap, 1);
+            borrow path as &pq in {
+                buffer.drop(heap, head);
+                head = request_head(heap, "GET", buffer.bytes(pq), host, port, auth, "", 0 - 1);
+            }
             buffer.drop(heap, path);
+            var at_host = buffer.append(heap, buffer.empty(heap, 1), host);
+            var at_port = port;
+            let where_to = box_slice(heap, 4096, byte_of(0));
+            var hops = 0;
+            var going = true;
+            while going {
+                going = false;
+                var length = 0;
+                borrow head as &hb in {
+                    borrow at_host as &hn in {
+                        borrow mut where_to as &!ww in {
+                            let (c, n2) = blob_get(heap, net, eng, now_ms, buffer.bytes(hn), at_port, buffer.bytes(hb), want, size, blobs, tmp, contents(ww));
+                            code = c;
+                            length = n2;
+                        }
+                    }
+                }
+                if code == moved_code() {
+                    hops = hops + 1;
+                    if hops > 3 {
+                        code = refused_redirect();
+                    } else {
+                        borrow where_to as &wr in {
+                            let (next_head, next_name, next_port, c4) = next_hop(heap, contents(wr)[0..length], host, port, now_ms > 0, auth);
+                            code = c4;
+                            if code == 0 {
+                                buffer.drop(heap, head);
+                                head = next_head;
+                                buffer.drop(heap, at_host);
+                                at_host = next_name;
+                                at_port = next_port;
+                                going = true;
+                            } else {
+                                buffer.drop(heap, next_head);
+                                buffer.drop(heap, next_name);
+                            }
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, where_to);
+            buffer.drop(heap, head);
+            buffer.drop(heap, at_host);
         }
     }
     return code;
@@ -933,4 +1114,222 @@ pub fn read_credentials[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byt
         }
     }
     return (out, code);
+}
+
+// ---- the Bearer token flow (the Docker token authentication scheme; what ghcr.io and Docker Hub use)
+
+// The value of `name="..."` in a challenge, or an empty view. No escapes are read: a backslash makes it empty.
+fn param_of[&c, &n](challenge: &c [byte], name: &n [byte]) -> [] &c [byte] {
+    var i = 0;
+    while i + len(name) + 2 <= len(challenge) {
+        let before = i == 0 || int_of(challenge[i - 1]) == ' ' || int_of(challenge[i - 1]) == ',';
+        if before && digest.equal(challenge[i..i + len(name)], name) && int_of(challenge[i + len(name)]) == '=' && int_of(challenge[i + len(name) + 1]) == '"' {
+            let from = i + len(name) + 2;
+            var j = from;
+            while j < len(challenge) && int_of(challenge[j]) != '"' {
+                if int_of(challenge[j]) == '\\' {
+                    return challenge[0..0];
+                }
+                j = j + 1;
+            }
+            if j >= len(challenge) {
+                return challenge[0..0];
+            }
+            return challenge[from..j];
+        }
+        i = i + 1;
+    }
+    return challenge[0..0];
+}
+
+// Is `c` a character allowed in a token the client will put in a header? (Letters, digits and `-._~+/=:,`: a JWT, a
+// base64 string, a scope-shaped token. Anything else, a space or a line break above all, is refused.)
+fn token_char(c: int) -> [] bool {
+    return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.' || c == '_' || c == '~' || c == '+' || c == '/' || c == '=' || c == ':' || c == ',';
+}
+
+// `text` percent-encoded for a query value, but for the characters a scope uses.
+fn query_value[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buffer.Buffer {
+    var b = out;
+    let hex = "0123456789ABCDEF";
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if token_char(c) && c != '+' && c != '=' {
+            b = buffer.push(heap, b, text[i]);
+        } else {
+            b = buffer.push(heap, b, byte_of('%'));
+            b = buffer.push(heap, b, hex[c >> 4..(c >> 4) + 1][0]);
+            b = buffer.push(heap, b, hex[c & 15..(c & 15) + 1][0]);
+        }
+        i = i + 1;
+    }
+    return b;
+}
+
+// Where the token is asked for, from the challenge's `realm`: the path (with a query started) on the registry's own host,
+// or a refusal. The realm must be `https://` (`http://` when the registry is plain HTTP), name this host and port, and have a
+// plain absolute path. A token endpoint on another host is refused: the credentials would go there.
+fn realm_path[&h, &r, &t](heap: &!h Heap, realm: &r [byte], host: &t [byte], port: int, secure: bool) -> [heap] (buffer.Buffer, int) {
+    var scheme = "http://";
+    var default_port = 80;
+    if secure {
+        scheme = "https://";
+        default_port = 443;
+    }
+    var out = buffer.empty(heap, 64);
+    if len(realm) <= len(scheme) || !digest.equal(realm[0..len(scheme)], scheme) {
+        return (out, refused_realm());
+    }
+    let rest = realm[len(scheme)..len(realm)];
+    var slash = 0;
+    while slash < len(rest) && int_of(rest[slash]) != '/' {
+        slash = slash + 1;
+    }
+    if slash >= len(rest) {
+        return (out, refused_realm());
+    }
+    let authority = rest[0..slash];
+    let path = rest[slash..len(rest)];
+    var expected = buffer.empty(heap, 32);
+    expected = buffer.append(heap, expected, host);
+    expected = buffer.append(heap, expected, ":");
+    expected = buffer.push_nat(heap, expected, port);
+    var same = false;
+    borrow expected as &eb in {
+        same = digest.equal(authority, buffer.bytes(eb));
+    }
+    if port == default_port && digest.equal(authority, host) {
+        same = true;
+    }
+    buffer.drop(heap, expected);
+    var k = 0;
+    while k < len(path) {
+        let c = int_of(path[k]);
+        if !(token_char(c) && c != ',' && c != ':') {
+            same = false;
+        }
+        k = k + 1;
+    }
+    if !same {
+        return (out, refused_realm());
+    }
+    out = buffer.append(heap, out, path);
+    return (out, 0);
+}
+
+// Ask `realm` for a token for `repo`: the Authorization line, or a refusal. See `negotiate`.
+fn ask_token[&h, &n, &t, &a, &r, &m, &s, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, secure: bool, basic: &a [byte], repo: &r [byte], push: bool, realm: &m [byte], service: &s [byte]) -> [heap, net_out(""), conn_read, conn_write] (buffer.Buffer, int) {
+    var line = buffer.empty(heap, 1);
+    let (path, c1) = realm_path(heap, realm, host, port, secure);
+    var code = c1;
+    var query = path;
+    if code == 0 {
+        query = buffer.append(heap, query, "?");
+        if len(service) > 0 {
+            query = buffer.append(heap, query, "service=");
+            query = query_value(heap, query, service);
+            query = buffer.append(heap, query, "&");
+        }
+        query = buffer.append(heap, query, "scope=");
+        var scope = buffer.empty(heap, 64);
+        scope = buffer.append(heap, scope, "repository:");
+        scope = buffer.append(heap, scope, repo);
+        scope = buffer.append(heap, scope, ":pull");
+        if push {
+            scope = buffer.append(heap, scope, ",push");
+        }
+        borrow scope as &sb in {
+            query = query_value(heap, query, buffer.bytes(sb));
+        }
+        buffer.drop(heap, scope);
+        borrow query as &qb in {
+            let (answer, c2) = round_trip_get(heap, net, eng, now_ms, host, port, basic, buffer.bytes(qb), 16384);
+            code = c2;
+            if code == 0 {
+                borrow answer as &ar in {
+                    if reply_status(ar) == 401 {
+                        code = refused_unauthorized();
+                    } else if reply_status(ar) != 200 {
+                        code = refused_token();
+                    } else {
+                        let body = reply_body(ar);
+                        region a {
+                            let tape = alloc_slice[a](layout.tape_ints(body), 0);
+                            if json.parse(body, tape) < 0 {
+                                code = refused_token();
+                            } else {
+                                var token = layout.text_of(body, tape, 0, "token");
+                                if len(token) == 0 {
+                                    token = layout.text_of(body, tape, 0, "access_token");
+                                }
+                                var good = len(token) > 0;
+                                var k = 0;
+                                while k < len(token) {
+                                    if !token_char(int_of(token[k])) {
+                                        good = false;
+                                    }
+                                    k = k + 1;
+                                }
+                                if !good {
+                                    code = refused_token();
+                                } else {
+                                    line = buffer.append(heap, line, "Authorization: Bearer ");
+                                    line = buffer.append(heap, line, token);
+                                    line = buffer.append(heap, line, "\r\n");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            drop_reply(heap, answer);
+        }
+    }
+    buffer.drop(heap, query);
+    if code != 0 {
+        buffer.drop(heap, line);
+        return (buffer.empty(heap, 1), code);
+    }
+    return (line, 0);
+}
+
+// The Authorization line to use for `repo` on this registry, found before anything is sent to it. `GET /v2/` answers 200
+// (no token needed: `basic`, the credentials' line, is kept) or 401 with a challenge. A `Bearer` challenge is answered by
+// asking its realm, on this host only, for a token for `repository:<repo>:pull` (and `push` when `push`), with the Basic
+// credentials if there are any, and the token goes in `Authorization: Bearer`. The line and 0, or an empty line and a refusal.
+pub fn negotiate[&h, &n, &t, &a, &r, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, secure: bool, basic: &a [byte], repo: &r [byte], push: bool) -> [heap, net_out(""), conn_read, conn_write] (buffer.Buffer, int) {
+    let (probe, c0) = round_trip_get(heap, net, eng, now_ms, host, port, basic, "/v2/", 16384);
+    if c0 != 0 {
+        drop_reply(heap, probe);
+        return (buffer.empty(heap, 1), c0);
+    }
+    var wanted = false;
+    var realm_text = buffer.empty(heap, 1);
+    var service_text = buffer.empty(heap, 1);
+    borrow probe as &pr in {
+        if reply_status(pr) == 401 && len(reply_challenge(pr)) >= 7 && digest.equal(reply_challenge(pr)[0..7], "Bearer ") {
+            wanted = true;
+            realm_text = buffer.append(heap, realm_text, param_of(reply_challenge(pr), "realm"));
+            service_text = buffer.append(heap, service_text, param_of(reply_challenge(pr), "service"));
+        }
+    }
+    drop_reply(heap, probe);
+    var line = buffer.empty(heap, 1);
+    var code = 0;
+    if !wanted {
+        line = buffer.append(heap, line, basic);
+    } else {
+        borrow realm_text as &rb in {
+            borrow service_text as &sb in {
+                let (got, c) = ask_token(heap, net, eng, now_ms, host, port, secure, basic, repo, push, buffer.bytes(rb), buffer.bytes(sb));
+                buffer.drop(heap, line);
+                line = got;
+                code = c;
+            }
+        }
+    }
+    buffer.drop(heap, realm_text);
+    buffer.drop(heap, service_text);
+    return (line, code);
 }

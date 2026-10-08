@@ -35,6 +35,11 @@ def sources(b):
     for s in b["sources"]:
         p = ROOT / s
         files += sorted(p.rglob("*.cho")) if p.is_dir() else [p]
+    # A program that imports the TLS package is compiled with the project's installed libraries (`cancho install`
+    # puts them in build/deps), so the report must be made over them too.
+    if any(re.search(r"^import tls;", f.read_text(), re.M) for f in files):
+        subprocess.run(["cancho", "install"], cwd=ROOT, capture_output=True, check=True)
+        files += sorted((ROOT / "build" / "deps").glob("*.cho"))
     return [str(f) for f in files]
 
 
@@ -121,10 +126,11 @@ fn main(world: World) -> [] int {
 # for writing (writes go through directory handles). Granting one means editing this list in the same PR.
 FORBIDDEN = ("net", "conn_", "listen", "accept", "exec", "clock", "signals", "ffi", "fs_write", "udp", "poller")
 
-# The only programs that may speak to a network, and the only network effects they may have: dial out, read and
-# write on what they dialled. They may not listen, accept, resolve through a poller, or do anything else on the list.
+# The only programs that may speak to a network, and the only effects they may have beyond the rest: dial out, read and
+# write on what they dialled, and read the clock (a certificate's dates are checked against it). They may not listen,
+# accept, resolve through a poller, or do anything else on the list.
 NETWORK_CLIENTS = {"oci-push", "oci-pull", "http-probe"}
-CLIENT_EFFECTS = {"net_out", "conn_read", "conn_write"}
+CLIENT_EFFECTS = {"net_out", "conn_read", "conn_write", "clock"}
 
 
 def forbidden_in(ceil, name=""):

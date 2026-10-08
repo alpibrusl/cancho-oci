@@ -1,0 +1,83 @@
+edition 7;
+
+module oci.secure;
+
+import tls;
+
+import std.buffer;
+
+// `oci.secure` -- the TLS engine of a registry client, made ready (design 5.7, task #9b). cancho's own TLS
+// (`packages/tls`, `packages/x509`) takes what it needs as data: the roots as PEM bytes the caller read, 32
+// bytes of entropy the caller read, the time as a number. So this module is the one place that reads the
+// two files; the engine itself holds no capability. Not independently reviewed upstream (cancho #209).
+
+pub fn refused_roots() -> [] int {
+    return 0 - 920;
+}
+
+pub fn refused_entropy() -> [] int {
+    return 0 - 921;
+}
+
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == refused_roots() {
+        return "tls-roots";
+    }
+    if code == refused_entropy() {
+        return "tls-entropy";
+    }
+    return "unknown";
+}
+
+// The PEM file of roots may be up to a mebibyte (the engine's store holds as much). One byte more is refused.
+pub fn roots_cap() -> [] int {
+    return 1048576;
+}
+
+// An engine that trusts the roots in the PEM file at `roots_path` and is seeded from /dev/urandom. The engine and
+// 0, or an engine nothing was done to and a refusal. The caller closes the engine either way.
+pub fn engine[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), roots_path: &p [byte]) -> [heap, fs_read("")] (tls.Engine, int) {
+    var eng = tls.open(heap, 1);
+    var code = 0;
+    let pem = box_slice(heap, roots_cap() + 1, byte_of(0));
+    borrow mut pem as &!pw in {
+        let got = fs_read(fs, roots_path, contents(pw));
+        if got <= 0 || got > roots_cap() {
+            code = refused_roots();
+        } else {
+            borrow mut eng as &!ew in {
+                if tls.trust(ew, contents(pw)[0..got]) < 1 {
+                    code = refused_roots();
+                }
+            }
+        }
+        // the roots are public; the buffer is cleared all the same, to hold nothing after it
+        var k = 0;
+        while k < got && k < len(contents(pw)) {
+            contents(pw)[k] = byte_of(0);
+            k = k + 1;
+        }
+    }
+    unbox_slice(heap, pem);
+    if code == 0 {
+        region a {
+            let entropy = alloc_slice[a](32, byte_of(0));
+            let n = fs_read(fs, "/dev/urandom", entropy);
+            if n != 32 {
+                code = refused_entropy();
+            } else {
+                borrow mut eng as &!ew2 in {
+                    if tls.seed(ew2, entropy) != 0 {
+                        code = refused_entropy();
+                    }
+                }
+            }
+            var j = 0;
+            while j < 32 {
+                entropy[j] = byte_of(0);
+                j = j + 1;
+            }
+        }
+    }
+    return (eng, code);
+}

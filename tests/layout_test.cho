@@ -11,7 +11,7 @@ import std.test;
 fn test_text_and_numbers() -> [] int {
     region a {
         let doc = "{\"name\":\"amd64\",\"size\":123,\"nested\":{\"k\":\"v\"},\"flag\":true,\"neg\":-5,\"big\":99999999999999999999,\"frac\":1.5}";
-        let tape = alloc_slice[a](json.tape_len(doc), 0);
+        let tape = alloc_slice[a](layout.tape_ints(doc), 0);
         test.assert(json.parse(doc, tape) > 0);
         test.assert(digest.equal(layout.text_of(doc, tape, 0, "name"), "amd64"));
         test.assert_eq(len(layout.text_of(doc, tape, 0, "absent")), 0);
@@ -27,6 +27,39 @@ fn test_text_and_numbers() -> [] int {
         test.assert_eq(layout.number_of(doc, tape, 0, "frac"), 0 - 1);
         test.assert_eq(layout.number_of(doc, tape, 0, "big"), 0 - 1);
         test.assert_eq(layout.number_of(doc, tape, 0, "flag"), 0 - 1);
+    }
+    return 0;
+}
+
+// A tape past a region's 64 KiB is a trap; `tape_ints` keeps it under, and a document too big for it is a parse
+// error (a refusal), not a crash.
+fn test_the_tape_stays_inside_a_region() -> [] int {
+    test.assert_eq(layout.tape_ints("{}"), 9);
+    test.assert_eq(layout.tape_ints(""), 3);
+    region a {
+        // 3,000 numbers in an array: more nodes than 8,000 ints hold
+        var text = alloc_slice[a](2 + 2 * 3000 + 1, byte_of(0));
+        var at = 0;
+        text[at] = byte_of('[');
+        at = at + 1;
+        var k = 0;
+        while k < 3000 {
+            if k > 0 {
+                text[at] = byte_of(',');
+                at = at + 1;
+            }
+            text[at] = byte_of('1');
+            at = at + 1;
+            k = k + 1;
+        }
+        text[at] = byte_of(']');
+        at = at + 1;
+        let doc = text[0..at];
+        test.assert_eq(layout.tape_ints(doc), 7000);
+        region b {
+            let tape = alloc_slice[b](layout.tape_ints(doc), 0);
+            test.assert(json.parse(doc, tape) < 0);
+        }
     }
     return 0;
 }

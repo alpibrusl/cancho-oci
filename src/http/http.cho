@@ -2,6 +2,8 @@ edition 7;
 
 module oci.http;
 
+import tls;
+
 // `oci.http` -- an HTTP/1.1 client, one exchange at a time (design 5.7, task #9). There
 // is no client in cancho's packages (`http.request` reads a server's incoming
 // requests), so this is it, and it is deliberately small: one connection per exchange
@@ -69,18 +71,28 @@ pub fn rule_name(code: int) -> [] &static [byte] {
     if code == refused_body() {
         return "http-body";
     }
+    // a refusal of the TLS engine (-1 to -63) is named by the engine
+    if code < 0 && code > 0 - 100 {
+        return tls.refusal_tag(code);
+    }
     return "unknown";
 }
 
 // st: 0 bytes in `buf`, 1 read position in `buf`, 2 status, 3 bytes of head, 4
 //     Content-Length (-1 when absent), 5 chunked (1/0), 6 body mode (0 length,
 //     1 chunked, 2 until close), 7 bytes left in the current length or chunk,
-//     8 chunk state (0 size line next, 1 data, 2 CRLF after data, 3 done)
+//     8 chunk state (0 size line next, 1 data, 2 CRLF after data, 3 done),
+//     9 transport (0 plain, 1 TLS: the bytes go through slot 0 of the caller's engine),
+//     10 the engine's refusal that ended a read (0 if none), 11 and 12 the ciphertext in `wire` the
+//     engine has not taken yet (from, to)
+// wire: for TLS, [0, 16384) holds ciphertext just read from the socket and [16384, 36864) ciphertext
+//     on its way out; one byte for a plain exchange.
 pub res struct Exchange {
     conn: Conn,
     buf: Box[[byte]],
     st: Box[[int]],
     head: Box[[byte]],
+    wire: Box[[byte]],
 }
 
 pub enum Started {
@@ -88,37 +100,281 @@ pub enum Started {
     Failed(int),
 }
 
-// Dial `host:port` (the builtin resolves names). One exchange, one connection.
-pub fn begin[&h, &n, &t](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int) -> [heap, net_out("")] Started {
+fn wire_in() -> [] int {
+    return 16384;
+}
+
+fn wire_len() -> [] int {
+    return 36864;
+}
+
+// Ciphertext the engine has queued, written to the socket. 0, or -1 on a socket error.
+fn flush[&c, &e, &w](conn: &!c Conn, eng: &!e tls.Engine, out: &!w [byte]) -> [conn_write] int {
+    var n = tls.take(eng, 0, out);
+    while n > 0 {
+        var at = 0;
+        while at < n {
+            match conn_write(conn, out[at..n]) {
+                Sent::Wrote(k) => {
+                    if k <= 0 {
+                        return 0 - 1;
+                    }
+                    at = at + k;
+                }
+                Sent::Again => {
+                    return 0 - 1;
+                }
+                Sent::Failed(errno) => {
+                    return 0 - 1;
+                }
+            }
+        }
+        n = tls.take(eng, 0, out);
+    }
+    return 0;
+}
+
+// `k` bytes of ciphertext at the start of `wire` given to the engine; whatever it answers is
+// written. 0, a refusal of the engine (negative, from -1 to -63), or -1000 on a socket error.
+fn pump[&c, &e, &w](conn: &!c Conn, eng: &!e tls.Engine, wire: &!w [byte], k: int) -> [conn_write] int {
+    var at = 0;
+    var idle = 0;
+    while at < k {
+        let used = tls.feed(eng, 0, wire[at..k]);
+        if used < 0 {
+            return used;
+        }
+        at = at + used;
+        if used == 0 {
+            idle = idle + 1;
+            if idle > 4 {
+                return 0 - 1000;
+            }
+        } else {
+            idle = 0;
+        }
+        if flush(conn, eng, wire[wire_in()..wire_len()]) != 0 {
+            return 0 - 1000;
+        }
+    }
+    return 0;
+}
+
+// The handshake, driven to the end. 0, or the engine's refusal, or `refused_dial`.
+fn handshake[&c, &e, &w](conn: &!c Conn, eng: &!e tls.Engine, wire: &!w [byte]) -> [conn_read, conn_write] int {
+    var rounds = 0;
+    while rounds < 64 {
+        rounds = rounds + 1;
+        if flush(conn, eng, wire[wire_in()..wire_len()]) != 0 {
+            return refused_dial();
+        }
+        let ev = tls.event(eng, 0);
+        if ev == tls.event_established() {
+            return 0;
+        }
+        if ev == tls.event_failed() {
+            return tls.failure(eng, 0);
+        }
+        match conn_read(conn, wire[0..wire_in()]) {
+            Received::Data(k) => {
+                let c = pump(conn, eng, wire, k);
+                if c != 0 {
+                    if c == 0 - 1000 {
+                        return refused_dial();
+                    }
+                    return c;
+                }
+            }
+            Received::End => {
+                tls.eof(eng, 0);
+                return tls.failure(eng, 0);
+            }
+            Received::Again => {
+                return refused_dial();
+            }
+            Received::Failed(errno) => {
+                return refused_dial();
+            }
+        }
+    }
+    return refused_dial();
+}
+
+// Plaintext from the transport into `out`: the count (at least 1), 0 at the end of the
+// stream (for TLS: after the server's close_notify; a close without one is an error), -1 on an error.
+// For TLS the ciphertext read from the socket waits in `wire` until the engine has room for it
+// (`st` 11 and 12), so a read is never more than the engine can hold.
+fn wire_read[&c, &e, &w, &s, &o](conn: &!c Conn, eng: &!e tls.Engine, wire: &!w [byte], st: &!s [int], out: &!o [byte]) -> [conn_read, conn_write] int {
+    if st[9] == 0 {
+        match conn_read(conn, out) {
+            Received::Data(n) => {
+                return n;
+            }
+            Received::End => {
+                return 0;
+            }
+            Received::Again => {
+                return 0 - 1;
+            }
+            Received::Failed(errno) => {
+                return 0 - 1;
+            }
+        }
+    }
+    var turns = 0;
+    while turns < 1000000 {
+        turns = turns + 1;
+        let n = tls.recv(eng, 0, out);
+        if n > 0 {
+            return n;
+        }
+        if n == 0 {
+            return 0;
+        }
+        if n != tls.would_block() {
+            st[10] = n;
+            return 0 - 1;
+        }
+        if st[11] < st[12] {
+            // ciphertext the engine has not taken yet: it takes only what it has room to decrypt
+            let used = tls.feed(eng, 0, wire[st[11]..st[12]]);
+            if used < 0 {
+                st[10] = used;
+                return 0 - 1;
+            }
+            st[11] = st[11] + used;
+            if flush(conn, eng, wire[wire_in()..wire_len()]) != 0 || used == 0 {
+                st[10] = 0 - 1000;
+                return 0 - 1;
+            }
+        } else {
+            match conn_read(conn, wire[0..wire_in()]) {
+                Received::Data(k) => {
+                    st[11] = 0;
+                    st[12] = k;
+                }
+                Received::End => {
+                    tls.eof(eng, 0);
+                    let m = tls.recv(eng, 0, out);
+                    if m >= 0 {
+                        return m;
+                    }
+                    st[10] = m;
+                    return 0 - 1;
+                }
+                Received::Again => {
+                    return 0 - 1;
+                }
+                Received::Failed(errno) => {
+                    return 0 - 1;
+                }
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+// Dial `host:port` (the builtin resolves names). One exchange, one connection. With `now_ms`
+// (Unix milliseconds) above 0 the connection is TLS, to the name `host`, checked against the
+// roots the engine was given and the certificates' dates against `now_ms`; with 0 it is plain.
+// The engine is the caller's (`tls.trust` and `tls.seed` done); slot 0 is used and freed by `end`.
+pub fn begin[&h, &n, &t, &e](heap: &!h Heap, net: &n Net(""), host: &t [byte], port: int, eng: &!e tls.Engine, now_ms: int) -> [heap, net_out(""), conn_read, conn_write] Started {
     match tcp_connect(net, host, port) {
         Dialed::Failed(errno) => {
             return Started::Failed(refused_dial());
         }
         Dialed::Ok(conn) => {
-            let st = box_slice(heap, 9, 0);
+            let st = box_slice(heap, 13, 0);
             borrow mut st as &!sw in {
                 contents(sw)[4] = 0 - 1;
             }
-            return Started::Ok(Exchange { conn: conn, buf: box_slice(heap, 16384, byte_of(0)), st: st, head: box_slice(heap, 16384, byte_of(0)) });
+            var wire = box_slice(heap, 1, byte_of(0));
+            var c = conn;
+            if now_ms > 0 {
+                unbox_slice(heap, wire);
+                wire = box_slice(heap, wire_len(), byte_of(0));
+                var code = tls.start(eng, 0, host, now_ms);
+                if code == 0 {
+                    borrow mut c as &!cw in {
+                        borrow mut wire as &!ww in {
+                            code = handshake(cw, eng, contents(ww));
+                        }
+                    }
+                }
+                if code != 0 {
+                    tls.drop(eng, 0);
+                    conn_close(c);
+                    unbox_slice(heap, st);
+                    unbox_slice(heap, wire);
+                    return Started::Failed(code);
+                }
+                borrow mut st as &!sw2 in {
+                    contents(sw2)[9] = 1;
+                }
+            }
+            return Started::Ok(Exchange { conn: c, buf: box_slice(heap, 16384, byte_of(0)), st: st, head: box_slice(heap, 16384, byte_of(0)), wire: wire });
         }
     }
 }
 
-pub fn end[&h](heap: &!h Heap, ex: Exchange) -> [heap] int {
-    let Exchange { conn, buf, st, head } = ex;
-    conn_close(conn);
+pub fn end[&h, &e](heap: &!h Heap, ex: Exchange, eng: &!e tls.Engine) -> [heap, conn_write] int {
+    let Exchange { conn, buf, st, head, wire } = ex;
+    var c = conn;
+    var secure = false;
+    borrow st as &sr in {
+        secure = contents(sr)[9] == 1;
+    }
+    if secure {
+        tls.finish(eng, 0);
+        borrow mut c as &!cw in {
+            borrow mut wire as &!ww in {
+                flush(cw, eng, contents(ww)[wire_in()..wire_len()]);
+            }
+        }
+        tls.drop(eng, 0);
+    }
+    conn_close(c);
     unbox_slice(heap, buf);
     unbox_slice(heap, st);
     unbox_slice(heap, head);
+    unbox_slice(heap, wire);
     return 0;
 }
 
 // Write all of `bytes`. The exchange back and 0, or a refusal.
-pub fn send[&b](ex: Exchange, bytes: &b [byte]) -> [conn_write] (Exchange, int) {
-    let Exchange { conn, buf, st, head } = ex;
+pub fn send[&b, &e](ex: Exchange, eng: &!e tls.Engine, bytes: &b [byte]) -> [conn_write] (Exchange, int) {
+    let Exchange { conn, buf, st, head, wire } = ex;
     var c = conn;
     var code = 0;
     var at = 0;
+    var secure = false;
+    borrow st as &sr in {
+        secure = contents(sr)[9] == 1;
+    }
+    if secure {
+        var stuck = 0;
+        borrow mut c as &!cw in {
+            borrow mut wire as &!ww in {
+                while at < len(bytes) && code == 0 {
+                    let k = tls.send(eng, 0, bytes[at..len(bytes)]);
+                    if k < 0 {
+                        code = refused_send();
+                    } else {
+                        at = at + k;
+                        if k == 0 {
+                            stuck = stuck + 1;
+                        } else {
+                            stuck = 0;
+                        }
+                        if stuck > 2 || flush(cw, eng, contents(ww)[wire_in()..wire_len()]) != 0 {
+                            code = refused_send();
+                        }
+                    }
+                }
+            }
+        }
+        return (Exchange { conn: c, buf: buf, st: st, head: head, wire: wire }, code);
+    }
     while at < len(bytes) && code == 0 {
         borrow mut c as &!cw in {
             match conn_write(cw, bytes[at..len(bytes)]) {
@@ -138,36 +394,27 @@ pub fn send[&b](ex: Exchange, bytes: &b [byte]) -> [conn_write] (Exchange, int) 
             }
         }
     }
-    return (Exchange { conn: c, buf: buf, st: st, head: head }, code);
+    return (Exchange { conn: c, buf: buf, st: st, head: head, wire: wire }, code);
 }
 
 // Refill the read buffer when it is empty. 1 when there are bytes, 0 at the end of the
 // stream, -1 on an error.
-fn fill[&c, &b, &s](conn: &!c Conn, buf: &!b [byte], st: &!s [int]) -> [conn_read] int {
+fn fill[&c, &e, &w, &b, &s](conn: &!c Conn, eng: &!e tls.Engine, wire: &!w [byte], buf: &!b [byte], st: &!s [int]) -> [conn_read, conn_write] int {
     if st[1] < st[0] {
         return 1;
     }
-    match conn_read(conn, buf) {
-        Received::Data(n) => {
-            st[0] = n;
-            st[1] = 0;
-            return 1;
-        }
-        Received::End => {
-            return 0;
-        }
-        Received::Again => {
-            return 0 - 1;
-        }
-        Received::Failed(errno) => {
-            return 0 - 1;
-        }
+    let n = wire_read(conn, eng, wire, st, buf);
+    if n > 0 {
+        st[0] = n;
+        st[1] = 0;
+        return 1;
     }
+    return n;
 }
 
 // The next byte (0..255), -1 at the end of the stream, -2 on an error.
-fn next_byte[&c, &b, &s](conn: &!c Conn, buf: &!b [byte], st: &!s [int]) -> [conn_read] int {
-    let f = fill(conn, buf, st);
+fn next_byte[&c, &e, &w, &b, &s](conn: &!c Conn, eng: &!e tls.Engine, wire: &!w [byte], buf: &!b [byte], st: &!s [int]) -> [conn_read, conn_write] int {
+    let f = fill(conn, eng, wire, buf, st);
     if f == 0 {
         return 0 - 1;
     }
@@ -182,11 +429,11 @@ fn next_byte[&c, &b, &s](conn: &!c Conn, buf: &!b [byte], st: &!s [int]) -> [con
 // One line, without its line ending, into `line`: its length; -1 at the end of the
 // stream before any byte; -2 when the line would not fit; -3 on an error. A bare LF
 // ends a line too (a lenient reader of the line, strict about where it ends).
-fn read_line[&c, &b, &s, &l](conn: &!c Conn, buf: &!b [byte], st: &!s [int], line: &!l [byte]) -> [conn_read] int {
+fn read_line[&c, &e, &w, &b, &s, &l](conn: &!c Conn, eng: &!e tls.Engine, wire: &!w [byte], buf: &!b [byte], st: &!s [int], line: &!l [byte]) -> [conn_read, conn_write] int {
     var n = 0;
     var first = true;
     while true {
-        let v = next_byte(conn, buf, st);
+        let v = next_byte(conn, eng, wire, buf, st);
         if v == 0 - 1 {
             if first {
                 return 0 - 1;
@@ -270,62 +517,64 @@ fn trim[&t](text: &t [byte]) -> [] &t [byte] {
 // Read the response head: the status line and every header, into the exchange's head
 // buffer (one header per line, "\n" separated), and decide how the body is framed.
 // The exchange back and 0, or a refusal. The status is `status(ex)`.
-pub fn read_head(ex: Exchange) -> [conn_read] (Exchange, int) {
-    let Exchange { conn, buf, st, head } = ex;
+pub fn read_head[&e](ex: Exchange, eng: &!e tls.Engine) -> [conn_read, conn_write] (Exchange, int) {
+    let Exchange { conn, buf, st, head, wire } = ex;
     var c = conn;
     var code = 0;
     borrow mut c as &!cw in {
-        borrow mut buf as &!bw in {
-            borrow mut st as &!sw in {
-                borrow mut head as &!hw in {
-                    let b = contents(bw);
-                    let s = contents(sw);
-                    let h = contents(hw);
-                    region a {
-                        let line = alloc_slice[a](8192, byte_of(0));
-                        var used = 0;
-                        var n = read_line(cw, b, s, line);
-                        if n < 0 {
-                            code = refused_truncated();
-                            if n == 0 - 2 {
-                                code = refused_head_too_large();
-                            }
-                        } else if n < 12 || int_of(line[0]) != 'H' || int_of(line[1]) != 'T' || int_of(line[2]) != 'T' || int_of(line[3]) != 'P' || int_of(line[4]) != '/' {
-                            code = refused_malformed();
-                        } else {
-                            // "HTTP/1.1 201 Created": the status is the three digits after the first space
-                            var sp = 0;
-                            while sp < n && int_of(line[sp]) != ' ' {
-                                sp = sp + 1;
-                            }
-                            let status = number_in(line[sp + 1..sp + 4]);
-                            if sp + 4 > n || status < 100 || status > 599 {
+        borrow mut wire as &!ww in {
+            borrow mut buf as &!bw in {
+                borrow mut st as &!sw in {
+                    borrow mut head as &!hw in {
+                        let b = contents(bw);
+                        let s = contents(sw);
+                        let h = contents(hw);
+                        region a {
+                            let line = alloc_slice[a](8192, byte_of(0));
+                            var used = 0;
+                            var n = read_line(cw, eng, contents(ww), b, s, line);
+                            if n < 0 {
+                                code = refused_truncated();
+                                if n == 0 - 2 {
+                                    code = refused_head_too_large();
+                                }
+                            } else if n < 12 || int_of(line[0]) != 'H' || int_of(line[1]) != 'T' || int_of(line[2]) != 'T' || int_of(line[3]) != 'P' || int_of(line[4]) != '/' {
                                 code = refused_malformed();
                             } else {
-                                s[2] = status;
-                                var going = true;
-                                while going && code == 0 {
-                                    n = read_line(cw, b, s, line);
-                                    if n < 0 {
-                                        code = refused_truncated();
-                                        if n == 0 - 2 {
-                                            code = refused_head_too_large();
-                                        }
-                                    } else if n == 0 {
-                                        going = false;
-                                    } else if used + n + 1 > len(h) {
-                                        code = refused_head_too_large();
-                                    } else {
-                                        var k = 0;
-                                        while k < n {
-                                            h[used + k] = line[k];
-                                            k = k + 1;
-                                        }
-                                        h[used + n] = byte_of('\n');
-                                        used = used + n + 1;
-                                    }
+                                // "HTTP/1.1 201 Created": the status is the three digits after the first space
+                                var sp = 0;
+                                while sp < n && int_of(line[sp]) != ' ' {
+                                    sp = sp + 1;
                                 }
-                                s[3] = used;
+                                let status = number_in(line[sp + 1..sp + 4]);
+                                if sp + 4 > n || status < 100 || status > 599 {
+                                    code = refused_malformed();
+                                } else {
+                                    s[2] = status;
+                                    var going = true;
+                                    while going && code == 0 {
+                                        n = read_line(cw, eng, contents(ww), b, s, line);
+                                        if n < 0 {
+                                            code = refused_truncated();
+                                            if n == 0 - 2 {
+                                                code = refused_head_too_large();
+                                            }
+                                        } else if n == 0 {
+                                            going = false;
+                                        } else if used + n + 1 > len(h) {
+                                            code = refused_head_too_large();
+                                        } else {
+                                            var k = 0;
+                                            while k < n {
+                                                h[used + k] = line[k];
+                                                k = k + 1;
+                                            }
+                                            h[used + n] = byte_of('\n');
+                                            used = used + n + 1;
+                                        }
+                                    }
+                                    s[3] = used;
+                                }
                             }
                         }
                     }
@@ -333,7 +582,7 @@ pub fn read_head(ex: Exchange) -> [conn_read] (Exchange, int) {
             }
         }
     }
-    let ex2 = Exchange { conn: c, buf: buf, st: st, head: head };
+    let ex2 = Exchange { conn: c, buf: buf, st: st, head: head, wire: wire };
     if code != 0 {
         return (ex2, code);
     }
@@ -366,6 +615,12 @@ pub fn header[&e, &n](ex: &e Exchange, name: &n [byte]) -> [] &e [byte] {
     return header_in(contents(ex.head)[0..contents(ex.st)[3]], name);
 }
 
+// The TLS engine's refusal that ended a read, or 0: what `http-truncated` hides when the cause was the
+// connection's security and not its length.
+pub fn transport_failure[&e](ex: &e Exchange) -> [] int {
+    return contents(ex.st)[10];
+}
+
 pub fn status[&e](ex: &e Exchange) -> [] int {
     return contents(ex.st)[2];
 }
@@ -373,7 +628,7 @@ pub fn status[&e](ex: &e Exchange) -> [] int {
 // Decide the body framing from the headers: chunked wins over a length (RFC 9112 6.3);
 // a length that is not a number, or two that differ, is a refusal.
 fn frame(ex: Exchange) -> [] (Exchange, int) {
-    let Exchange { conn, buf, st, head } = ex;
+    let Exchange { conn, buf, st, head, wire } = ex;
     var code = 0;
     borrow head as &hr in {
         borrow mut st as &!sw in {
@@ -413,12 +668,12 @@ fn frame(ex: Exchange) -> [] (Exchange, int) {
             }
         }
     }
-    return (Exchange { conn: conn, buf: buf, st: st, head: head }, code);
+    return (Exchange { conn: conn, buf: buf, st: st, head: head, wire: wire }, code);
 }
 
 // Up to `want` bytes of body into `out`: from the read buffer if it holds any, else
 // straight from the connection. The count (at least 1), 0 when the stream ends, -1 on an error.
-fn pull[&c, &b, &s, &o](conn: &!c Conn, buf: &!b [byte], st: &!s [int], out: &!o [byte], want: int) -> [conn_read] int {
+fn pull[&c, &e, &w, &b, &s, &o](conn: &!c Conn, eng: &!e tls.Engine, wire: &!w [byte], buf: &!b [byte], st: &!s [int], out: &!o [byte], want: int) -> [conn_read, conn_write] int {
     var room = want;
     if room > len(out) {
         room = len(out);
@@ -439,20 +694,7 @@ fn pull[&c, &b, &s, &o](conn: &!c Conn, buf: &!b [byte], st: &!s [int], out: &!o
         st[1] = st[1] + n;
         return n;
     }
-    match conn_read(conn, out[0..room]) {
-        Received::Data(n) => {
-            return n;
-        }
-        Received::End => {
-            return 0;
-        }
-        Received::Again => {
-            return 0 - 1;
-        }
-        Received::Failed(errno) => {
-            return 0 - 1;
-        }
-    }
+    return wire_read(conn, eng, wire, st, out[0..room]);
 }
 
 // A chunk-size line: hexadecimal digits, then optionally ";extension". The size, or -1.
@@ -494,85 +736,87 @@ fn chunk_size[&t](line: &t [byte]) -> [] int {
 // The next piece of the body into `out` (never more than `len(out)` bytes): its length,
 // 0 when the body is complete, or a refusal (`http-truncated`: the stream ended early;
 // `http-body`: bad chunk framing). The exchange is handed back for the next call.
-pub fn read_body[&o](ex: Exchange, out: &!o [byte]) -> [conn_read] (Exchange, int) {
-    let Exchange { conn, buf, st, head } = ex;
+pub fn read_body[&o, &e](ex: Exchange, eng: &!e tls.Engine, out: &!o [byte]) -> [conn_read, conn_write] (Exchange, int) {
+    let Exchange { conn, buf, st, head, wire } = ex;
     var c = conn;
     var result = 0;
     borrow mut c as &!cw in {
-        borrow mut buf as &!bw in {
-            borrow mut st as &!sw in {
-                let b = contents(bw);
-                let s = contents(sw);
-                if s[6] == 0 {
-                    if s[7] > 0 {
-                        let n = pull(cw, b, s, out, s[7]);
-                        if n > 0 {
-                            s[7] = s[7] - n;
-                            result = n;
-                        } else {
-                            result = refused_truncated();
-                        }
-                    }
-                } else if s[6] == 2 {
-                    let n = pull(cw, b, s, out, len(out));
-                    if n > 0 {
-                        result = n;
-                    } else if n < 0 {
-                        result = refused_truncated();
-                    }
-                } else {
-                    var going = true;
-                    while going {
-                        going = false;
-                        if s[8] == 0 {
-                            region a {
-                                let line = alloc_slice[a](128, byte_of(0));
-                                let n = read_line(cw, b, s, line);
-                                if n < 0 {
-                                    result = refused_truncated();
-                                } else {
-                                    let size = chunk_size(line[0..n]);
-                                    if size < 0 {
-                                        result = refused_body();
-                                    } else if size == 0 {
-                                        s[8] = 3;
-                                        // trailers, up to the blank line that ends the message
-                                        var more = true;
-                                        while more && result == 0 {
-                                            let t = read_line(cw, b, s, line);
-                                            if t < 0 {
-                                                result = refused_truncated();
-                                            } else if t == 0 {
-                                                more = false;
-                                            }
-                                        }
-                                    } else {
-                                        s[7] = size;
-                                        s[8] = 1;
-                                        going = true;
-                                    }
-                                }
-                            }
-                        } else if s[8] == 1 {
-                            let n = pull(cw, b, s, out, s[7]);
+        borrow mut wire as &!ww in {
+            borrow mut buf as &!bw in {
+                borrow mut st as &!sw in {
+                    let b = contents(bw);
+                    let s = contents(sw);
+                    if s[6] == 0 {
+                        if s[7] > 0 {
+                            let n = pull(cw, eng, contents(ww), b, s, out, s[7]);
                             if n > 0 {
                                 s[7] = s[7] - n;
-                                if s[7] == 0 {
-                                    s[8] = 2;
-                                }
                                 result = n;
                             } else {
                                 result = refused_truncated();
                             }
-                        } else if s[8] == 2 {
-                            region a2 {
-                                let line = alloc_slice[a2](8, byte_of(0));
-                                let n = read_line(cw, b, s, line);
-                                if n != 0 {
-                                    result = refused_body();
+                        }
+                    } else if s[6] == 2 {
+                        let n = pull(cw, eng, contents(ww), b, s, out, len(out));
+                        if n > 0 {
+                            result = n;
+                        } else if n < 0 {
+                            result = refused_truncated();
+                        }
+                    } else {
+                        var going = true;
+                        while going {
+                            going = false;
+                            if s[8] == 0 {
+                                region a {
+                                    let line = alloc_slice[a](128, byte_of(0));
+                                    let n = read_line(cw, eng, contents(ww), b, s, line);
+                                    if n < 0 {
+                                        result = refused_truncated();
+                                    } else {
+                                        let size = chunk_size(line[0..n]);
+                                        if size < 0 {
+                                            result = refused_body();
+                                        } else if size == 0 {
+                                            s[8] = 3;
+                                            // trailers, up to the blank line that ends the message
+                                            var more = true;
+                                            while more && result == 0 {
+                                                let t = read_line(cw, eng, contents(ww), b, s, line);
+                                                if t < 0 {
+                                                    result = refused_truncated();
+                                                } else if t == 0 {
+                                                    more = false;
+                                                }
+                                            }
+                                        } else {
+                                            s[7] = size;
+                                            s[8] = 1;
+                                            going = true;
+                                        }
+                                    }
+                                }
+                            } else if s[8] == 1 {
+                                let n = pull(cw, eng, contents(ww), b, s, out, s[7]);
+                                if n > 0 {
+                                    s[7] = s[7] - n;
+                                    if s[7] == 0 {
+                                        s[8] = 2;
+                                    }
+                                    result = n;
                                 } else {
-                                    s[8] = 0;
-                                    going = true;
+                                    result = refused_truncated();
+                                }
+                            } else if s[8] == 2 {
+                                region a2 {
+                                    let line = alloc_slice[a2](8, byte_of(0));
+                                    let n = read_line(cw, eng, contents(ww), b, s, line);
+                                    if n != 0 {
+                                        result = refused_body();
+                                    } else {
+                                        s[8] = 0;
+                                        going = true;
+                                    }
                                 }
                             }
                         }
@@ -581,5 +825,5 @@ pub fn read_body[&o](ex: Exchange, out: &!o [byte]) -> [conn_read] (Exchange, in
             }
         }
     }
-    return (Exchange { conn: c, buf: buf, st: st, head: head }, result);
+    return (Exchange { conn: c, buf: buf, st: st, head: head, wire: wire }, result);
 }
