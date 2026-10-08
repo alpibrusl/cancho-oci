@@ -7,12 +7,12 @@ registries do not return a wrong digest or redirect a blob upload to another hos
 at a registry it does not trust has to survive both. The real oracles (`crane registry serve`, `registry:2`) are run
 in CI as well; this one is for what they will not do, and for developing without them.
 
-    mock_registry.py [--auth user:password] [--bearer] [--tls-cert PEM --tls-key PEM] [--fault NAME]... [--port N]
+    mock_registry.py [--auth user:password] [--bearer] [--no-referrers] [--tls-cert PEM --tls-key PEM] [--fault NAME]... [--port N]
 
 `--bearer` makes it a registry that wants a token: the API answers 401 with a Bearer challenge whose realm is this host's
 `/token`, which answers a token for the scope asked (with `--auth`, only to a request that carries those credentials as
 Basic); the API takes only `Authorization: Bearer <that token>`, and a token that has no `push` is refused for writes.
-`--tls-cert` and `--tls-key` serve https.
+`--tls-cert` and `--tls-key` serve https. `--no-referrers` makes it a registry without the referrers API (404), as `registry:2` is.
 
 Prints `PORT <n>` on its first line. Faults (any number):
   location-absolute      the upload Location is an absolute URL on this host
@@ -44,6 +44,7 @@ Prints `PORT <n>` on its first line. Faults (any number):
   blob-redirect-userinfo ... to a URL with `user@` in front of the host
   blob-redirect-space    ... to a URL with a space in it
   blob-redirect-foreign  ... to another host name that does not exist
+  referrers-forget       the referrers API answers an empty list whatever was pushed (a registry that lies about its index)
   until-close            GET responses have no Content-Length and end when the server closes (valid on plain HTTP; over TLS
                          the server closes without a close_notify, so a client cannot tell the body is whole)
 With --bearer:
@@ -55,13 +56,14 @@ With --bearer:
   token-huge             the token is 40 KiB long
   token-access-token     the token is under `access_token`, not `token`
 """
-import argparse, base64, hashlib, json, os, re, sys, threading, time, uuid
+import argparse, base64, hashlib, json, os, re, sys, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STATE = {"blobs": {}, "manifests": {}, "uploads": {}, "log": [], "served": 0, "leaked": 0}
 FAULTS = set()
 AUTH = None
 BEARER = False
+NO_REFERRERS = False
 SCHEME = "http"
 
 
@@ -192,6 +194,9 @@ class H(BaseHTTPRequestHandler):
             return
         if path == "/v2/" or path == "/v2":
             return self.reply(200, b"{}", {"Docker-Distribution-API-Version": "registry/2.0"}, "application/json")
+        m = re.match(r"^/v2/(.+?)/referrers/(sha256:[0-9a-f]{64})$", path)
+        if m:
+            return self.referrers(m.group(1), m.group(2), query)
         m = re.match(r"^/v2/(.+?)/(blobs|manifests)/(.+)$", path)
         if not m:
             return self.reply(404, json.dumps({"errors": [{"code": "NAME_UNKNOWN", "message": "no such route"}]}).encode(), None, "application/json")
@@ -201,6 +206,30 @@ class H(BaseHTTPRequestHandler):
         if kind == "blobs":
             return self.blob(name, rest)
         return self.manifest(name, rest)
+
+    def referrers(self, name, digest, query):
+        if NO_REFERRERS:
+            return self.reply(404, json.dumps({"errors": [{"code": "NAME_UNKNOWN", "message": "no referrers API"}]}).encode(), None, "application/json")
+        q = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+        want = urllib.parse.unquote(q["artifactType"]) if "artifactType" in q else None
+        found = []
+        for key, (media, data) in sorted(STATE["manifests"].get(name, {}).items()) if "referrers-forget" not in FAULTS else []:
+            if not key.startswith("sha256:"):
+                continue
+            try:
+                doc = json.loads(data)
+            except ValueError:
+                continue
+            if not isinstance(doc, dict) or (doc.get("subject") or {}).get("digest") != digest:
+                continue
+            entry = {"mediaType": media, "digest": key, "size": len(data)}
+            if doc.get("artifactType"):
+                entry["artifactType"] = doc["artifactType"]
+            if want is None or entry.get("artifactType") == want:
+                found.append(entry)
+        body = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": found}, separators=(",", ":")).encode()
+        hdr = {"OCI-Filters-Applied": "artifactType"} if want is not None else None
+        return self.reply(200, body, hdr, "application/vnd.oci.image.index.v1+json")
 
     def uploads(self, name, rest, query):
         if self.command == "POST" and rest == "":
@@ -336,17 +365,19 @@ class H(BaseHTTPRequestHandler):
 
 
 def main():
-    global AUTH, BEARER, SCHEME
+    global AUTH, BEARER, SCHEME, NO_REFERRERS
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--auth")
     ap.add_argument("--fault", action="append", default=[])
     ap.add_argument("--bearer", action="store_true")
+    ap.add_argument("--no-referrers", action="store_true")
     ap.add_argument("--tls-cert")
     ap.add_argument("--tls-key")
     a = ap.parse_args()
     AUTH = a.auth
     BEARER = a.bearer
+    NO_REFERRERS = a.no_referrers
     FAULTS.update(a.fault)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)
     if a.tls_cert:

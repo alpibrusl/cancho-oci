@@ -129,7 +129,7 @@ FORBIDDEN = ("net", "conn_", "listen", "accept", "exec", "clock", "signals", "ff
 # The only programs that may speak to a network, and the only effects they may have beyond the rest: dial out, read and
 # write on what they dialled, and read the clock (a certificate's dates are checked against it). They may not listen,
 # accept, resolve through a poller, or do anything else on the list.
-NETWORK_CLIENTS = {"oci-push", "oci-pull", "http-probe"}
+NETWORK_CLIENTS = {"oci-push", "oci-pull", "oci-ref", "http-probe"}
 CLIENT_EFFECTS = {"net_out", "conn_read", "conn_write", "clock"}
 
 

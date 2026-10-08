@@ -72,7 +72,7 @@ def run(cmd, **kw):
 
 
 class Mock:
-    def __init__(self, faults=(), auth=None, bearer=False, tls=None):
+    def __init__(self, faults=(), auth=None, bearer=False, tls=None, no_referrers=False):
         cmd = [sys.executable, str(ROOT / "scripts" / "mock_registry.py")]
         for f in faults:
             cmd += ["--fault", f]
@@ -80,6 +80,8 @@ class Mock:
             cmd += ["--auth", auth]
         if bearer:
             cmd += ["--bearer"]
+        if no_referrers:
+            cmd += ["--no-referrers"]
         self.scheme = "http"
         if tls:
             cmd += ["--tls-cert", tls + ".pem", "--tls-key", tls + ".key"]
