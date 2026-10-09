@@ -1,0 +1,102 @@
+{
+ "cells": {
+  "a-one-5mb-binary": {
+   "inputs": 1,
+   "bytes": 5242880,
+   "oci-build": {
+    "status": "ok",
+    "wall-s": [
+     0.232,
+     0.227,
+     0.223
+    ],
+    "peak-kb-at-least": 21644,
+    "peak-kb-note": "ru_maxrss of children: the max over all runs so far, so at-least",
+    "reproducible": true
+   },
+   "crane": {
+    "status": "absent"
+   },
+   "ko": {
+    "status": "absent"
+   },
+   "buildah": {
+    "status": "absent"
+   }
+  },
+  "b-one-50mb-binary": {
+   "inputs": 1,
+   "bytes": 52428800,
+   "oci-build": {
+    "status": "ok",
+    "wall-s": [
+     4.807,
+     4.759,
+     4.841
+    ],
+    "peak-kb-at-least": 21644,
+    "peak-kb-note": "ru_maxrss of children: the max over all runs so far, so at-least",
+    "reproducible": true
+   },
+   "crane": {
+    "status": "absent"
+   },
+   "ko": {
+    "status": "absent"
+   },
+   "buildah": {
+    "status": "absent"
+   }
+  },
+  "c-500-files-20mb-as-registered": {
+   "inputs": 500,
+   "bytes": 20971500,
+   "oci-build": {
+    "status": "failed",
+    "error": "refused: layer-too-many-entries\n"
+   },
+   "crane": {
+    "status": "absent"
+   },
+   "ko": {
+    "status": "absent"
+   },
+   "buildah": {
+    "status": "absent"
+   }
+  },
+  "c-64-files-2.5mb-at-the-layer-limit": {
+   "inputs": 64,
+   "bytes": 2684352,
+   "oci-build": {
+    "status": "ok",
+    "wall-s": [
+     0.296,
+     0.298,
+     0.296
+    ],
+    "peak-kb-at-least": 21644,
+    "peak-kb-note": "ru_maxrss of children: the max over all runs so far, so at-least",
+    "reproducible": true
+   },
+   "crane": {
+    "status": "absent"
+   },
+   "ko": {
+    "status": "absent"
+   },
+   "buildah": {
+    "status": "absent"
+   }
+  }
+ },
+ "tools": {
+  "oci-build": true,
+  "crane": false,
+  "ko": false,
+  "buildah": false
+ },
+ "cold-cache": "needs root: not run; warm only",
+ "runs": 3,
+ "host-arch": "amd64"
+}
