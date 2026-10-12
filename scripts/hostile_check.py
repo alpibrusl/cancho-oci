@@ -120,6 +120,7 @@ def timed(cmd, limit=12):
 
 
 def main():
+    global PROBE, REF
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=300)
     ap.add_argument("--probe", default=PROBE)
@@ -127,7 +128,6 @@ def main():
     ap.add_argument("--ref", default=REF)
     ap.add_argument("--quick", action="store_true", help="the stalls and the slow server only (for the mutation gate)")
     a = ap.parse_args()
-    global PROBE, REF
     PROBE, REF = a.probe, a.ref
     if a.pull:
         R.PULL = a.pull
