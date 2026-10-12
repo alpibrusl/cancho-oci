@@ -14,7 +14,7 @@ Raw-socket servers (plain and TLS) that:
 
     hostile_check.py
 """
-import argparse, os, random, socket, ssl, subprocess, sys, tempfile, threading, time
+import argparse, os, random, signal, socket, ssl, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 import importlib.util
 
@@ -179,6 +179,26 @@ def main():
                     ok(code == 1 and "http-timeout" in err and dt < 8, f"{name} against a server that {label}: {code} {err.strip()!r} after {dt:.1f}s")
             finally:
                 srv.close()
+        # a stall during which the client is stopped and continued: the wait that the signal cuts short is waited again, so the
+        # answer is still a timeout after the idle time, not a failed connection at once (cancho-hooks#79 was this fault)
+        srv = Server(lambda c: (read_request(c), time.sleep(30)))
+        try:
+            t0 = time.time()
+            p = subprocess.Popen([str(x) for x in [PROBE, "127.0.0.1", srv.port, "GET", "/v2/", "--timeout-s", "2"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(0.5)
+            os.kill(p.pid, signal.SIGSTOP)
+            time.sleep(0.1)
+            os.kill(p.pid, signal.SIGCONT)
+            try:
+                out, err = p.communicate(timeout=12)
+                code, err = p.returncode, err.decode(errors="replace")
+            except subprocess.TimeoutExpired:
+                p.kill()
+                code, err = "hang", ""
+            dt = time.time() - t0
+            ok(code == 1 and "http-timeout" in err and 1.8 < dt < 8, f"http-probe stopped and continued during a stall: still a timeout after the idle time: {code} {err.strip()!r} after {dt:.1f}s")
+        finally:
+            srv.close()
         # a client that dials a server that accepts the TCP connection and never answers the TLS hello
         if pki:
             srv = Server(lambda c: time.sleep(30))

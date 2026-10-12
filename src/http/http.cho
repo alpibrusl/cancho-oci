@@ -132,11 +132,27 @@ fn wait_for[&c](conn: &!c Link, events: int) -> [poll] int {
     var answer = 0 - 1;
     region a {
         let out = alloc_slice[a](8, 0);
-        let n = poller_wait(conn.poller, out, conn.idle);
-        if n > 0 {
-            answer = 1;
-        } else if n == 0 {
-            answer = 0;
+        // A wait that a signal cuts short (-4, EINTR: the process was stopped and continued, or a handled signal arrived) has neither
+        // run out of time nor failed, so it is waited again. There is no clock here, so the next wait is a whole idle time: a signal
+        // lengthens the deadline, and after 64 of them the wait counts as timed out. (cancho-hooks' hooks-mcp had this fault: #79.)
+        var interrupted = 0;
+        var waiting = true;
+        while waiting {
+            let n = poller_wait(conn.poller, out, conn.idle);
+            if n > 0 {
+                answer = 1;
+                waiting = false;
+            } else if n == 0 {
+                answer = 0;
+                waiting = false;
+            } else if n == 0 - 4 && interrupted < 64 {
+                interrupted = interrupted + 1;
+            } else if n == 0 - 4 {
+                answer = 0;
+                waiting = false;
+            } else {
+                waiting = false;
+            }
         }
     }
     return answer;
