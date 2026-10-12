@@ -1,4 +1,8 @@
 {
+ "machine": {
+  "recorded": false,
+  "note": "Linux x86-64, the pinned compiler, cranelift (as the pull request that made this file says); the harness that made it did not record the machine, and now does"
+ },
  "cells": {
   "a-one-5mb-binary": {
    "inputs": 1,
@@ -10,9 +14,9 @@
      0.227,
      0.223
     ],
-    "peak-kb-at-least": 21644,
-    "peak-kb-note": "ru_maxrss of children: the max over all runs so far, so at-least",
-    "reproducible": true
+    "reproducible": true,
+    "peak-kib": null,
+    "peak-note": "not recorded: the harness that made this file read RUSAGE_CHILDREN, the largest child it ever had (its own input generators included), and reported 21644 for every cell; it now reads each run's own ru_maxrss. Run scripts/bench.py again to fill this."
    },
    "crane": {
     "status": "absent"
@@ -34,9 +38,9 @@
      4.759,
      4.841
     ],
-    "peak-kb-at-least": 21644,
-    "peak-kb-note": "ru_maxrss of children: the max over all runs so far, so at-least",
-    "reproducible": true
+    "reproducible": true,
+    "peak-kib": null,
+    "peak-note": "not recorded: the harness that made this file read RUSAGE_CHILDREN, the largest child it ever had (its own input generators included), and reported 21644 for every cell; it now reads each run's own ru_maxrss. Run scripts/bench.py again to fill this."
    },
    "crane": {
     "status": "absent"
@@ -75,9 +79,9 @@
      0.298,
      0.296
     ],
-    "peak-kb-at-least": 21644,
-    "peak-kb-note": "ru_maxrss of children: the max over all runs so far, so at-least",
-    "reproducible": true
+    "reproducible": true,
+    "peak-kib": null,
+    "peak-note": "not recorded: the harness that made this file read RUSAGE_CHILDREN, the largest child it ever had (its own input generators included), and reported 21644 for every cell; it now reads each run's own ru_maxrss. Run scripts/bench.py again to fill this."
    },
    "crane": {
     "status": "absent"

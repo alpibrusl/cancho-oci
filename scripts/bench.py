@@ -15,16 +15,18 @@ comparison is like for like where the tools have a comparable mode (crane app ap
 FROM-scratch layer from files; ko needs Go sources, so its cells say "not comparable" rather than
 quote a number, per the design: where there is no comparable mode, the table says so).
 
-Wall time is measured around the whole process (fork to exit) with time.monotonic; peak memory is
-the process tree's ru_maxrss (getrusage(RUSAGE_CHILDREN) delta is unusable across runs, so each tool
-run is wrapped in its own python subprocess and measured by reading /proc/<pid>/status VmHWM after
-wait -- ru_maxrss of children gives the max of all children ever, which is fine: it is per-run here).
-Cold cache: echo 3 > /proc/sys/vm/drop_caches needs root, so cold-cache runs are marked "needs root:
-not run" unless the file is writable; the harness says so instead of pretending.
+Wall time is measured around the whole process (fork to exit) with time.monotonic; peak memory is that
+one process's own ru_maxrss, from wait4 on its pid (getrusage(RUSAGE_CHILDREN) is the largest child the
+harness ever had, its own input generators included, so it is not used).
+Cold cache: echo 3 > /proc/sys/vm/drop_caches needs root. When it can be written, each cell gets one
+cold run (caches dropped just before it) besides the warm runs; when it cannot, the results say "needs
+root: not run" instead of pretending.
 """
+import hashlib
 import json
+import os
 import pathlib
-import resource
+import platform
 import shutil
 import subprocess
 import sys
@@ -34,12 +36,6 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORK = ROOT / "bench" / "work"
 OUT_DEFAULT = ROOT / "bench" / "results" / "bench.json"
 RUNS = 3
-
-TOOLS = {
-    # name: (check command, build command template taking cell dir/image dir, supports_gzip)
-    "oci-build": (["oci-build", "--help"], None, True),
-}
-
 
 def have(binary):
     return shutil.which(binary) is not None
@@ -100,15 +96,15 @@ def host_arch():
 
 
 def run_measured(cmd, cwd=None):
-    """Fork a process, measure wall time and its peak resident memory (VmHWM), return (seconds, kbytes, rc)."""
+    """Run one process; its wall time, its own peak resident memory (KiB, from wait4), its exit status and the start of its output."""
     t0 = time.monotonic()
     proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate()
+    out = proc.stdout.read()
+    err = proc.stderr.read()
+    _, status, usage = os.wait4(proc.pid, 0)
     elapsed = time.monotonic() - t0
-    # ru_maxrss of children is the max over every child ever spawned, so this is "at least",
-    # monotonically non-decreasing across runs; the results file says so.
-    peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    return elapsed, peak, proc.returncode, out.decode()[:200], err.decode()[:200]
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    return elapsed, usage.ru_maxrss, proc.returncode, out.decode()[:200], err.decode()[:200]
 
 
 def build_with(build_tool, cell, cell_dir, inputs, image_dir):
@@ -123,20 +119,30 @@ def build_with(build_tool, cell, cell_dir, inputs, image_dir):
 
 
 def drop_caches():
-    p = pathlib.Path("/proc/sys/vm/drop_caches")
-    if not p.exists():
-        return False
-        try:
-            with open(p) as f:
-                pass
-        except PermissionError:
-            return False
+    """Drop the page cache (needs root). True when it was dropped."""
     try:
-        with open(p, "w") as f:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
             f.write("3\n")
         return True
-    except (PermissionError, OSError):
+    except OSError:
         return False
+
+
+def machine():
+    model = ""
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith(("model name", "Model")):
+                model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    def git(*a):
+        r = subprocess.run(["git", "-C", str(ROOT), *a], capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else "unknown"
+    return {"cpu": model, "cores": os.cpu_count(), "kernel": platform.release(), "system": platform.system(), "machine": platform.machine(),
+            "loadavg_start": os.getloadavg(), "commit": git("rev-parse", "HEAD"), "dirty": bool(git("status", "--porcelain")),
+            "date": time.strftime("%Y-%m-%d %H:%M:%S %z")}
 
 
 def main():
@@ -158,8 +164,8 @@ def main():
              "ko": have("ko"),
              "buildah": have("buildah")}
     cold_possible = drop_caches()
-    results = {"cells": {}, "tools": {k: v for k, v in tools.items()},
-               "cold-cache": "measured" if cold_possible else "needs root: not run; warm only",
+    results = {"machine": machine(), "cells": {}, "tools": {k: v for k, v in tools.items()},
+               "cold-cache": "one cold run per cell, the page cache dropped just before it" if cold_possible else "needs root: not run; warm only",
                "runs": RUNS, "host-arch": host_arch()}
 
     for name, cell_dir, inputs in cells:
@@ -170,44 +176,52 @@ def main():
                 entry["status"] = "absent"
                 continue
             if tool == "oci-build":
-                timings, peaks, digests = [], [], []
-                for run in range(RUNS):
+                timings, peaks, digests, cold = [], [], [], None
+                runs = (["cold"] if cold_possible else []) + ["warm"] * RUNS
+                for run, kind in enumerate(runs):
                     image_dir = WORK / ("image-%s-%d" % (name, run))
                     if image_dir.exists():
                         shutil.rmtree(image_dir)
                     (image_dir / "blobs" / "sha256").mkdir(parents=True)
                     cmd = build_with("oci-build", name, cell_dir, inputs, image_dir)
+                    if kind == "cold":
+                        drop_caches()
                     seconds, peak, rc, out, err = run_measured(cmd)
                     if rc != 0:
                         entry["status"] = "failed"
                         entry["error"] = err
                         break
-                    timings.append(seconds)
-                    peaks.append(peak)
-                    import hashlib
                     manifest = (image_dir / "index.json").read_text()
                     digests.append(hashlib.sha256(manifest.encode()).hexdigest())
+                    if kind == "cold":
+                        cold = round(seconds, 3)
+                        continue
+                    timings.append(seconds)
+                    peaks.append(peak)
                 else:
                     entry.update({
                         "status": "ok",
                         "wall-s": [round(t, 3) for t in timings],
-                        "peak-kb-at-least": max(peaks),
-                        "peak-kb-note": "ru_maxrss of children: the max over all runs so far, so at-least",
+                        "peak-kib": peaks,
+                        "peak-note": "each run's own ru_maxrss (wait4 on its pid)",
                         "reproducible": len(set(digests)) == 1,
                     })
+                    if cold is not None:
+                        entry["cold-wall-s"] = cold
             else:
                 # The design says: where there is no comparable mode, the table says so.
                 entry["status"] = "not comparable: no like-for-like mode for this cell (design: benchmark cells)"
     for image_dir in WORK.glob("image-*"):
         shutil.rmtree(image_dir, ignore_errors=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    results["machine"]["loadavg_end"] = os.getloadavg()
     out_path.write_text(json.dumps(results, indent=1) + "\n")
     print("wrote %s" % out_path)
     for name in results["cells"]:
         e = results["cells"][name].get("oci-build", {})
         if e.get("status") == "ok":
-            print("%-22s oci-build: %s s (median %s), peak %s kb, reproducible: %s"
-                  % (name, e["wall-s"], sorted(e["wall-s"])[len(e["wall-s"]) // 2], e["peak-kb-at-least"], e["reproducible"]))
+            print("%-22s oci-build: %s s (median %s), peak %s KiB, reproducible: %s"
+                  % (name, e["wall-s"], sorted(e["wall-s"])[len(e["wall-s"]) // 2], max(e["peak-kib"]), e["reproducible"]))
     return 0
 
 
