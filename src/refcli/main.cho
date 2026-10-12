@@ -136,11 +136,11 @@ fn max_file() -> [] int {
 }
 
 // Attach `bytes` of type `atype` to `subject`: the file, the empty config, the artifact manifest, and the listing.
-fn attach[&h, &n, &t, &a, &r, &s, &y, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], bytes: &b [byte], io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, io_write] int {
+fn attach[&h, &n, &t, &a, &r, &s, &y, &b, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], bytes: &b [byte], io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, io_write] int {
     var code = 0;
     region w {
         let shown = alloc_slice[w](71, byte_of(0));
-        let (doc, c0) = registry.manifest_fetch(heap, net, eng, now_ms, host, port, auth, repo, subject, shown);
+        let (doc, c0) = registry.manifest_fetch(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, subject, shown);
         code = c0;
         if code == 0 {
             borrow doc as &db in {
@@ -158,9 +158,9 @@ fn attach[&h, &n, &t, &a, &r, &s, &y, &b, &i, &tl](heap: &!h Heap, net: &n Net("
                             digest.of_bytes(bytes, raw);
                             let blob_text = alloc_slice[v](71, byte_of(0));
                             digest.text_into(raw, blob_text);
-                            code = registry.blob_upload_bytes(heap, net, eng, now_ms, host, port, auth, repo, blob_text, bytes);
+                            code = registry.blob_upload_bytes(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, blob_text, bytes);
                             if code == 0 {
-                                code = registry.blob_upload_bytes(heap, net, eng, now_ms, host, port, auth, repo, image.empty_digest(), "{}");
+                                code = registry.blob_upload_bytes(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, image.empty_digest(), "{}");
                             }
                             if code == 0 {
                                 let (art, c1) = image.artifact_manifest_json(heap, atype, blob_text, len(bytes), media, subject, len(body));
@@ -172,9 +172,9 @@ fn attach[&h, &n, &t, &a, &r, &s, &y, &b, &i, &tl](heap: &!h Heap, net: &n Net("
                                         digest.of_bytes(ab_bytes, sum);
                                         let art_text = alloc_slice[v](71, byte_of(0));
                                         digest.text_into(sum, art_text);
-                                        code = registry.manifest_put(heap, net, eng, now_ms, host, port, auth, repo, art_text, image.media_manifest(), ab_bytes, art_text);
+                                        code = registry.manifest_put(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, art_text, image.media_manifest(), ab_bytes, art_text);
                                         if code == 0 {
-                                            code = registry.referrers_register(heap, net, eng, now_ms, host, port, auth, repo, subject, art_text, len(ab_bytes), atype);
+                                            code = registry.referrers_register(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, subject, art_text, len(ab_bytes), atype);
                                         }
                                         if code == 0 {
                                             io.write_all(io, "attached ");
@@ -200,8 +200,8 @@ fn attach[&h, &n, &t, &a, &r, &s, &y, &b, &i, &tl](heap: &!h Heap, net: &n Net("
 }
 
 // List the referrers of `subject` of type `atype` (any when empty).
-fn list_only[&h, &n, &t, &a, &r, &s, &y, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, io_write] int {
-    let (listed, c0, unused_api) = registry.referrers_fetch(heap, net, eng, now_ms, host, port, auth, repo, subject, atype);
+fn list_only[&h, &n, &t, &a, &r, &s, &y, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, io_write] int {
+    let (listed, c0, unused_api) = registry.referrers_fetch(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, subject, atype);
     var code = c0;
     if code == 0 {
         borrow listed as &lb in {
@@ -242,8 +242,8 @@ fn list_only[&h, &n, &t, &a, &r, &s, &y, &i, &tl](heap: &!h Heap, net: &n Net(""
 }
 
 // Fetch the attached file of each referrer of `subject` of type `atype` into the blob store `blobs`.
-fn fetch_all[&h, &n, &t, &a, &r, &s, &y, &i, &tl, &d](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_write, file_write, io_write] int {
-    let (listed, c0, unused_api) = registry.referrers_fetch(heap, net, eng, now_ms, host, port, auth, repo, subject, atype);
+fn fetch_all[&h, &n, &t, &a, &r, &s, &y, &i, &tl, &d](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], subject: &s [byte], atype: &y [byte], blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, dir_write, file_write, io_write] int {
+    let (listed, c0, unused_api) = registry.referrers_fetch(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, subject, atype);
     var code = c0;
     if code == 0 {
         borrow listed as &lb in {
@@ -266,7 +266,7 @@ fn fetch_all[&h, &n, &t, &a, &r, &s, &y, &i, &tl, &d](heap: &!h Heap, net: &n Ne
                         if len(ed) != 71 || es < 0 {
                             code = rf_document();
                         } else if len(atype) == 0 || digest.equal(et, atype) {
-                            code = fetch_one(heap, net, eng, now_ms, host, port, auth, repo, ed, blobs, io);
+                            code = fetch_one(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, ed, blobs, io);
                         }
                         k = k + 1;
                     }
@@ -279,11 +279,11 @@ fn fetch_all[&h, &n, &t, &a, &r, &s, &y, &i, &tl, &d](heap: &!h Heap, net: &n Ne
 }
 
 // The attached file of the artifact manifest `manifest_digest`: its first layer, into the blob store.
-fn fetch_one[&h, &n, &t, &a, &r, &m, &d, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], manifest_digest: &m [byte], blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, dir_write, file_write, io_write] int {
+fn fetch_one[&h, &n, &t, &a, &r, &m, &d, &i, &tl](heap: &!h Heap, net: &n Net(""), eng: &!tl tls.Engine, now_ms: int, idle_ms: int, host: &t [byte], port: int, auth: &a [byte], repo: &r [byte], manifest_digest: &m [byte], blobs: &d Dir, io: &!i Io) -> [heap, net_out(""), conn_read, conn_write, poll, dir_write, file_write, io_write] int {
     var code = 0;
     region w {
         let shown = alloc_slice[w](71, byte_of(0));
-        let (doc, c0) = registry.manifest_fetch(heap, net, eng, now_ms, host, port, auth, repo, manifest_digest, shown);
+        let (doc, c0) = registry.manifest_fetch(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, manifest_digest, shown);
         code = c0;
         if code == 0 {
             borrow doc as &db in {
@@ -303,7 +303,7 @@ fn fetch_one[&h, &n, &t, &a, &r, &m, &d, &i, &tl](heap: &!h Heap, net: &n Net(""
                             if len(layout.hex_of(ld)) != 64 || ls < 0 || ls > max_file() {
                                 code = rf_document();
                             } else {
-                                code = registry.blob_fetch(heap, net, eng, now_ms, host, port, auth, repo, ld, ls, blobs, ".incoming-ref");
+                                code = registry.blob_fetch(heap, net, eng, now_ms, idle_ms, host, port, auth, repo, ld, ls, blobs, ".incoming-ref");
                                 if code == 0 {
                                     io.write_all(io, manifest_digest);
                                     io.write_all(io, " ");
@@ -358,7 +358,7 @@ fn skeleton_ok[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read(""), dir_read
     return good;
 }
 
-fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args, clock_ms: int) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, dir_read, dir_write, file_write, io_write, err_write] int {
+fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &!i Io, args: &g Args, clock_ms: int) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, poll, dir_read, dir_write, file_write, io_write, err_write] int {
     if arg_count(args) < 2 {
         return refuse(io, rf_mode(), "attach, list or fetch");
     }
@@ -374,6 +374,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     var out_path = "";
     var basic_file = "";
     var trust_file = "/etc/ssl/certs/ca-certificates.crt";
+    var idle_s = 30;
     var plain = false;
     var bad = "";
     var at = 2;
@@ -402,6 +403,8 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
                 basic_file = value;
             } else if digest.equal(flag, "--trust-file") {
                 trust_file = value;
+            } else if digest.equal(flag, "--timeout-s") {
+                idle_s = registry.port_of(value);
             } else {
                 bad = flag;
             }
@@ -410,6 +413,9 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     }
     if len(bad) > 0 {
         return refuse(io, rf_flag(), bad);
+    }
+    if idle_s < 1 {
+        return refuse(io, rf_flag(), "--timeout-s");
     }
     if len(registry_text) == 0 || len(repo) == 0 || len(subject) == 0 {
         return refuse(io, rf_missing(), "--registry, --repo and --subject");
@@ -477,6 +483,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
     }
     var eng = tls.open(heap, 1);
     var now_ms = 0;
+    let idle_ms = idle_s * 1000;
     var ready = 0;
     if !plain {
         tls.close(heap, eng);
@@ -493,7 +500,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
         var negotiated = 0;
         borrow auth as &ab0 in {
             borrow mut eng as &!ew0 in {
-                let (got, c) = registry.negotiate(heap, net, ew0, now_ms, host, port, !plain, buffer.bytes(ab0), repo, digest.equal(mode, "attach"));
+                let (got, c) = registry.negotiate(heap, net, ew0, now_ms, idle_ms, host, port, !plain, buffer.bytes(ab0), repo, digest.equal(mode, "attach"));
                 buffer.drop(heap, line);
                 line = got;
                 negotiated = c;
@@ -506,7 +513,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
                 borrow mut eng as &!ew in {
                     if digest.equal(mode, "attach") {
                         borrow content as &cr in {
-                            let code = attach(heap, net, ew, now_ms, host, port, buffer.bytes(lb), repo, subject, atype, contents(cr)[0..length], io);
+                            let code = attach(heap, net, ew, now_ms, idle_ms, host, port, buffer.bytes(lb), repo, subject, atype, contents(cr)[0..length], io);
                             if code != 0 {
                                 status = refuse(io, code, subject);
                             } else {
@@ -514,7 +521,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
                             }
                         }
                     } else if digest.equal(mode, "list") {
-                        let code = list_only(heap, net, ew, now_ms, host, port, buffer.bytes(lb), repo, subject, atype, io);
+                        let code = list_only(heap, net, ew, now_ms, idle_ms, host, port, buffer.bytes(lb), repo, subject, atype, io);
                         if code != 0 {
                             status = refuse(io, code, subject);
                         } else {
@@ -542,7 +549,7 @@ fn run[&h, &f, &n, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), io: &
                                                     DirOpened::Ok(sha_dir) => {
                                                         var sha = sha_dir;
                                                         borrow sha as &sd in {
-                                                            let code = fetch_all(heap, net, ew, now_ms, host, port, buffer.bytes(lb), repo, subject, atype, sd, io);
+                                                            let code = fetch_all(heap, net, ew, now_ms, idle_ms, host, port, buffer.bytes(lb), repo, subject, atype, sd, io);
                                                             if code != 0 {
                                                                 status = refuse(io, code, subject);
                                                             } else {

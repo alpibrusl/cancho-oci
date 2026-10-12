@@ -9,7 +9,8 @@
     "fs_read",
     "heap",
     "io_write",
-    "net_out"
+    "net_out",
+    "poll"
   ],
   "labels": [
     {
@@ -47,6 +48,10 @@
     {
       "name": "net_out",
       "argument": ""
+    },
+    {
+      "name": "poll",
+      "argument": null
     }
   ],
   "foreign_symbols": []
