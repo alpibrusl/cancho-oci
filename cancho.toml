@@ -1,12 +1,12 @@
 [package]
 name = "cancho-oci"
-cancho = "dcf6751951590aa7f3427001eca3bef0d6677f3b"   # the compiler these sources were written for
+cancho = "2bd251f7f9354fe43d48055b3d9fe4d4af007a5c"   # the compiler these sources were written for
 
 # cancho's own TLS client and the certificate verifier it needs (`packages/tls`, `packages/x509`): the registry
 # client's transport for https (task #9b). Not independently reviewed upstream (cancho #209); see docs/design.md 5.7.
 [dependencies.tls]
 git = "https://github.com/alpibrusl/cancho"
-rev = "dcf6751951590aa7f3427001eca3bef0d6677f3b"
+rev = "2bd251f7f9354fe43d48055b3d9fe4d4af007a5c"
 path = "packages/tls/.cancho-vcs/tls"
 
 # One program per capability row (docs/design.md 5.5): a program's authority is
