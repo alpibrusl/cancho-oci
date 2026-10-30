@@ -1,0 +1,4 @@
+#!/bin/sh
+# `clang` with -static, for `cancho build --clang scripts/static-clang`: the command line in cancho runs one clang that compiles and links (it has no $CC to
+# link with, as the Rust build has: scripts/static-cc), and -static gives an executable with no loader and no libc to find, which a `scratch` image needs.
+exec clang "$@" -static

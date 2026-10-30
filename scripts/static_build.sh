@@ -13,5 +13,5 @@ print(" ".join(a.sources(b)))
 PY
 )
 # shellcheck disable=SC2086
-CC="$PWD/scripts/static-cc" cancho build $FILES --std -o build/oci-build-static
+cancho build $FILES --std --clang "$PWD/scripts/static-clang" -o build/oci-build-static
 file build/oci-build-static 2>/dev/null || true
