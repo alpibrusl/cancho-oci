@@ -175,7 +175,7 @@ jobs:
   # The same golden digests on a second operating system and CPU architecture: a build on macOS/arm64 and a build on
   # Linux/x86-64 must give identical manifests, configs, layers and diff_ids (design 2, G1; task #11).
   golden-macos:
-    runs-on: macos-14
+    runs-on: macos-latest   # macos-14 is no longer provisioned ("macos-14-arm64-us-default" is not supported)
     steps:
       - uses: actions/checkout@v4
         with:
