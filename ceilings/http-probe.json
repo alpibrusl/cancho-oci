@@ -1,5 +1,5 @@
 {
-  "bounded": true,
+  "bounded": false,
   "effects": [
     "args",
     "clock",
@@ -54,5 +54,8 @@
       "argument": null
     }
   ],
-  "foreign_symbols": []
+  "foreign_symbols": [],
+  "unbounded_by": [
+    "net_out(\"\")"
+  ]
 }

@@ -1,4 +1,6 @@
 #!/bin/sh
-# The linker wrapper cancho's docs/package-system.md describes: `cancho build` links with $CC, and
-# adding -static gives an executable with no loader and no libc to find, which a `scratch` image needs.
-exec cc "$@" -static
+# The linker wrapper for a static executable (a `scratch` image has no loader and no libc to find). Since 0.1.1 cancho
+# does not read $CC: `cancho build --clang scripts/static-cc` runs this in place of clang, once, to compile the
+# generated LLVM IR and link it, so -static (and no PIE, which would want a loader) is added to that one call.
+# Needs a static libc (libc.a; Debian/Ubuntu: libc6-dev).
+exec /usr/bin/clang "$@" -static -no-pie

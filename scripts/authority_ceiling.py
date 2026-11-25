@@ -6,7 +6,9 @@
     authority_ceiling.py --selftest prove the gate can fail: a program that reads files must be refused
 
 A report may be narrower than its ceiling, never wider: a new effect, a label whose argument is not
-the ceiling's, or `bounded` turning false (foreign code reachable) fails. Widening the ceiling is a
+the ceiling's, or `bounded` turning false against a bounded ceiling fails.
+Since compiler 0.1.1 `bounded` is also false when the network is held unnarrowed (`net_out("")`, cancho#551);
+the ceiling then pins the exact `unbounded_by` labels, and the report may list fewer, never others. Widening the ceiling is a
 change to ceilings/<name>.json in the same PR, so a reviewer sees it.
 """
 import json, re, subprocess, sys, tempfile
@@ -55,13 +57,17 @@ def snapshot(r):
     return {"bounded": r["bounded"], "effects": sorted(r["effects"]),
             "labels": sorted(({"name": l["name"], "argument": l["argument"]} for l in r["labels"]),
                              key=lambda l: (l["name"], str(l["argument"]))),
-            "foreign_symbols": sorted(r["foreign_symbols"])}
+            "foreign_symbols": sorted(r["foreign_symbols"]),
+            "unbounded_by": sorted(r.get("unbounded_by", []))}
 
 
 def widened(cur, ceil):
     why = []
     if ceil["bounded"] and not cur["bounded"]:
         why.append("the report is no longer bounded (foreign code is reachable)")
+    for u in cur["unbounded_by"]:
+        if u not in ceil.get("unbounded_by", []):
+            why.append(f"unbounded by `{u}`, which the ceiling does not name")
     for e in cur["effects"]:
         if e not in ceil["effects"]:
             why.append(f"new effect `{e}`")
@@ -91,7 +97,8 @@ def check():
             for w in why:
                 print(f"     {w}")
         else:
-            print(f"ok   {b['name']}: effects {cur['effects'] or '[]'}, bounded={cur['bounded']}")
+            print(f"ok   {b['name']}: effects {cur['effects'] or '[]'}, bounded={cur['bounded']}"
+                  + (f", unbounded_by {cur['unbounded_by']}" if cur["unbounded_by"] else ""))
     return bad
 
 
@@ -160,6 +167,13 @@ def selftest():
             if not any(l["name"] == "net_out" for l in labels):
                 print(f"SELFTEST FAIL: {b['name']} is a network client but its ceiling has no net_out row")
                 bad = 1
+    # a ceiling is bounded unless it names exactly the unnarrowed network, and only a network client may name it
+    for b in bins():
+        c = json.loads((ROOT / "ceilings" / f"{b['name']}.json").read_text())
+        want = ['net_out("")'] if b["name"] in NETWORK_CLIENTS else []
+        if c.get("unbounded_by", []) != want or c["bounded"] != (not want):
+            print(f"SELFTEST FAIL: the ceiling of {b['name']} must have unbounded_by {want} and bounded={not want}")
+            bad = 1
     if bad:
         return 1
     ceil = json.loads((ROOT / "ceilings" / "tar-probe.json").read_text())
